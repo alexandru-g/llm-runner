@@ -1,0 +1,26 @@
+[project]
+name = "llm-runner"
+version = "0.1.0"
+description = "Background runner for local llama-server instances."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Alexandru Gherghina", email = "alexandru.gherghina.p@gmail.com" },
+]
+dependencies = [
+    "click>=8.1",
+    "huggingface_hub>=0.24",
+    "questionary>=2.0",
+]
+
+[project.scripts]
+llmctl = "llm_runner.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llm_runner"]

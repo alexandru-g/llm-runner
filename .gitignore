@@ -1,0 +1,11 @@
+.state/
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
+dist/
+build/
+.python-version
+uv.lock
+models/*
+!models/.gitkeep
