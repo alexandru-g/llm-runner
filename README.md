@@ -5,7 +5,8 @@ Background runner for local `llama-server` instances.
 CLI (`llmctl`) to download, list, start, stop, and tail GGUF models served via
 [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`. Works
 with any GGUF from Hugging Face (Gemma, Llama, Qwen, Mistral, etc.) and
-arbitrary local files via `--ft`.
+arbitrary local files via `--ft`. Embedding models (e.g. bge-m3) are supported
+too via `--embeddings`.
 
 ## Install
 
@@ -158,7 +159,10 @@ llmctl download unsloth/gemma-4-E4B-it-GGUF
 ```
 
 You'll get an arrow-key picker listing every quant in the repo with file size.
-After selecting, the matching `mmproj` (if any) is auto-fetched alongside.
+After selecting, the matching `mmproj` (vision projector) and any
+speculative/MTP drafter (e.g. an `MTP/*-MTP.gguf`) are auto-fetched alongside —
+the drafter is flattened into the model folder so `run` can pair it
+automatically (see [Speculative decoding](#speculative-decoding-mtp-drafters)).
 
 Skip the picker for scripting with `--file`:
 
@@ -169,7 +173,27 @@ llmctl download unsloth/gemma-4-E4B-it-GGUF --file gemma-4-E4B-it-Q4_K_M.gguf
 Other flags:
 
 - `--no-mmproj` — don't download the vision projector
+- `--no-draft` — don't download the speculative/MTP drafter
 - `--subdir <name>` — override the target subdir (default: repo name, lowercased, `-GGUF` stripped)
+
+### Update a downloaded model
+
+`download` records the source repo in a `.llmctl-source.json` sidecar in the
+model folder, so you can re-check it later without retyping the repo:
+
+```bash
+llmctl update                          # pick from models with a recorded source
+llmctl update gemma-4-31b-it-ud-q4_k_xl # by model key (uses the recorded repo)
+llmctl update unsloth/gemma-4-31B-it-GGUF  # by repo id (for manually-placed models)
+```
+
+`update` revalidates against the remote and re-downloads **only what changed** —
+`hf_hub_download` compares the commit/etag, so unchanged files are reported `up
+to date` and skipped. Handy when a repo fixes a quant or **adds an `mtp-`
+drafter after you first pulled** (the new drafter lands beside the model and
+auto-attaches on `run`). Models downloaded before provenance tracking (or placed
+by hand) have no recorded repo — pass the repo id once and it's recorded going
+forward.
 
 ### Layout convention
 
@@ -181,13 +205,18 @@ $MODELS_DIR/
 ├── gemma-4-e4b-it/
 │   ├── gemma-4-E4B-it-Q4_K_M.gguf
 │   ├── gemma-4-E4B-it-Q8_0.gguf
-│   └── mmproj-F16.gguf           ← shared by both quants
+│   └── mmproj-F16.gguf                  ← shared by both quants
+├── gemma-4-31b-it/
+│   ├── gemma-4-31B-it-Q4_K_M.gguf
+│   └── gemma-4-31B-it-Q8_0-MTP.gguf     ← MTP drafter, auto-attached on run
 └── qwen3-8b/
     └── Qwen3-8B-Q5_K_M.gguf
 ```
 
 If you place GGUFs manually, follow the same convention: each base model in
-its own folder, mmproj (if any) alongside.
+its own folder, with its `mmproj` and/or drafter alongside. A GGUF whose name
+contains `mtp`, `-assistant`, `-draft`, or `-eagle` is treated as a drafter for
+its sibling base model, not as a model in its own right.
 
 ### Reuse an existing collection
 
@@ -203,17 +232,20 @@ export LLM_RUNNER_MODELS_DIR=/fast/ml/models
 llmctl list
 ```
 
-Shows discovered models with key, size, vision marker, and path:
+Shows discovered models with key, size, vision/draft markers, and path:
 
 ```
-KEY                     SIZE  VISION  PATH
-gemma-4-e4b-it-q4_k_m   2.4G  yes     gemma-4-e4b-it/gemma-4-E4B-it-Q4_K_M.gguf
-gemma-4-e4b-it-q8_0     5.0G  yes     gemma-4-e4b-it/gemma-4-E4B-it-Q8_0.gguf
-qwen3-8b-q5_k_m         5.4G          qwen3-8b/Qwen3-8B-Q5_K_M.gguf
+KEY                     SIZE  VISION  DRAFT  PATH
+gemma-4-e4b-it-q4_k_m   2.4G  yes            gemma-4-e4b-it/gemma-4-E4B-it-Q4_K_M.gguf
+gemma-4-e4b-it-q8_0     5.0G  yes            gemma-4-e4b-it/gemma-4-E4B-it-Q8_0.gguf
+gemma-4-31b-it-q4_k_m   17G           yes    gemma-4-31b-it/gemma-4-31B-it-Q4_K_M.gguf
+qwen3-8b-q5_k_m         5.4G                 qwen3-8b/Qwen3-8B-Q5_K_M.gguf
 ```
 
 The key is the filename stem lowercased; collisions across folders are
-disambiguated by prefixing with the parent dir name.
+disambiguated by prefixing with the parent dir name. A `DRAFT` marker means a
+speculative/MTP drafter sits alongside and is auto-attached on `run` (see
+[Speculative decoding](#speculative-decoding-mtp-drafters)).
 
 ### Start a model
 
@@ -227,6 +259,7 @@ llmctl run gemma-4-e4b-it-q4_k_m    # by key
 - Override either: `-p 8081 -c 65536`.
 - Reasoning is **disabled by default** (`--reasoning-budget 0`). Pass
   `--reasoning` to let the model's default reasoning behavior apply.
+- Serve an embedding model with `--embeddings` (see [Embedding models](#embedding-models)).
 - Process is detached (own session, survives the CLI exit). Stdout/stderr go
   to a per-instance log file under the state dir.
 
@@ -236,6 +269,133 @@ Run an arbitrary GGUF outside `MODELS_DIR`:
 llmctl run --ft /path/to/finetune.gguf
 llmctl run --ft /path/to/finetune.gguf --name my-ft -p 8082 -c 16384
 ```
+
+### Speculative decoding (MTP drafters)
+
+Models that ship a draft head — e.g. Gemma 4's
+[Multi-Token Prediction](https://huggingface.co/unsloth/gemma-4-12b-it-GGUF/blob/main/MTP/README.md)
+drafter — can generate substantially faster: the small drafter proposes several
+tokens per step and the base model verifies them in one pass (often >1.4× on
+dense models like Gemma-4-31B). This needs a `llama.cpp` build from **after
+2026-06-07**, when MTP landed.
+
+If a drafter sits next to the model (a sibling GGUF whose name contains `mtp`,
+`-assistant`, `-draft`, or `-eagle` — `llmctl list` shows a `DRAFT` marker), it
+is wired up automatically:
+
+```bash
+llmctl run gemma-4-31b-it-q4_k_m          # auto-attaches the MTP drafter
+```
+
+This emits:
+
+```bash
+llama-server -m …/gemma-4-31B-it-Q4_K_M.gguf \
+  --model-draft …/gemma-4-31B-it-Q8_0-MTP.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 3 \
+  --flash-attn on --ctx-size 32768 …
+```
+
+Point at a drafter explicitly (by path or by registry key), or tune the spec
+flags:
+
+```bash
+# Explicit base + drafter by path (no registry needed)
+llmctl run --ft ~/models/gemma-4/gemma-4-31B-it-Q4_K_M.gguf \
+  --draft ~/models/gemma-4/gemma-4-31B-it-assistant-Q8_0.gguf
+
+# Tune how many tokens the drafter proposes per step (try 1–6)
+llmctl run gemma-4-31b-it-q4_k_m --spec-draft-n-max 4
+```
+
+- `--draft <path|key>` — drafter to pair with the model (overrides auto-detect).
+- `--no-draft` — ignore an auto-detected drafter and run the base model alone.
+- `--spec-type <type>` — `llama-server --spec-type` (default `draft-mtp`).
+- `--spec-draft-n-max <n>` — max draft tokens per step (default `3`; try 1–6).
+- `--n-parallel <n>` — server slots (`llama-server --parallel`). **Auto-set to
+  `1` when a drafter is attached**, because MTP acceptance and prompt-prefix
+  reuse both work best single-stream; raise it only if you need concurrent
+  requests. For a client that keeps N short requests in flight (the enersec
+  v2 document analysis with `concurrency: N`) use `--n-parallel N`; decode is
+  bandwidth-bound so N sequences cost about the same per step as one.
+- `--kv-unified` / `--no-kv-unified` — share one KV buffer across the slots
+  (`llama-server --kv-unified`), so a slot can use the full `--ctx-size`
+  instead of ctx/N. Default on when `--n-parallel > 1`.
+- `--cache-ram <MiB>` — host-RAM prompt cache (`llama-server --cache-ram`),
+  default `0` (off). Enable it (e.g. `16384`) only for workloads whose prompts
+  are long and share a long prefix. On Gemma 4 each saved prompt also carries
+  its sliding-window context checkpoints (~1.7 GB per ~900-token prompt), so
+  for many short, distinct prompts the save costs more than the prefill it
+  spares.
+
+Drafters are ignored in `--embeddings` mode.
+
+> **⚠️ Don't combine `--kv-quant` with a drafter.** Quantizing the *target* KV
+> cache (`-ctk/-ctv q8_0`) is a known llama.cpp bug that drops MTP/speculative
+> acceptance to ~0% — the drafter runs but nothing it proposes is accepted, so
+> you get *no* speedup (and pay the drafter's overhead, ending up slower than
+> the base model). `llmctl run` warns when you request both. Pick one:
+> **f16 KV + MTP** (faster generation, but the larger KV fits less context), or
+> **quantized KV + `--no-draft`** (long context, no MTP). You can't have both
+> until the upstream bug is fixed.
+
+### Embedding models
+
+Embedding models (e.g. [bge-m3](https://huggingface.co/gpustack/bge-m3-GGUF))
+are served in embedding mode, which switches `llama-server` into embedding mode
+and drops the chat-only flags (flash-attn, prompt cache, reasoning) that don't
+apply to BERT-style models.
+
+Embedding mode is **auto-enabled** when the model's filename matches a known
+embedding family (`bge`, `e5`, `gte`, `nomic-embed`, `mxbai-embed`,
+`arctic-embed`, `minilm`, or anything containing `embed`), so no flag is needed
+for bge-m3:
+
+```bash
+llmctl download gpustack/bge-m3-GGUF --file bge-m3-Q8_0.gguf --no-mmproj
+llmctl run bge-m3-q8_0
+```
+
+Force it either way with `--embeddings` / `--no-embeddings` (e.g. to embed with a
+model whose name isn't recognized, or to run a recognized one as a chat server).
+
+In embedding mode the defaults are tuned for bge-m3, so the bare command
+above is equivalent to:
+
+```bash
+llama-server -m bge-m3-Q8_0.gguf --embeddings --pooling cls -c 8192 -b 8192 -ub 8192
+```
+
+- `--pooling [none|mean|cls|last|rank]` sets the pooling strategy (default
+  `cls`, which bge-m3 expects). Ignored without `--embeddings`.
+- `-c/--ctx-size` defaults to `8192` in embedding mode (vs `32768` for chat).
+- `-b/--batch-size` and `-ub/--ubatch-size` default to the context size so a
+  full-length input embeds in a single pass. Override either if needed.
+- Port auto-selection still applies: with a chat model already on `8080`, the
+  embedding server lands on `8081`. Query it at the OpenAI-compatible
+  `http://localhost:<port>/v1/embeddings`.
+
+### Fitting large models into limited VRAM
+
+Three knobs trade quality/speed for memory, in rough order of bang-for-buck:
+
+```bash
+# Quantize the KV cache. q8_0 is ~half of f16 and near-lossless; q4_0 halves
+# it again. (flash-attn is always on, which q8_0/q4_0 V-cache requires.)
+llmctl run gemma-4-31b-it-q4_k_m --kv-quant q8_0
+
+# Shrink the context window — KV cache scales linearly with it.
+llmctl run gemma-4-31b-it-q4_k_m --kv-quant q8_0 -c 16384
+
+# Skip the vision projector on a vision model you're using for text only.
+llmctl run gemma-4-31b-it-q4_k_m --no-vision
+
+# Last resort: spill some layers to CPU (it fits, but it's slower).
+llmctl run gemma-4-31b-it-q4_k_m --ngl 48
+```
+
+For a 17 GB Q4 weight file on a 24 GB card, `--kv-quant q8_0 -c 16384`
+(optionally `--no-vision`) is usually enough to fit comfortably.
 
 ### List running models
 
@@ -255,12 +415,46 @@ llmctl stop 12345                  # by PID
 
 Sends `SIGTERM` to the process group; escalates to `SIGKILL` after 10 s.
 
+### Auto-restart running models on boot
+
+`llmctl` keeps a manifest of what you have running (updated on every `run` and
+`stop`) so the set can be brought back after a reboot:
+
+```bash
+llmctl restore            # relaunch everything that was running pre-reboot
+llmctl autostart list     # show what restore would bring back
+```
+
+`restore` is idempotent — anything already running is left alone. To run it
+automatically at boot, install a **systemd user service**:
+
+```bash
+llmctl autostart install    # writes + enables the unit, enables linger
+llmctl autostart status     # unit + manifest state
+llmctl autostart uninstall  # remove the unit (manifest is kept)
+```
+
+The installer detects an active **conda** env and bakes a `bash -lc 'source
+…/conda.sh && conda activate <env> && llmctl restore'` `ExecStart` into the
+unit, so `llama-server` and its CUDA libraries resolve at boot exactly as they
+do in your shell (without conda it bakes the current `PATH`/`LD_LIBRARY_PATH`
+instead). `LLM_RUNNER_*` overrides are passed through. Test it without
+rebooting:
+
+```bash
+systemctl --user start llmctl-restore.service && llmctl ps
+```
+
+A model you explicitly `stop` is dropped from the manifest, so it won't come
+back on the next boot.
+
 ### Tail a model's log
 
 ```bash
 llmctl logs                        # auto-pick if 1 running; picker if many
 llmctl logs gemma-4-e4b-it-q4_k_m
 llmctl logs 12345 -n 200
+llmctl logs gemma-4-e4b-it-q4_k_m -f   # follow (like `tail -f`); Ctrl-C to stop
 ```
 
 ### Chatting with a running model
@@ -297,8 +491,26 @@ from 8080, so omitting `-p` for the second model also works.
 ### `MODELS_DIR` resolution order
 
 1. `$LLM_RUNNER_MODELS_DIR` if set (e.g. `/fast/ml/models`).
-2. `<repo>/models/` if it already exists (developer convenience).
-3. `$XDG_DATA_HOME/llm-runner/models` (default `~/.local/share/llm-runner/models`).
+2. The persisted `models_dir` from `llmctl config models-dir <path>` (see below).
+3. `<repo>/models/` if it already exists (developer convenience).
+4. `$XDG_DATA_HOME/llm-runner/models` (default `~/.local/share/llm-runner/models`).
+
+### Persisting the models dir with `llmctl config`
+
+Save a models directory so you don't have to export `LLM_RUNNER_MODELS_DIR`
+every session:
+
+```bash
+llmctl config models-dir /fast/ml/models          # persist it
+llmctl config models-dir /fast/ml/models --create # ... creating it if missing
+llmctl config models-dir                          # print the stored value
+llmctl config show                                # config file + effective dir
+```
+
+Settings are written to `$XDG_CONFIG_HOME/llm-runner/config.json` (default
+`~/.config/llm-runner/config.json`); override the location with
+`$LLM_RUNNER_CONFIG_DIR`. The `$LLM_RUNNER_MODELS_DIR` env var, if set, still
+takes precedence over the persisted value.
 
 ### State and logs
 
@@ -311,6 +523,8 @@ State (`running.json` + per-instance logs) is resolved in this order:
 Contents:
 
 - `running.json` — registry of active PIDs (reconciled on every `ps`/`stop`).
+- `autostart.json` — manifest of models to bring back via `llmctl restore`
+  (survives reboots; updated on `run`/`stop`).
 - `logs/` — per-instance log files, named `<key>-<port>-<timestamp>.log`.
 
 Wipe state if it ever desyncs from reality:

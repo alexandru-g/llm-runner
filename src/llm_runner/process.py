@@ -33,6 +33,10 @@ def _resolve_state_dir() -> Path:
 
 STATE_DIR = _resolve_state_dir()
 STATE_FILE = STATE_DIR / "running.json"
+# Durable "what the user wants running" manifest. Unlike running.json (which is
+# reconciled — dead PIDs are pruned), this survives a reboot so `restore` can
+# relaunch the last-running set. Kept in sync: `start` upserts, `stop` removes.
+AUTOSTART_FILE = STATE_DIR / "autostart.json"
 LOG_DIR = STATE_DIR / "logs"
 
 
@@ -45,6 +49,15 @@ class RunningProcess:
     model_path: str
     log_file: str
     cmd: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LaunchSpec:
+    """The minimal recipe needed to relaunch a model after a reboot."""
+    name: str
+    cmd: list[str]
+    port: int
+    model_path: str
 
 
 def _load() -> list[RunningProcess]:
@@ -70,6 +83,62 @@ def _alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _load_autostart() -> list[LaunchSpec]:
+    if not AUTOSTART_FILE.exists():
+        return []
+    try:
+        raw = json.loads(AUTOSTART_FILE.read_text())
+    except json.JSONDecodeError:
+        return []
+    return [LaunchSpec(**r) for r in raw]
+
+
+def _save_autostart(specs: list[LaunchSpec]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    AUTOSTART_FILE.write_text(json.dumps([asdict(s) for s in specs], indent=2))
+
+
+def autostart_list() -> list[LaunchSpec]:
+    return _load_autostart()
+
+
+def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str) -> None:
+    """Upsert a launch spec into the autostart manifest (keyed by name)."""
+    specs = [s for s in _load_autostart() if s.name != name]
+    specs.append(LaunchSpec(name=name, cmd=list(cmd), port=port,
+                            model_path=model_path))
+    _save_autostart(specs)
+
+
+def autostart_remove(name: str) -> None:
+    specs = _load_autostart()
+    kept = [s for s in specs if s.name != name]
+    if len(kept) != len(specs):
+        _save_autostart(kept)
+
+
+def restore() -> list[tuple[LaunchSpec, str]]:
+    """Relaunch every manifest model that isn't already running.
+
+    Idempotent: a model whose name is already live is left alone. Returns
+    ``(spec, status)`` pairs for reporting, where status is ``"started …"``,
+    ``"already running"``, or ``"error: …"``.
+    """
+    live = {p.name for p in list_running()}
+    results: list[tuple[LaunchSpec, str]] = []
+    for spec in _load_autostart():
+        if spec.name in live:
+            results.append((spec, "already running"))
+            continue
+        try:
+            rec = start(name=spec.name, cmd=spec.cmd, port=spec.port,
+                        model_path=spec.model_path)
+            results.append((spec, f"started pid={rec.pid} port={rec.port}"))
+        except Exception as e:  # never let one bad spec abort the rest
+            results.append((spec, f"error: {e}"))
+    return results
 
 
 def reconcile() -> list[RunningProcess]:
@@ -119,6 +188,8 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str) -> RunningPr
     procs = reconcile()
     procs.append(rec)
     _save(procs)
+    # Remember this launch so `restore` can bring it back after a reboot.
+    autostart_add(name=name, cmd=cmd, port=port, model_path=model_path)
     return rec
 
 
@@ -134,6 +205,8 @@ def stop(identifier: str, *, timeout: float = 10.0) -> RunningProcess | None:
         _signal_group(target.pid, signal.SIGKILL)
     procs = [p for p in reconcile() if p.pid != target.pid]
     _save(procs)
+    # An explicit stop means "don't autostart this next boot".
+    autostart_remove(target.name)
     return target
 
 
