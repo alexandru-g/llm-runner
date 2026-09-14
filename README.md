@@ -415,13 +415,32 @@ llmctl stop 12345                  # by PID
 
 Sends `SIGTERM` to the process group; escalates to `SIGKILL` after 10 s.
 
+### Re-run a model with its last arguments
+
+Every `llmctl run` records the exact invocation (model, flags, and the port it
+landed on) in a manifest, so you never have to remember the args again:
+
+```bash
+llmctl autostart list                        # shows each entry's `llmctl run …` line
+llmctl restart gemma-4-26b-a4b-it-ud-q4_k_m  # stop (if running) + relaunch, same args, same port
+llmctl restart gemma-4-26b-a4b-it-ud-q4_k_m --n-parallel 8   # …with one flag changed
+llmctl restore gemma-4-26b-a4b-it-ud-q4_k_m  # relaunch only if not already running
+```
+
+Overrides passed to `restart` win over the remembered flags and become the new
+remembered set. **Ports are pinned**: a model always comes back on the port it
+was first started on. If that port is taken, `restart`/`restore` report an
+error rather than silently moving it — pass `--port N` to `restart` to move
+it deliberately.
+
 ### Auto-restart running models on boot
 
-`llmctl` keeps a manifest of what you have running (updated on every `run` and
-`stop`) so the set can be brought back after a reboot:
+The same manifest (updated on every `run` and `stop`) brings the whole set
+back after a reboot:
 
 ```bash
 llmctl restore            # relaunch everything that was running pre-reboot
+llmctl restore NAME...    # only these entries
 llmctl autostart list     # show what restore would bring back
 ```
 

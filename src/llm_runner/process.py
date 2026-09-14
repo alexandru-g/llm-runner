@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -53,11 +54,28 @@ class RunningProcess:
 
 @dataclass
 class LaunchSpec:
-    """The minimal recipe needed to relaunch a model after a reboot."""
+    """The minimal recipe needed to relaunch a model after a reboot.
+
+    ``cmd`` is the fully-resolved llama-server argv (what actually runs);
+    ``run_args`` is the original ``llmctl run`` argv (minus ``--port``, which
+    is pinned separately) so the launch can be shown and re-issued with
+    overrides. Empty for manifests written before ``run_args`` existed.
+    """
     name: str
     cmd: list[str]
     port: int
     model_path: str
+    run_args: list[str] = field(default_factory=list)
+
+    def run_cmd(self) -> list[str]:
+        """The ``llmctl run …`` argv that reproduces this launch, port pinned."""
+        return ["run", *self.run_args, "--port", str(self.port)]
+
+
+def port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.2)
+        return s.connect_ex(("127.0.0.1", port)) == 0
 
 
 def _load() -> list[RunningProcess]:
@@ -104,12 +122,17 @@ def autostart_list() -> list[LaunchSpec]:
     return _load_autostart()
 
 
-def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str) -> None:
+def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
+                  run_args: list[str] | None = None) -> None:
     """Upsert a launch spec into the autostart manifest (keyed by name)."""
     specs = [s for s in _load_autostart() if s.name != name]
     specs.append(LaunchSpec(name=name, cmd=list(cmd), port=port,
-                            model_path=model_path))
+                            model_path=model_path, run_args=list(run_args or [])))
     _save_autostart(specs)
+
+
+def autostart_find(name: str) -> LaunchSpec | None:
+    return next((s for s in _load_autostart() if s.name == name), None)
 
 
 def autostart_remove(name: str) -> None:
@@ -119,22 +142,39 @@ def autostart_remove(name: str) -> None:
         _save_autostart(kept)
 
 
-def restore() -> list[tuple[LaunchSpec, str]]:
-    """Relaunch every manifest model that isn't already running.
+def restore(names: list[str] | None = None) -> list[tuple[LaunchSpec, str]]:
+    """Relaunch manifest models that aren't already running.
 
-    Idempotent: a model whose name is already live is left alone. Returns
+    ``names`` restricts the set (default: everything in the manifest).
+    Idempotent: a model whose name is already live is left alone. Ports are
+    pinned — an entry whose port is taken is reported, not moved. Returns
     ``(spec, status)`` pairs for reporting, where status is ``"started …"``,
     ``"already running"``, or ``"error: …"``.
     """
     live = {p.name for p in list_running()}
+    specs = _load_autostart()
+    if names:
+        by_name = {s.name: s for s in specs}
+        specs = []
+        for n in names:
+            if n in by_name:
+                specs.append(by_name[n])
+            else:
+                specs.append(LaunchSpec(name=n, cmd=[], port=0, model_path=""))
     results: list[tuple[LaunchSpec, str]] = []
-    for spec in _load_autostart():
+    for spec in specs:
+        if not spec.cmd:
+            results.append((spec, "error: not in autostart manifest"))
+            continue
         if spec.name in live:
             results.append((spec, "already running"))
             continue
+        if port_in_use(spec.port):
+            results.append((spec, f"error: port {spec.port} is in use"))
+            continue
         try:
             rec = start(name=spec.name, cmd=spec.cmd, port=spec.port,
-                        model_path=spec.model_path)
+                        model_path=spec.model_path, run_args=spec.run_args)
             results.append((spec, f"started pid={rec.pid} port={rec.port}"))
         except Exception as e:  # never let one bad spec abort the rest
             results.append((spec, f"error: {e}"))
@@ -164,7 +204,8 @@ def find(identifier: str) -> RunningProcess | None:
     return next((p for p in procs if p.name == identifier), None)
 
 
-def start(*, name: str, cmd: list[str], port: int, model_path: str) -> RunningProcess:
+def start(*, name: str, cmd: list[str], port: int, model_path: str,
+          run_args: list[str] | None = None) -> RunningProcess:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"{name}-{port}-{int(time.time())}.log"
     fh = open(log_file, "ab", buffering=0)
@@ -189,7 +230,8 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str) -> RunningPr
     procs.append(rec)
     _save(procs)
     # Remember this launch so `restore` can bring it back after a reboot.
-    autostart_add(name=name, cmd=cmd, port=port, model_path=model_path)
+    autostart_add(name=name, cmd=cmd, port=port, model_path=model_path,
+                  run_args=run_args)
     return rec
 
 

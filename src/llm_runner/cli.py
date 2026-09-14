@@ -9,23 +9,20 @@ import os
 import re
 import shlex
 import shutil
-import socket
 import subprocess
 import time
 from pathlib import Path
 
 import click
 
+from llm_runner import __version__
 from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner import registry
 from llm_runner.registry import MODELS_DIR, ModelSpec, discover_models
 
 
-def _port_in_use(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.2)
-        return s.connect_ex(("127.0.0.1", port)) == 0
+_port_in_use = proc.port_in_use
 
 
 def _next_free_port(start: int = 8080) -> int:
@@ -149,6 +146,29 @@ def _resolve_draft(draft_spec: str | None,
     return auto_spec.draft_path if auto_spec else None
 
 
+def _run_option_args(ctx: click.Context) -> list[str]:
+    """Rebuild the option part of the `llmctl run` argv from the params the
+    user passed on the command line (defaults are omitted so re-detection —
+    e.g. embeddings-by-filename — still applies on a re-run). ``--port`` is
+    left out: the manifest pins it separately."""
+    src = click.core.ParameterSource.COMMANDLINE
+    args: list[str] = []
+    for p in ctx.command.params:
+        if not isinstance(p, click.Option) or p.name == "port":
+            continue
+        if ctx.get_parameter_source(p.name) != src:
+            continue
+        val = ctx.params[p.name]
+        if p.is_flag:
+            if p.secondary_opts:  # --x/--no-x pair: emit whichever side was chosen
+                args.append(p.opts[0] if val else p.secondary_opts[0])
+            elif val:
+                args.append(p.opts[0])
+        elif val is not None:
+            args += [p.opts[0], str(val)]
+    return args
+
+
 def _require_llama_server() -> None:
     if shutil.which("llama-server") is None:
         raise click.UsageError(
@@ -159,8 +179,15 @@ def _require_llama_server() -> None:
 
 
 @click.group()
+@click.version_option(__version__, "--version", "-V", prog_name="llmctl")
 def cli() -> None:
     """Manage local llama-server instances."""
+
+
+@cli.command()
+def version() -> None:
+    """Print the llmctl version."""
+    click.echo(f"llmctl {__version__}")
 
 
 @cli.group()
@@ -307,7 +334,8 @@ def list_cmd() -> None:
 @click.option("--ubatch-size", "-ub", "ubatch_size", type=int, default=None,
               help="Physical batch size for --embeddings mode "
                    "(default: the context size). Ignored without --embeddings.")
-def run(model: str | None, port: int | None, ctx_size: int | None,
+@click.pass_context
+def run(ctx: click.Context, model: str | None, port: int | None, ctx_size: int | None,
         ft_path: Path | None, ft_name: str | None, reasoning: bool,
         kv_quant: str, n_gpu_layers: int, no_vision: bool,
         embeddings: bool | None, pooling: str, batch_size: int | None,
@@ -390,7 +418,11 @@ def run(model: str | None, port: int | None, ctx_size: int | None,
                      draft_path=draft_path, spec_type=spec_type,
                      spec_n_max=spec_n_max, n_parallel=n_parallel,
                      cache_ram=cache_ram, kv_unified=kv_unified)
-    rec = proc.start(name=name, cmd=cmd, port=chosen_port, model_path=str(model_path))
+    # Remember the llmctl-level invocation (with the interactively-picked model
+    # made explicit) so `restart`/`autostart list` can show and re-issue it.
+    run_args = ([] if ft_path else [model]) + _run_option_args(ctx)
+    rec = proc.start(name=name, cmd=cmd, port=chosen_port,
+                     model_path=str(model_path), run_args=run_args)
     click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}")
     if draft_path:
         click.echo(f"Speculative drafter: {draft_path.name}  "
@@ -571,20 +603,97 @@ def _build_unit() -> str:
 
 
 @cli.command()
-def restore() -> None:
-    """Relaunch the models that were running before the last reboot."""
+@click.argument("names", nargs=-1)
+def restore(names: tuple[str, ...]) -> None:
+    """Relaunch the models that were running before the last reboot.
+
+    Pass NAMES to restore only those manifest entries. Ports are pinned: an
+    entry whose port is taken is reported as an error, never moved.
+    """
     _require_llama_server()
-    results = proc.restore()
+    results = proc.restore(list(names) or None)
     if not results:
         click.echo("Nothing to restore (autostart manifest is empty).")
         return
+    failed = False
     for spec, status in results:
+        failed |= status.startswith("error")
         click.echo(f"{spec.name:<24}  {status}")
+    if failed:
+        raise SystemExit(1)
+
+
+@cli.command(context_settings={"ignore_unknown_options": True})
+@click.argument("identifier", required=False)
+@click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
+@click.pass_context
+def restart(ctx: click.Context, identifier: str | None,
+            overrides: tuple[str, ...]) -> None:
+    """Stop IDENTIFIER (if running) and relaunch it with its last `run` args.
+
+    Extra `run` options after the name override the remembered ones and are
+    remembered for next time, e.g.:
+
+      llmctl restart gemma-4-26b-a4b-it-ud-q4_k_m --n-parallel 8
+
+    The port is kept the same. Pass --port to move it deliberately.
+    """
+    _require_llama_server()
+    if identifier is None:
+        running = proc.list_running()
+        if not running:
+            raise click.UsageError(
+                "No models running. Pass a name from `llmctl autostart list`.")
+        identifier = _pick_instance_interactively(running).name
+    live = proc.find(identifier)
+    name = live.name if live else identifier
+    spec = proc.autostart_find(name)
+    if spec is None:
+        raise click.UsageError(
+            f"'{name}' is not in the autostart manifest "
+            "(see `llmctl autostart list`).")
+    if not spec.run_args and overrides:
+        raise click.UsageError(
+            f"'{name}' was recorded before run args were tracked; re-run it "
+            "with `llmctl run …` once, then `restart` can take overrides.")
+
+    if live:
+        proc.stop(name)
+        click.echo(f"Stopped {name}  pid={live.pid}  port={live.port}")
+        # The listen socket closes with the process, but give the kernel a
+        # beat so the pinned port is free again before we rebind it.
+        for _ in range(20):
+            if not _port_in_use(spec.port):
+                break
+            time.sleep(0.25)
+
+    if not spec.run_args:
+        # Legacy manifest entry: relaunch the resolved llama-server command as-is.
+        rec = proc.start(name=spec.name, cmd=spec.cmd, port=spec.port,
+                         model_path=spec.model_path)
+        click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}")
+        return
+
+    # Re-issue `llmctl run` with the remembered args; overrides come last so
+    # they win, and `run` re-records the merged set in the manifest.
+    args = spec.run_cmd()[1:] + list(overrides)
+    click.echo(f"Re-running: llmctl run {shlex.join(args)}")
+    sub = run.make_context("llmctl run", args, parent=ctx)
+    with sub:
+        run.invoke(sub)
 
 
 @cli.group()
 def autostart() -> None:
     """Restart the last-running models on boot via a systemd user service."""
+
+
+def _fmt_run_line(s: proc.LaunchSpec) -> str:
+    """The `llmctl run …` line that reproduces a manifest entry, or a hint for
+    entries recorded before run args were tracked."""
+    if s.run_args:
+        return f"llmctl {shlex.join(s.run_cmd())}"
+    return "(run args not recorded — `llmctl run` it again with your flags to capture them)"
 
 
 @autostart.command("list")
@@ -596,6 +705,7 @@ def autostart_list_cmd() -> None:
         return
     for s in specs:
         click.echo(f"{s.name:<24}  port={s.port}  {s.model_path}")
+        click.echo(f"{'':<24}  {_fmt_run_line(s)}")
 
 
 @autostart.command("install")
@@ -626,6 +736,13 @@ def autostart_install() -> None:
             lvl = "error" if required else "note"
             click.echo(f"  {lvl}: `{' '.join(cmd)}` failed ({e}) — run it manually.",
                        err=True)
+            if cmd[0] == "loginctl":
+                # Enabling linger for yourself needs polkit auth, which SSH
+                # sessions usually lack; root can always do it.
+                click.echo("        Without linger the service only runs after you "
+                           "log in. To start it at boot, run:\n"
+                           f"          sudo loginctl enable-linger {getpass.getuser()}",
+                           err=True)
     click.echo("\nInstalled. Test it now without rebooting:\n"
                f"  systemctl --user start {SERVICE_NAME} && llmctl ps")
 
@@ -653,6 +770,7 @@ def autostart_status() -> None:
     click.echo(f"Manifest: {len(specs)} model(s)")
     for s in specs:
         click.echo(f"  {s.name:<24}  port={s.port}")
+        click.echo(f"  {'':<24}  {_fmt_run_line(s)}")
     if unit_path.exists():
         subprocess.run(["systemctl", "--user", "status", SERVICE_NAME,
                         "--no-pager"], check=False)
