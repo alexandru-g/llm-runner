@@ -1,12 +1,18 @@
 # llm-runner
 
-Background runner for local `llama-server` instances.
+Background runner for local model servers.
 
-CLI (`llmctl`) to download, list, start, stop, and tail GGUF models served via
-[llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`. Works
-with any GGUF from Hugging Face (Gemma, Llama, Qwen, Mistral, etc.) and
-arbitrary local files via `--ft`. Embedding models (e.g. bge-m3) are supported
-too via `--embeddings`.
+CLI (`llmctl`) to download, list, start, stop, and tail models served via
+[llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` (GGUF
+files) or [vLLM](https://docs.vllm.ai) (Hugging Face safetensors
+checkpoints). Works with any GGUF or HF checkpoint (Gemma, Llama, Qwen,
+Mistral, etc.) and arbitrary local files/dirs via `--ft`. Embedding models
+(e.g. bge-m3) are supported too via `--embeddings`.
+
+The backend is picked from the model format: a `.gguf` runs on
+`llama-server`, a checkpoint directory (`config.json` + `*.safetensors`) runs
+on `vllm serve`. Both expose the same OpenAI-compatible `/v1` API, so clients
+don't care which one is behind a port.
 
 ## Install
 
@@ -146,17 +152,98 @@ llama-server --version
 equivalent of `build-essential`, `cmake`, `git`, and `libcurl4-openssl-dev`
 via your package manager, plus your accelerator's driver/toolkit.
 
+### 3. `vllm` (optional, for Hugging Face checkpoints)
+
+vLLM is a Python package with a CUDA-specific torch build, so give it its own
+env rather than installing it next to `llmctl`:
+
+```bash
+conda create -n vllm python=3.12 -y
+conda activate vllm
+pip install vllm
+vllm --version
+```
+
+`llmctl` finds the binary without the env being active: it checks
+`$LLM_RUNNER_VLLM_BIN`, then the persisted `vllm_bin` setting, then `PATH`,
+then a conda/venv env named `vllm`, then any conda env. If it lives somewhere
+else:
+
+```bash
+llmctl config vllm-bin ~/some/env/bin/vllm
+llmctl config show          # lists both backends and where they resolve
+```
+
+vLLM JIT-compiles a few kernels (flashinfer sampler) on first start, which
+needs a working `nvcc` **and** a host C++ compiler it accepts. If a start dies
+with `cannot execute 'cc1plus'` or `Ninja build failed` in `llmctl logs`,
+either install the C++ half of whatever `gcc` is first on your PATH (a conda
+`gcc_linux-64` without `gxx_linux-64` is the usual culprit:
+`conda install -n base -c conda-forge gxx=<same version>`), or skip that JIT:
+
+```bash
+llmctl run <model> -E VLLM_USE_FLASHINFER_SAMPLER=0
+```
+
+### 4. `decider` (optional, for decision servers)
+
+[Mapika/decider](https://github.com/Mapika/decider) serves *decision* models
+— typed questions in, calibrated probabilities out, no text generation — on
+the Jev wire (`POST /v1/systemone`). It is a Python package with its own
+torch build, so clone it and give it a venv, then point `llmctl` at the
+clone:
+
+```bash
+git clone https://github.com/Mapika/decider /fast/ml/jev/decider
+cd /fast/ml/jev/decider
+uv venv --python 3.12 .venv312 && uv pip install -p .venv312/bin/python -e ".[serve]"
+llmctl config decider-dir /fast/ml/jev/decider   # or $LLM_RUNNER_DECIDER_DIR
+llmctl download Mapika/decider-2b --hf           # an HF checkpoint + decider_config.json
+llmctl run decider-2b -p 8009 --wait             # backend auto-detected from decider_config.json
+curl -s localhost:8009/v1/systemone -H 'content-type: application/json' \
+  -d '{"state": "My card was charged twice.", "questions": {"refund": {"type": "noul", "instructions": "A refund is due."}}}'
+```
+
+A checkpoint directory that carries `decider_config.json` is listed with
+backend `decider` and served by `decider.serve` (uvicorn from the clone's
+`.venv*/bin`). The launch profile is sized for a GPU shared with a
+llama-server: CUDA graphs only up to 8 × 1024 tokens, batch ≤ 8, eager
+forwards capped at 4,608 padded tokens, bf16 linears,
+`DECIDER_TEMPERATURE=1.0` (raw model — apply your own fitted scaling
+client-side); decider-2b then takes ~5.6 GB loaded / ~6.1 GB peak on a 4090.
+`--n-parallel N` sets the batch, `-E KEY=VALUE` overrides any `DECIDER_*`
+knob (e.g. `-E DECIDER_FP8=1` for fp8 linears: ~0.7 GB less, half the
+throughput without torch.compile), `-X` appends uvicorn flags. The graph-capture caps
+(`DECIDER_WARMUP_MAX_B`, `DECIDER_GRAPH_MAX_T`) need the small `serve.py`
+patch kept in enersec-agentic (`benchmark/decisions/serving-decider-footprint.patch`)
+until it is upstream; without it they are ignored and the server captures
+its default 72 graphs (~20 GB peak for the 2B).
+
 ## Models
 
-Models are discovered dynamically: any `*.gguf` file under `MODELS_DIR` is a
-candidate, with a friendly key derived from its filename. Any `*mmproj*.gguf`
-in the same folder is auto-attached as the vision projector.
+Models are discovered dynamically under `MODELS_DIR`:
+
+- any `*.gguf` file is a **llama** model, keyed by its filename stem. Any
+  `*mmproj*.gguf` in the same folder is auto-attached as the vision projector;
+- any directory holding a Hugging Face checkpoint (`config.json` plus
+  `*.safetensors`/`*.bin` weights) is a **vllm** model, keyed by the directory
+  name.
+
+`llmctl list` shows which backend each key resolves to.
 
 ### Get a model with `llmctl download`
 
 ```bash
-llmctl download unsloth/gemma-4-E4B-it-GGUF
+llmctl download unsloth/gemma-4-E4B-it-GGUF   # GGUF repo → pick a quant → llama
+llmctl download Qwen/Qwen3-8B                 # no GGUFs → whole checkpoint → vllm
+llmctl download some/repo --hf                # force the checkpoint even if GGUFs exist
 ```
+
+A checkpoint repo is snapshotted whole (safetensors, config, tokenizer),
+skipping legacy `.bin`/`.pth` weights when safetensors are present and any
+`original/` or `consolidated*` files. Gated repos need `hf auth login` or
+`$HF_TOKEN`. Local layout: `MODELS_DIR/<repo-name-lowercased>/`, so
+`Qwen/Qwen3-8B` becomes the key `qwen3-8b`.
 
 You'll get an arrow-key picker listing every quant in the repo with file size.
 After selecting, the matching `mmproj` (vision projector) and any
@@ -251,23 +338,32 @@ speculative/MTP drafter sits alongside and is auto-attached on `run` (see
 
 ```bash
 llmctl run                          # interactive picker
-llmctl run gemma-4-e4b-it-q4_k_m    # by key
+llmctl run gemma-4-e4b-it-q4_k_m    # by key → llama-server
+llmctl run qwen3-8b --wait          # HF checkpoint → vllm; --wait blocks until /health
 ```
 
+- Backend: from the model format (`--backend llama|vllm` to force; see
+  [vLLM specifics](#vllm-specifics)).
 - Default port: first free port from `8080`.
 - Default context size: `32768`.
 - Override either: `-p 8081 -c 65536`.
-- Reasoning is **disabled by default** (`--reasoning-budget 0`). Pass
-  `--reasoning` to let the model's default reasoning behavior apply.
+- Reasoning is **disabled by default** on llama (`--reasoning-budget 0`). Pass
+  `--reasoning` to let the model's default reasoning behavior apply. On vllm
+  use `--reasoning-parser <name>` to get `reasoning_content` split out.
 - Serve an embedding model with `--embeddings` (see [Embedding models](#embedding-models)).
 - Process is detached (own session, survives the CLI exit). Stdout/stderr go
-  to a per-instance log file under the state dir.
+  to a per-instance log file under the state dir. `--wait` polls `/health`
+  and exits non-zero if the server dies first — useful for vllm, which takes
+  a minute or more to load and compile.
+- `-X '<args>'` appends anything verbatim to the server command; `-E K=V`
+  sets an env var for it. Both are remembered for `restart`/`restore`.
 
-Run an arbitrary GGUF outside `MODELS_DIR`:
+Run an arbitrary GGUF or checkpoint dir outside `MODELS_DIR`:
 
 ```bash
 llmctl run --ft /path/to/finetune.gguf
 llmctl run --ft /path/to/finetune.gguf --name my-ft -p 8082 -c 16384
+llmctl run --ft /path/to/hf-checkpoint-dir --name my-ft     # → vllm
 ```
 
 ### Speculative decoding (MTP drafters)
@@ -494,16 +590,66 @@ clients:
 model: local:local
 ```
 
+### vLLM specifics
+
+```bash
+llmctl run qwen3-8b --wait                  # block until /health answers (vllm takes ~1 min)
+llmctl run qwen3-8b --gpu-mem 0.5           # cap at 50% of *total* VRAM (vllm default 0.9)
+llmctl run qwen3-8b --tool-parser hermes    # OpenAI tool calling (--enable-auto-tool-choice)
+llmctl run qwen3-8b --reasoning-parser qwen3   # split thinking into reasoning_content
+llmctl run qwen3-8b --kv-quant q8_0         # → --kv-cache-dtype fp8 (no 4-bit KV in vllm)
+llmctl run qwen3-8b --n-parallel 16         # → --max-num-seqs
+llmctl run qwen3-8b -X '--max-num-batched-tokens 8192'   # anything else, verbatim
+llmctl run qwen3-8b -E VLLM_USE_FLASHINFER_SAMPLER=0     # env var for the server process
+```
+
+How the shared `run` flags map:
+
+| `llmctl run`        | llama-server                  | vllm serve                         |
+|---------------------|-------------------------------|------------------------------------|
+| `--ctx-size N`      | `--ctx-size N`                | `--max-model-len N`                |
+| `--kv-quant q8_0`   | `--cache-type-k/v q8_0`       | `--kv-cache-dtype fp8`             |
+| `--n-parallel N`    | `--parallel N`                | `--max-num-seqs N`                 |
+| `--embeddings`      | `--embeddings --pooling ...`  | `--runner pooling`                 |
+| `--draft M`         | `--model-draft M`             | `--speculative-config {draft_model}` |
+| `--spec-type ngram` | (llama types)                 | `--speculative-config {ngram}`     |
+| `--name X`          | display name only             | also `--served-model-name X`       |
+| `-X ARGS` / `-E K=V`| appended / env                | appended / env                     |
+
+`--gpu-mem`, `--tool-parser`, `--reasoning-parser` and `--trust-remote-code`
+are vllm-only; `--n-gpu-layers`, `--no-vision`, `--kv-unified`, `--cache-ram`,
+`--reasoning` and the embedding batch flags are llama-only. Passing one to the
+other backend prints a warning and ignores it.
+
+`--gpu-mem` is how vllm shares the card. It reserves that fraction of
+**total** GPU memory up front (all of it, as KV cache — even for a tiny
+model) and refuses to start if it isn't free. When omitted, llmctl computes
+it from the VRAM free at launch (minus ~0.75 GB headroom, capped at vllm's
+own 0.9) and prints the value it chose. So:
+
+- vllm alone → it takes ~everything. Fine.
+- llama model already running → the default fits in what's left. Fine.
+- vllm first, llama model later → pass a deliberate `--gpu-mem 0.3` or the
+  llama model won't fit.
+
+`restart` recomputes the default; `restore` replays the value recorded at
+launch.
+
+The model id clients send is the registry key (or `--name`), e.g.
+`"model": "qwen3-8b"`; check with `curl localhost:<port>/v1/models`.
+
 ## Running multiple models concurrently
 
 ```bash
 llmctl run gemma-4-e4b-it-q4_k_m       # → 8080
 llmctl run gemma-4-31b-it-q4_k_m -p 8081
+llmctl run qwen3-8b --gpu-mem 0.3      # vllm alongside the llama instances
 llmctl ps
 ```
 
 Each instance gets its own port and log file. The auto-port picker walks up
-from 8080, so omitting `-p` for the second model also works.
+from 8080, so omitting `-p` for the second model also works. Backends mix
+freely; `ps`, `show` and `autostart list` report which one each instance uses.
 
 ## Configuration
 
@@ -530,6 +676,10 @@ Settings are written to `$XDG_CONFIG_HOME/llm-runner/config.json` (default
 `~/.config/llm-runner/config.json`); override the location with
 `$LLM_RUNNER_CONFIG_DIR`. The `$LLM_RUNNER_MODELS_DIR` env var, if set, still
 takes precedence over the persisted value.
+
+The other persisted setting is `vllm_bin` (`llmctl config vllm-bin <path>`,
+`--clear` to forget); `$LLM_RUNNER_VLLM_BIN` overrides it. See the vllm
+install section for the full lookup order.
 
 ### State and logs
 

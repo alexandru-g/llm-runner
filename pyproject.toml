@@ -1,7 +1,7 @@
 [project]
 name = "llm-runner"
-version = "0.1.0"
-description = "Background runner for local llama-server instances."
+version = "0.2.0"
+description = "Background runner for local model servers (llama-server / vllm)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

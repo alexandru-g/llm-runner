@@ -1,4 +1,4 @@
-"""CLI for managing background llama-server instances."""
+"""CLI for managing background model servers (llama-server / vllm)."""
 from __future__ import annotations
 
 import contextlib
@@ -11,14 +11,18 @@ import shlex
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import click
 
 from llm_runner import __version__
+from llm_runner import backends
 from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner import registry
+from llm_runner.backends import DECIDER, LLAMA, VLLM
 from llm_runner.registry import MODELS_DIR, ModelSpec, discover_models
 
 
@@ -46,15 +50,16 @@ def _looks_like_embedding_model(name: str) -> bool:
     return any(hint in low for hint in _EMBEDDING_NAME_HINTS)
 
 
-def _build_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size: int,
-               reasoning: bool, *, kv_quant: str = "f16",
-               n_gpu_layers: int = 999, embeddings: bool = False,
-               pooling: str = "cls", batch_size: int | None = None,
-               ubatch_size: int | None = None, draft_path: Path | None = None,
-               spec_type: str = "draft-mtp", spec_n_max: int = 3,
-               n_parallel: int | None = None,
-               cache_ram: int = 0,
-               kv_unified: bool | None = None) -> list[str]:
+def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size: int,
+                     reasoning: bool, *, kv_quant: str = "f16",
+                     n_gpu_layers: int = 999, embeddings: bool = False,
+                     pooling: str = "cls", batch_size: int | None = None,
+                     ubatch_size: int | None = None, draft_path: Path | None = None,
+                     spec_type: str = "draft-mtp", spec_n_max: int = 3,
+                     n_parallel: int | None = None,
+                     cache_ram: int = 0,
+                     kv_unified: bool | None = None,
+                     extra: list[str] | None = None) -> list[str]:
     if embeddings:
         # Embedding models (e.g. BERT-style bge-m3) take no chat/generation
         # flags: flash-attn isn't supported, and the prompt-cache / reasoning
@@ -75,6 +80,7 @@ def _build_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size: int,
             "--host", "0.0.0.0",
             "--embeddings",
             "--pooling", pooling,
+            *(extra or []),
         ]
     cmd = [
         "llama-server",
@@ -121,28 +127,42 @@ def _build_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size: int,
             "--spec-type", spec_type,
             "--spec-draft-n-max", str(spec_n_max),
         ])
+    if extra:
+        cmd.extend(extra)
     return cmd
 
 
-def _resolve_draft(draft_spec: str | None,
-                   auto_spec: ModelSpec | None) -> Path | None:
-    """Resolve the speculative drafter to wire up as ``--model-draft``.
+def _resolve_draft(draft_spec: str | None, auto_spec: ModelSpec | None,
+                   backend: str = LLAMA) -> Path | None:
+    """Resolve the speculative drafter (llama ``--model-draft`` / vllm
+    ``--speculative-config`` model).
 
-    ``draft_spec`` (from ``--draft``) may be a path to a GGUF or a registry
-    key. When it is omitted, fall back to the drafter auto-attached to
-    ``auto_spec`` (a sibling ``*-MTP`` / ``*-assistant`` file), if any.
+    ``draft_spec`` (from ``--draft``) may be a path (GGUF file, or checkpoint
+    dir for vllm), a registry key, or — vllm only — a Hugging Face repo id
+    that vllm fetches itself. When it is omitted, fall back to the drafter
+    auto-attached to ``auto_spec`` (a sibling ``*-MTP`` / ``*-assistant``
+    GGUF), if any — llama only, since that file is a GGUF.
     """
     if draft_spec:
         p = Path(draft_spec).expanduser()
-        if p.is_file():
+        if p.is_file() or (backend == VLLM and p.is_dir()):
             return p.resolve()
         specs = discover_models()
         if draft_spec in specs:
-            return specs[draft_spec].model_path
+            cand = specs[draft_spec]
+            if cand.backend != backend:
+                raise click.BadArgumentUsage(
+                    f"--draft '{draft_spec}' is a {cand.backend} model; the "
+                    f"drafter must match the {backend} backend.")
+            return cand.model_path
+        if backend == VLLM and re.fullmatch(r"[\w.-]+/[\w.-]+", draft_spec):
+            return Path(draft_spec)  # HF repo id; vllm downloads it
         raise click.BadArgumentUsage(
-            f"--draft '{draft_spec}' is neither an existing GGUF file nor a "
+            f"--draft '{draft_spec}' is neither an existing model file/dir nor a "
             "known model key."
         )
+    if backend == VLLM:
+        return None
     return auto_spec.draft_path if auto_spec else None
 
 
@@ -150,11 +170,12 @@ def _run_option_args(ctx: click.Context) -> list[str]:
     """Rebuild the option part of the `llmctl run` argv from the params the
     user passed on the command line (defaults are omitted so re-detection —
     e.g. embeddings-by-filename — still applies on a re-run). ``--port`` is
-    left out: the manifest pins it separately."""
+    left out: the manifest pins it separately. So is ``--wait``: it's about
+    this invocation, not the launch."""
     src = click.core.ParameterSource.COMMANDLINE
     args: list[str] = []
     for p in ctx.command.params:
-        if not isinstance(p, click.Option) or p.name == "port":
+        if not isinstance(p, click.Option) or p.name in ("port", "wait"):
             continue
         if ctx.get_parameter_source(p.name) != src:
             continue
@@ -164,24 +185,86 @@ def _run_option_args(ctx: click.Context) -> list[str]:
                 args.append(p.opts[0] if val else p.secondary_opts[0])
             elif val:
                 args.append(p.opts[0])
+        elif p.multiple:
+            for v in val:
+                args += [p.opts[0], str(v)]
         elif val is not None:
             args += [p.opts[0], str(val)]
     return args
 
 
-def _require_llama_server() -> None:
-    if shutil.which("llama-server") is None:
-        raise click.UsageError(
-            "`llama-server` binary not found on PATH. Install llama.cpp "
-            "(https://github.com/ggml-org/llama.cpp) and ensure llama-server "
-            "is on PATH."
-        )
+def _require_backend(backend: str) -> str:
+    """Return the server binary for ``backend`` or fail with an install hint."""
+    binary = backends.find(backend)
+    if binary is None:
+        raise click.UsageError(backends.missing_hint(backend))
+    return binary
+
+
+# `run` options that only mean something to llama-server. Passing one with
+# --backend vllm is almost certainly a mistake (or a stale `restart`
+# override), so warn instead of silently dropping it.
+_LLAMA_ONLY_PARAMS = {
+    "reasoning": "--reasoning", "n_gpu_layers": "--n-gpu-layers",
+    "no_vision": "--no-vision", "kv_unified": "--kv-unified/--no-kv-unified",
+    "cache_ram": "--cache-ram", "pooling": "--pooling",
+    "batch_size": "--batch-size", "ubatch_size": "--ubatch-size",
+}
+_VLLM_ONLY_PARAMS = {
+    "gpu_mem": "--gpu-mem", "tool_parser": "--tool-parser",
+    "reasoning_parser": "--reasoning-parser",
+    "trust_remote_code": "--trust-remote-code",
+}
+
+
+def _warn_foreign_flags(ctx: click.Context, backend: str) -> None:
+    src = click.core.ParameterSource.COMMANDLINE
+    if backend == DECIDER:
+        # decider takes only --port / --n-parallel / -X / -E; everything
+        # engine-specific is meaningless there.
+        groups = {LLAMA: _LLAMA_ONLY_PARAMS, VLLM: _VLLM_ONLY_PARAMS}
+    else:
+        groups = {VLLM: _VLLM_ONLY_PARAMS} if backend == LLAMA else {LLAMA: _LLAMA_ONLY_PARAMS}
+    for other, foreign in groups.items():
+        used = [flag for name, flag in foreign.items()
+                if ctx.get_parameter_source(name) == src]
+        if used:
+            click.echo(f"warning: {other}-only option(s) ignored for {backend}: "
+                       f"{', '.join(used)}", err=True)
+
+
+def _wait_healthy(rec: proc.RunningProcess, timeout: float) -> bool:
+    """Poll ``/health`` until the server answers 200, the process dies, or
+    ``timeout`` elapses. Both llama-server and vllm expose it."""
+    url = f"http://127.0.0.1:{rec.port}/health"
+    deadline = time.time() + timeout
+    spinner = "|/-\\"
+    i = 0
+    while time.time() < deadline:
+        if not proc._alive(rec.pid):
+            click.echo(f"\rServer exited before becoming healthy — see "
+                       f"`llmctl logs {rec.name}`.", err=True)
+            return False
+        try:
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                if resp.status == 200:
+                    click.echo("\rReady.                    ")
+                    return True
+        except (urllib.error.URLError, OSError, TimeoutError):
+            pass
+        click.echo(f"\rWaiting for {url} {spinner[i % 4]} ", nl=False)
+        i += 1
+        time.sleep(1.0)
+    click.echo(f"\rStill not healthy after {timeout:.0f}s; it may just be slow "
+               f"to load — check `llmctl logs {rec.name}`.", err=True)
+    return False
 
 
 @click.group()
 @click.version_option(__version__, "--version", "-V", prog_name="llmctl")
 def cli() -> None:
-    """Manage local llama-server instances."""
+    """Manage local model servers (llama-server for GGUF, vllm for HF
+    checkpoints)."""
 
 
 @cli.command()
@@ -211,6 +294,74 @@ def config_show() -> None:
     click.echo(f"\nEffective models dir: {registry._resolve_models_dir()}")
     if os.environ.get("LLM_RUNNER_MODELS_DIR"):
         click.echo("  (overridden by $LLM_RUNNER_MODELS_DIR)")
+    click.echo("\nBackends:")
+    for backend in backends.BACKENDS:
+        found = backends.find(backend)
+        click.echo(f"  {backend:<6} {found or '(not found)'}")
+    if os.environ.get("LLM_RUNNER_VLLM_BIN"):
+        click.echo("  (vllm overridden by $LLM_RUNNER_VLLM_BIN)")
+    if os.environ.get("LLM_RUNNER_DECIDER_DIR"):
+        click.echo("  (decider overridden by $LLM_RUNNER_DECIDER_DIR)")
+
+
+@config.command("vllm-bin")
+@click.argument("path", required=False,
+                type=click.Path(dir_okay=False, path_type=Path))
+@click.option("--clear", is_flag=True, help="Forget the stored path.")
+def config_vllm_bin(path: Path | None, clear: bool) -> None:
+    """Persist the path to the `vllm` CLI, or print it when PATH is omitted.
+
+    Only needed when vllm lives somewhere llmctl doesn't look: PATH, a
+    conda/venv env named `vllm`, or any conda env. Example:
+
+      llmctl config vllm-bin ~/miniconda3/envs/vllm/bin/vllm
+    """
+    if clear:
+        config_mod.set_vllm_bin(None)
+        click.echo("vllm_bin cleared")
+        return
+    if path is None:
+        configured = config_mod.get_vllm_bin()
+        if configured:
+            click.echo(str(configured))
+        else:
+            found = backends.find_vllm()
+            click.echo(f"(not set; {'auto-detected ' + found if found else 'vllm not found'})")
+        return
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        click.echo(f"warning: {resolved} does not exist", err=True)
+    saved = config_mod.set_vllm_bin(resolved)
+    click.echo(f"vllm_bin set to {saved}")
+    if os.environ.get("LLM_RUNNER_VLLM_BIN"):
+        click.echo("note: $LLM_RUNNER_VLLM_BIN is set and overrides this.", err=True)
+
+
+@config.command("decider-dir")
+@click.argument("path", required=False,
+                type=click.Path(file_okay=False, path_type=Path))
+@click.option("--clear", is_flag=True, help="Forget the stored path.")
+def config_decider_dir(path: Path | None, clear: bool) -> None:
+    """Persist the Mapika/decider clone dir (its .venv*/bin/uvicorn serves
+    decider checkpoints), or print it when PATH is omitted. Example:
+
+      llmctl config decider-dir /fast/ml/jev/decider
+    """
+    if clear:
+        config_mod.set_decider_dir(None)
+        click.echo("decider_dir cleared")
+        return
+    if path is None:
+        configured = config_mod.get_decider_dir()
+        click.echo(str(configured) if configured else "(not set)")
+        return
+    resolved = Path(path).expanduser().resolve()
+    if not (resolved / "decider" / "serve.py").is_file():
+        click.echo(f"warning: {resolved}/decider/serve.py does not exist", err=True)
+    saved = config_mod.set_decider_dir(resolved)
+    click.echo(f"decider_dir set to {saved}")
+    if os.environ.get("LLM_RUNNER_DECIDER_DIR"):
+        click.echo("note: $LLM_RUNNER_DECIDER_DIR is set and overrides this.", err=True)
 
 
 @config.command("models-dir")
@@ -242,42 +393,82 @@ def config_models_dir(path: Path | None, create: bool) -> None:
 
 @cli.command("list")
 def list_cmd() -> None:
-    """List GGUF models discovered on disk under MODELS_DIR."""
+    """List models discovered on disk under MODELS_DIR.
+
+    GGUF files are served by llama-server; Hugging Face checkpoint
+    directories (config.json + safetensors) by vllm, or by decider.serve when
+    they carry a decider_config.json.
+    """
     click.echo(f"Models dir: {MODELS_DIR}")
     specs = discover_models()
     if not specs:
-        click.echo("\n(no .gguf models found — use `llmctl download <repo>` to fetch one)")
+        click.echo("\n(no models found — use `llmctl download <repo>` to fetch one)")
         return
     key_w = max(20, max(len(k) for k in specs))
     click.echo("")
-    click.echo(f"{'KEY':<{key_w}}  {'SIZE':>8}  {'VISION':<6}  {'DRAFT':<6}  PATH")
-    click.echo("-" * (key_w + 48))
+    click.echo(f"{'KEY':<{key_w}}  {'BACKEND':<7}  {'SIZE':>8}  {'VISION':<6}  {'DRAFT':<6}  PATH")
+    click.echo("-" * (key_w + 57))
     for key, spec in specs.items():
         size = _fmt_size(spec.size).strip()
         vision = "yes" if spec.has_vision else ""
         draft = "yes" if spec.has_draft else ""
         rel = spec.model_path.relative_to(MODELS_DIR) if spec.model_path.is_relative_to(MODELS_DIR) else spec.model_path
-        click.echo(f"{key:<{key_w}}  {size:>8}  {vision:<6}  {draft:<6}  {rel}")
+        click.echo(f"{key:<{key_w}}  {spec.backend:<7}  {size:>8}  {vision:<6}  {draft:<6}  {rel}")
 
 
 @cli.command()
 @click.argument("model", required=False)
+@click.option("--backend", type=click.Choice(["auto", LLAMA, VLLM, DECIDER]), default="auto",
+              show_default=True,
+              help="Serving engine. auto = llama-server for a GGUF, vllm for a "
+                   "Hugging Face checkpoint directory.")
 @click.option("--port", "-p", type=int, default=None,
               help="Listen port. Auto-selected starting at 8080 if omitted or taken.")
 @click.option("--ctx-size", "-c", type=int, default=None,
-              help="Context size (default: 32768 for chat, 8192 for --embeddings).")
+              help="Context size (default: 32768 for chat, 8192 for --embeddings). "
+                   "vllm: --max-model-len.")
 @click.option("--ft", "ft_path",
-              type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              help="Path to a finetuned GGUF file (bypasses the registry).")
+              type=click.Path(exists=True, path_type=Path),
+              help="Path to a finetuned GGUF file, or an HF checkpoint directory "
+                   "for vllm (bypasses the registry).")
 @click.option("--name", "ft_name", default=None,
-              help="Override the display name (useful with --ft).")
+              help="Override the display name (useful with --ft). For vllm this "
+                   "is also the model id clients send (--served-model-name).")
+@click.option("--wait/--no-wait", "wait", default=False,
+              help="Block until the server answers /health (or exits). Handy for "
+                   "vllm, which takes a minute or more to load and compile.")
+@click.option("--extra", "-X", "extra", multiple=True,
+              help="Extra argument(s) appended verbatim to the server command; "
+                   "repeatable, each value is shell-split. e.g. "
+                   "-X '--max-num-batched-tokens 8192'.")
+@click.option("--env", "-E", "env_pairs", multiple=True, metavar="KEY=VALUE",
+              help="Environment variable for the server process; repeatable. "
+                   "Remembered for restart/restore. e.g. "
+                   "-E VLLM_USE_FLASHINFER_SAMPLER=0.")
 @click.option("--reasoning", is_flag=True, default=False,
-              help="Enable reasoning. Disabled by default (--reasoning-budget 0).")
+              help="Enable reasoning. Disabled by default (--reasoning-budget 0). "
+                   "llama only; for vllm see --reasoning-parser.")
 @click.option("--kv-quant", type=click.Choice(["f16", "q8_0", "q4_0"]),
               default="f16",
               help="Quantize the KV cache to save VRAM. q8_0 ≈ half the f16 size "
                    "and is near-lossless; q4_0 halves it again with some quality "
-                   "cost. Great for fitting big models / long context in VRAM.")
+                   "cost. Great for fitting big models / long context in VRAM. "
+                   "vllm: q8_0 → --kv-cache-dtype fp8 (no 4-bit KV in vllm).")
+@click.option("--gpu-mem", "gpu_mem", type=click.FloatRange(0.05, 1.0), default=None,
+              help="vllm only: fraction of *total* GPU memory vllm may claim "
+                   "(--gpu-memory-utilization). vllm refuses to start if that "
+                   "much isn't free, so the default is computed from the VRAM "
+                   "currently free (minus headroom, capped at vllm's own 0.9) — "
+                   "pass it explicitly to pin a value.")
+@click.option("--tool-parser", "tool_parser", default=None,
+              help="vllm only: enable OpenAI tool calling with this parser "
+                   "(--enable-auto-tool-choice --tool-call-parser), e.g. hermes, "
+                   "llama3_json, mistral, pythonic, qwen3_coder.")
+@click.option("--reasoning-parser", "reasoning_parser", default=None,
+              help="vllm only: split reasoning into reasoning_content with this "
+                   "parser (--reasoning-parser), e.g. deepseek_r1, qwen3.")
+@click.option("--trust-remote-code", is_flag=True, default=False,
+              help="vllm only: allow the checkpoint's custom modeling code.")
 @click.option("--n-gpu-layers", "--ngl", "n_gpu_layers", type=int, default=999,
               help="Layers to offload to GPU (default: all). Lower it to spill "
                    "the rest onto CPU when VRAM is tight (slower, but it fits).")
@@ -307,7 +498,7 @@ def list_cmd() -> None:
                    "concurrent requests, but they split the KV cache and weaken "
                    "prompt-prefix reuse. Defaults to 1 when a drafter is attached "
                    "(MTP + prefix reuse work best single-stream); otherwise "
-                   "llama-server auto-selects.")
+                   "llama-server auto-selects. vllm: --max-num-seqs (default 256).")
 @click.option("--kv-unified/--no-kv-unified", "kv_unified", default=None,
               help="Share one KV buffer across all slots (llama-server "
                    "--kv-unified) so each slot may use the full --ctx-size "
@@ -335,21 +526,29 @@ def list_cmd() -> None:
               help="Physical batch size for --embeddings mode "
                    "(default: the context size). Ignored without --embeddings.")
 @click.pass_context
-def run(ctx: click.Context, model: str | None, port: int | None, ctx_size: int | None,
-        ft_path: Path | None, ft_name: str | None, reasoning: bool,
-        kv_quant: str, n_gpu_layers: int, no_vision: bool,
+def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
+        ctx_size: int | None, ft_path: Path | None, ft_name: str | None,
+        wait: bool, extra: tuple[str, ...], env_pairs: tuple[str, ...],
+        reasoning: bool,
+        kv_quant: str, gpu_mem: float | None, tool_parser: str | None,
+        reasoning_parser: str | None, trust_remote_code: bool,
+        n_gpu_layers: int, no_vision: bool,
         embeddings: bool | None, pooling: str, batch_size: int | None,
         ubatch_size: int | None, draft_spec: str | None, no_draft: bool,
         spec_type: str, spec_n_max: int, n_parallel: int | None,
         cache_ram: int, kv_unified: bool | None) -> None:
-    """Start MODEL in the background. Use --ft <path> to run a finetune GGUF."""
-    _require_llama_server()
+    """Start MODEL in the background.
 
+    GGUF models run on llama-server; Hugging Face checkpoint directories run
+    on vllm, or on decider.serve when they carry a decider_config.json (see
+    --backend). Use --ft <path> to bypass the registry.
+    """
     spec: ModelSpec | None = None
     if ft_path:
-        name = ft_name or f"ft:{ft_path.stem}"
-        model_path = ft_path
+        name = ft_name or f"ft:{ft_path.stem if ft_path.is_file() else ft_path.name}"
+        model_path = ft_path.resolve()
         mmproj: Path | None = None
+        detected = backends.infer_backend(model_path)
     else:
         specs = discover_models()
         if not specs:
@@ -368,12 +567,32 @@ def run(ctx: click.Context, model: str | None, port: int | None, ctx_size: int |
         model_path = spec.model_path
         mmproj = None if no_vision else spec.mmproj_path
         name = ft_name or spec.key
+        detected = spec.backend
+
+    # Backend: what the model format implies unless the user forces it. A
+    # GGUF *can* be forced onto vllm (experimental there, needs --tokenizer via
+    # -X) but an HF directory can never run on llama-server.
+    if backend == "auto":
+        backend = detected
+    elif backend == LLAMA and model_path.is_dir():
+        raise click.UsageError(
+            f"'{model_path.name}' is a Hugging Face checkpoint directory; "
+            "llama-server only loads GGUF files. Use --backend vllm.")
+    elif backend == DECIDER and not backends.is_decider_model_dir(model_path):
+        raise click.UsageError(
+            f"'{model_path.name}' is not a decider checkpoint (no decider_config.json).")
+    binary = _require_backend(backend)
+    _warn_foreign_flags(ctx, backend)
+    if backend == VLLM and kv_quant == "q4_0":
+        raise click.UsageError("vllm has no 4-bit KV cache; use --kv-quant q8_0 "
+                               "(→ fp8) or f16.")
 
     # Default embeddings mode by filename when the user didn't force it.
+    stem = model_path.stem if model_path.is_file() else model_path.name
     if embeddings is None:
-        embeddings = _looks_like_embedding_model(model_path.stem)
+        embeddings = _looks_like_embedding_model(stem)
         if embeddings:
-            click.echo(f"Detected embedding model '{model_path.stem}' — starting "
+            click.echo(f"Detected embedding model '{stem}' — starting "
                        "in --embeddings mode (use --no-embeddings to override).")
 
     if port is not None and _port_in_use(port):
@@ -391,45 +610,96 @@ def run(ctx: click.Context, model: str | None, port: int | None, ctx_size: int |
             click.echo("Ignoring --draft: speculative decoding doesn't apply to "
                        "embedding servers.", err=True)
     elif not no_draft:
-        draft_path = _resolve_draft(draft_spec, spec)
+        draft_path = _resolve_draft(draft_spec, spec, backend)
 
-    # Known llama.cpp footgun: quantizing the *target* KV cache zeroes MTP /
-    # speculative acceptance, so the drafter runs but never gets accepted — you
-    # pay its cost for no speedup. Warn loudly rather than silently emit it.
-    if draft_path and kv_quant != "f16":
-        click.echo(
-            f"warning: --kv-quant {kv_quant} quantizes the target KV cache, which "
-            "drops MTP/speculative acceptance to ~0% in llama.cpp — the drafter "
-            "will run with no speedup. Either keep f16 KV to use MTP (fits less "
-            "context), or pass --no-draft to drop the unused drafter and reclaim "
-            "its overhead.", err=True)
+    extra_args = [tok for chunk in extra for tok in shlex.split(chunk)]
+    env: dict[str, str] = {}
+    for pair in env_pairs:
+        key, sep, val = pair.partition("=")
+        if not sep or not key:
+            raise click.BadOptionUsage("--env", f"--env expects KEY=VALUE, got '{pair}'")
+        env[key] = val
 
-    # Speculative decoding and prompt-prefix reuse both work best single-stream,
-    # so default to one slot when a drafter is attached (override with --n-parallel).
-    if n_parallel is None and draft_path is not None:
-        n_parallel = 1
-        click.echo("Using --n-parallel 1 (best for MTP acceptance + prompt-cache "
-                   "reuse); pass --n-parallel N to override.")
+    if backend == DECIDER:
+        decider_dir = backends.find_decider_dir()
+        assert decider_dir is not None  # _require_backend found uvicorn under it
+        cmd, launch_env = backends.build_decider_cmd(
+            binary, decider_dir, model_path, port=chosen_port,
+            n_parallel=n_parallel, extra=extra_args)
+        env = {**launch_env, **env}      # -E overrides the profile defaults
+    elif backend == VLLM:
+        if gpu_mem is None:
+            picked = backends.default_gpu_mem()
+            if picked:
+                gpu_mem, why = picked
+                click.echo(f"Using --gpu-mem {gpu_mem:g} ({why}); pass --gpu-mem "
+                           "to override.")
+        cmd = backends.build_vllm_cmd(
+            binary, model_path, name=name, port=chosen_port, ctx_size=ctx_size,
+            kv_quant=kv_quant, gpu_mem=gpu_mem, n_parallel=n_parallel,
+            embeddings=embeddings, draft_path=draft_path, spec_type=spec_type,
+            spec_n_max=spec_n_max, tool_parser=tool_parser,
+            reasoning_parser=reasoning_parser,
+            trust_remote_code=trust_remote_code, extra=extra_args)
+    else:
+        # Known llama.cpp footgun: quantizing the *target* KV cache zeroes MTP /
+        # speculative acceptance, so the drafter runs but never gets accepted —
+        # you pay its cost for no speedup. Warn loudly rather than silently emit it.
+        if draft_path and kv_quant != "f16":
+            click.echo(
+                f"warning: --kv-quant {kv_quant} quantizes the target KV cache, which "
+                "drops MTP/speculative acceptance to ~0% in llama.cpp — the drafter "
+                "will run with no speedup. Either keep f16 KV to use MTP (fits less "
+                "context), or pass --no-draft to drop the unused drafter and reclaim "
+                "its overhead.", err=True)
 
-    cmd = _build_cmd(model_path, mmproj, chosen_port, ctx_size, reasoning,
-                     kv_quant=kv_quant, n_gpu_layers=n_gpu_layers,
-                     embeddings=embeddings, pooling=pooling,
-                     batch_size=batch_size, ubatch_size=ubatch_size,
-                     draft_path=draft_path, spec_type=spec_type,
-                     spec_n_max=spec_n_max, n_parallel=n_parallel,
-                     cache_ram=cache_ram, kv_unified=kv_unified)
+        # Speculative decoding and prompt-prefix reuse both work best
+        # single-stream, so default to one slot when a drafter is attached
+        # (override with --n-parallel).
+        if n_parallel is None and draft_path is not None:
+            n_parallel = 1
+            click.echo("Using --n-parallel 1 (best for MTP acceptance + prompt-cache "
+                       "reuse); pass --n-parallel N to override.")
+
+        cmd = _build_llama_cmd(model_path, mmproj, chosen_port, ctx_size, reasoning,
+                               kv_quant=kv_quant, n_gpu_layers=n_gpu_layers,
+                               embeddings=embeddings, pooling=pooling,
+                               batch_size=batch_size, ubatch_size=ubatch_size,
+                               draft_path=draft_path, spec_type=spec_type,
+                               spec_n_max=spec_n_max, n_parallel=n_parallel,
+                               cache_ram=cache_ram, kv_unified=kv_unified,
+                               extra=extra_args)
     # Remember the llmctl-level invocation (with the interactively-picked model
     # made explicit) so `restart`/`autostart list` can show and re-issue it.
     run_args = ([] if ft_path else [model]) + _run_option_args(ctx)
     rec = proc.start(name=name, cmd=cmd, port=chosen_port,
-                     model_path=str(model_path), run_args=run_args)
-    click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}")
+                     model_path=str(model_path), run_args=run_args,
+                     backend=backend, env=env)
+    click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  backend={backend}")
+    if env:
+        click.echo("Env:     " + " ".join(f"{k}={v}" for k, v in env.items()))
     if draft_path:
-        click.echo(f"Speculative drafter: {draft_path.name}  "
-                   f"(--spec-type {spec_type} --spec-draft-n-max {spec_n_max})")
+        if backend == VLLM:
+            click.echo(f"Speculative drafter: {draft_path.name}  "
+                       f"(num_speculative_tokens={spec_n_max})")
+        else:
+            click.echo(f"Speculative drafter: {draft_path.name}  "
+                       f"(--spec-type {spec_type} --spec-draft-n-max {spec_n_max})")
     click.echo(f"Command: {shlex.join(cmd)}")
     click.echo(f"Logs:  {rec.log_file}")
     click.echo(f"Tail:  llmctl logs {rec.name}")
+    if wait:
+        # vllm loads weights, profiles memory and captures CUDA graphs before
+        # it listens; llama-server is usually up in seconds.
+        ok = _wait_healthy(rec, timeout=600 if backend in (VLLM, DECIDER) else 120)
+        if not ok:
+            raise SystemExit(1)
+    elif backend == VLLM:
+        click.echo("Note: vllm takes a minute or more to become ready; use "
+                   "--wait to block on /health.")
+    elif backend == DECIDER:
+        click.echo("Note: decider loads the weights and captures its CUDA graphs "
+                   "before it listens (~30 s); use --wait to block on /health.")
 
 
 @cli.command("ps")
@@ -439,11 +709,11 @@ def ps_cmd() -> None:
     if not procs:
         click.echo("(no models running)")
         return
-    click.echo(f"{'PID':<8} {'PORT':<6} {'STARTED':<20} NAME")
+    click.echo(f"{'PID':<8} {'PORT':<6} {'BACKEND':<8} {'STARTED':<20} NAME")
     click.echo("-" * 78)
     for p in procs:
         started = dt.datetime.fromtimestamp(p.started_at).strftime("%Y-%m-%d %H:%M:%S")
-        click.echo(f"{p.pid:<8} {p.port:<6} {started:<20} {p.name}")
+        click.echo(f"{p.pid:<8} {p.port:<6} {p.backend:<8} {started:<20} {p.name}")
 
 
 @cli.command()
@@ -482,20 +752,24 @@ def _resolve_running_target(identifier: str | None) -> proc.RunningProcess:
 @cli.command()
 @click.argument("identifier", required=False)
 def show(identifier: str | None) -> None:
-    """Print the exact llama-server command a running model was started with.
+    """Print the exact server command a running model was started with.
 
     With no IDENTIFIER: if exactly one model is running, show it; otherwise
     show an interactive picker.
     """
     target = _resolve_running_target(identifier)
-    click.echo(f"Name:  {target.name}")
-    click.echo(f"PID:   {target.pid}")
-    click.echo(f"Port:  {target.port}")
-    click.echo(f"Model: {target.model_path}")
-    click.echo(f"Log:   {target.log_file}")
-    spec = [f for f in ("--model-draft", "--spec-type", "--spec-draft-n-max")
+    click.echo(f"Name:    {target.name}")
+    click.echo(f"PID:     {target.pid}")
+    click.echo(f"Port:    {target.port}")
+    click.echo(f"Backend: {target.backend}")
+    click.echo(f"Model:   {target.model_path}")
+    click.echo(f"Log:     {target.log_file}")
+    if target.env:
+        click.echo("Env:     " + " ".join(f"{k}={v}" for k, v in target.env.items()))
+    spec = [f for f in ("--model-draft", "--spec-type", "--spec-draft-n-max",
+                        "--speculative-config")
             if f in target.cmd]
-    click.echo("MTP:   " + ("yes (" + ", ".join(spec) + ")" if spec else "no"))
+    click.echo("Spec:    " + ("yes (" + ", ".join(spec) + ")" if spec else "no"))
     click.echo("\nCommand:")
     click.echo("  " + (shlex.join(target.cmd) if target.cmd else "(not recorded)"))
 
@@ -610,7 +884,13 @@ def restore(names: tuple[str, ...]) -> None:
     Pass NAMES to restore only those manifest entries. Ports are pinned: an
     entry whose port is taken is reported as an error, never moved.
     """
-    _require_llama_server()
+    # Only demand the binaries the manifest actually needs. A vllm entry
+    # records an absolute binary path, so it doesn't depend on PATH.
+    wanted = {s.backend for s in proc.autostart_list()
+              if not names or s.name in names}
+    for backend in sorted(wanted):
+        if backends.find(backend) is None:
+            click.echo(f"warning: {backends.missing_hint(backend)}", err=True)
     results = proc.restore(list(names) or None)
     if not results:
         click.echo("Nothing to restore (autostart manifest is empty).")
@@ -638,7 +918,6 @@ def restart(ctx: click.Context, identifier: str | None,
 
     The port is kept the same. Pass --port to move it deliberately.
     """
-    _require_llama_server()
     if identifier is None:
         running = proc.list_running()
         if not running:
@@ -656,6 +935,8 @@ def restart(ctx: click.Context, identifier: str | None,
         raise click.UsageError(
             f"'{name}' was recorded before run args were tracked; re-run it "
             "with `llmctl run …` once, then `restart` can take overrides.")
+    # Check the binary before taking the live instance down.
+    _require_backend(spec.backend)
 
     if live:
         proc.stop(name)
@@ -668,9 +949,9 @@ def restart(ctx: click.Context, identifier: str | None,
             time.sleep(0.25)
 
     if not spec.run_args:
-        # Legacy manifest entry: relaunch the resolved llama-server command as-is.
+        # Legacy manifest entry: relaunch the resolved server command as-is.
         rec = proc.start(name=spec.name, cmd=spec.cmd, port=spec.port,
-                         model_path=spec.model_path)
+                         model_path=spec.model_path, backend=spec.backend)
         click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}")
         return
 
@@ -704,7 +985,7 @@ def autostart_list_cmd() -> None:
         click.echo("(autostart manifest empty — start a model to populate it)")
         return
     for s in specs:
-        click.echo(f"{s.name:<24}  port={s.port}  {s.model_path}")
+        click.echo(f"{s.name:<24}  port={s.port}  backend={s.backend}  {s.model_path}")
         click.echo(f"{'':<24}  {_fmt_run_line(s)}")
 
 
@@ -822,7 +1103,8 @@ def _pick_model_interactively(specs: dict[str, ModelSpec]) -> str:
     key_w = max(len(k) for k in specs)
     choices = [
         questionary.Choice(
-            title=f"{key:<{key_w}}  {_fmt_size(spec.size).strip():>8}  "
+            title=f"{key:<{key_w}}  {spec.backend:<5}  "
+                  f"{_fmt_size(spec.size).strip():>8}  "
                   f"{'[vision]' if spec.has_vision else '        '}  "
                   f"{'[mtp]' if spec.has_draft else '     '}",
             value=key,
@@ -861,17 +1143,71 @@ def _read_source(folder: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _write_source(folder: Path, repo_id: str, rfilenames: list[str]) -> None:
+def _write_source(folder: Path, repo_id: str, rfilenames: list[str],
+                  fmt: str = "gguf") -> None:
     data = _read_source(folder)
     files = sorted(set(data.get("files", [])) | set(rfilenames))
     (folder / _SOURCE_FILE).write_text(
-        json.dumps({"repo_id": repo_id, "files": files}, indent=2) + "\n")
+        json.dumps({"repo_id": repo_id, "format": fmt, "files": files}, indent=2)
+        + "\n")
+
+
+# Repo files a vllm checkpoint snapshot never needs. When safetensors are
+# present the legacy PyTorch pickles are skipped too (see _snapshot_hf).
+_HF_IGNORE_ALWAYS = ("*.gguf", "*.msgpack", "*.h5", "*.ot", "*.onnx", "onnx/*",
+                     "original/*", "consolidated*", ".gitattributes")
+_HF_IGNORE_IF_SAFETENSORS = ("*.bin", "*.pt", "*.pth")
+
+
+def _snapshot_hf(repo_id: str, info, target_dir: Path, *, revalidate: bool) -> None:
+    """Pull a Hugging Face checkpoint (safetensors + config/tokenizer) into
+    ``target_dir`` for vllm. ``snapshot_download`` is incremental: files whose
+    etag already matches are skipped, so re-running doubles as `update`."""
+    from huggingface_hub import snapshot_download
+
+    names = [s.rfilename for s in info.siblings]
+    ignore = list(_HF_IGNORE_ALWAYS)
+    if any(n.endswith(".safetensors") for n in names):
+        ignore += _HF_IGNORE_IF_SAFETENSORS
+    elif not any(n.endswith(_HF_IGNORE_IF_SAFETENSORS) for n in names):
+        raise click.UsageError(
+            f"{repo_id} has no safetensors or PyTorch weights — nothing vllm "
+            "can serve.")
+
+    from fnmatch import fnmatch
+    wanted = [s for s in info.siblings
+              if not any(fnmatch(s.rfilename, pat) for pat in ignore)]
+    total = sum(getattr(s, "size", None) or 0 for s in wanted)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    click.echo(f"Target: {target_dir}  (vllm / Hugging Face checkpoint)")
+    verb = "Revalidating" if revalidate else "Downloading"
+    click.echo(f"  ↓ {verb} {len(wanted)} files ({_fmt_size(total).strip()}) "
+               f"from {repo_id} ...")
+    try:
+        snapshot_download(repo_id=repo_id, local_dir=str(target_dir),
+                          ignore_patterns=ignore)
+    except Exception as e:
+        raise click.UsageError(
+            f"Download failed: {e}\n(Gated repo? Accept the license on "
+            "huggingface.co and run `hf auth login` or set $HF_TOKEN.)") from e
+    _write_source(target_dir, repo_id, [s.rfilename for s in wanted], fmt="hf")
+
+    click.echo(f"\nFiles now in {target_dir}:")
+    for p in sorted(target_dir.iterdir()):
+        if p.is_file() and p.name != _SOURCE_FILE:
+            click.echo(f"  {p.name}  ({_fmt_size(p.stat().st_size)})")
+    if not backends.is_hf_model_dir(target_dir):
+        click.echo("warning: folder doesn't look like a servable checkpoint "
+                   "(no config.json + weights).", err=True)
 
 
 def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
                   no_draft: bool, subdir: str | None, *, revalidate: bool = False,
-                  target_dir: Path | None = None) -> None:
+                  target_dir: Path | None = None, hf: bool = False) -> None:
     """Shared core for `download` (revalidate=False) and `update` (=True).
+
+    Repos holding GGUFs go through the quant picker; anything else (or
+    ``hf=True``) is snapshotted whole as a vllm checkpoint.
 
     With ``revalidate`` the "already present" short-circuit is skipped and every
     selected file is re-checked against the remote (``hf_hub_download`` only
@@ -891,8 +1227,17 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
         raise click.UsageError(f"Failed to fetch repo info for '{repo_id}': {e}") from e
 
     siblings = {s.rfilename: s for s in info.siblings if s.rfilename.endswith(".gguf")}
-    if not siblings:
-        raise click.UsageError(f"No .gguf files found in {repo_id}.")
+    if hf or not siblings:
+        if filename:
+            raise click.UsageError("--file only applies to GGUF repos; a Hugging "
+                                   "Face checkpoint is downloaded whole.")
+        if not siblings:
+            click.echo(f"No .gguf files in {repo_id} — treating it as a Hugging "
+                       "Face checkpoint for vllm.")
+        _snapshot_hf(repo_id, info,
+                     target_dir or MODELS_DIR / (subdir or _derive_subdir(repo_id)),
+                     revalidate=revalidate)
+        return
 
     mmproj_names = sorted(f for f in siblings if "mmproj" in f.lower())
     # Drafters may live in an MTP/ subdir (rfilename keeps the path), so match
@@ -1030,15 +1375,26 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
               help="Don't download the speculative/MTP drafter alongside the quant.")
 @click.option("--subdir", default=None,
               help=f"Override target subdir under {MODELS_DIR} (default: derived from repo name).")
+@click.option("--hf", is_flag=True,
+              help="Fetch the repo as a Hugging Face checkpoint for vllm "
+                   "(safetensors + config) even if it also has GGUFs. "
+                   "Repos without GGUFs are snapshotted this way automatically.")
 def download(repo_id: str, filename: str | None, no_mmproj: bool, no_draft: bool,
-             subdir: str | None) -> None:
-    """Download a GGUF quant from a Hugging Face REPO_ID into MODELS_DIR.
+             subdir: str | None, hf: bool) -> None:
+    """Download a model from a Hugging Face REPO_ID into MODELS_DIR.
 
-    Example: llmctl download unsloth/gemma-4-E4B-it-GGUF
+    GGUF repos: pick a quant (served by llama-server).
+    Checkpoint repos (safetensors): snapshot the whole repo (served by vllm).
+
+    Examples:
+
+      llmctl download unsloth/gemma-4-E4B-it-GGUF
+
+      llmctl download Qwen/Qwen3-8B            # → vllm
 
     Records the source repo so `llmctl update` can re-check it later.
     """
-    _run_download(repo_id, filename, no_mmproj, no_draft, subdir)
+    _run_download(repo_id, filename, no_mmproj, no_draft, subdir, hf=hf)
 
 
 def _resolve_update_target(target: str | None) -> tuple[str, Path, str | None]:
@@ -1048,11 +1404,15 @@ def _resolve_update_target(target: str | None) -> tuple[str, Path, str | None]:
     (owner/name), or None (pick from models that have a recorded source).
     """
     specs = discover_models()
-    updatable: dict[str, tuple[str, Path, str]] = {}
+    updatable: dict[str, tuple[str, Path, str | None]] = {}
     for key, spec in specs.items():
-        repo = _read_source(spec.model_path.parent).get("repo_id")
+        # GGUF: the folder holding the file. vllm: the checkpoint dir itself,
+        # which is re-snapshotted whole (no single file to name).
+        folder = spec.model_path if spec.backend == VLLM else spec.model_path.parent
+        repo = _read_source(folder).get("repo_id")
         if repo:
-            updatable[key] = (repo, spec.model_path.parent, spec.model_path.name)
+            known = None if spec.backend == VLLM else spec.model_path.name
+            updatable[key] = (repo, folder, known)
 
     if target is None:
         if not updatable:
@@ -1093,8 +1453,9 @@ def update(target: str | None, filename: str | None, no_mmproj: bool,
     if filename is None:
         filename = known_file  # may be None for a repo-id target → show picker
     click.echo(f"Updating from {repo_id}")
+    hf = _read_source(target_dir).get("format") == "hf"
     _run_download(repo_id, filename, no_mmproj, no_draft, subdir=None,
-                  revalidate=True, target_dir=target_dir)
+                  revalidate=True, target_dir=target_dir, hf=hf)
 
 
 if __name__ == "__main__":

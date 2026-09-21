@@ -1,4 +1,4 @@
-"""Background runner for local llama-server instances."""
+"""Background runner for local model servers (llama-server / vllm)."""
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
 try:

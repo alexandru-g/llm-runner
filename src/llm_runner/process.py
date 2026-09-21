@@ -1,4 +1,4 @@
-"""Lifecycle for detached llama-server processes.
+"""Lifecycle for detached model-server processes (llama-server or vllm).
 
 State is persisted to ``.state/running.json`` under a user-level state dir so
 the CLI is stateful across invocations regardless of cwd. Each running entry
@@ -50,13 +50,15 @@ class RunningProcess:
     model_path: str
     log_file: str
     cmd: list[str] = field(default_factory=list)
+    backend: str = "llama"  # default covers records written before vllm support
+    env: dict[str, str] = field(default_factory=dict)  # extra vars set at launch
 
 
 @dataclass
 class LaunchSpec:
     """The minimal recipe needed to relaunch a model after a reboot.
 
-    ``cmd`` is the fully-resolved llama-server argv (what actually runs);
+    ``cmd`` is the fully-resolved server argv (what actually runs);
     ``run_args`` is the original ``llmctl run`` argv (minus ``--port``, which
     is pinned separately) so the launch can be shown and re-issued with
     overrides. Empty for manifests written before ``run_args`` existed.
@@ -66,6 +68,8 @@ class LaunchSpec:
     port: int
     model_path: str
     run_args: list[str] = field(default_factory=list)
+    backend: str = "llama"
+    env: dict[str, str] = field(default_factory=dict)
 
     def run_cmd(self) -> list[str]:
         """The ``llmctl run …`` argv that reproduces this launch, port pinned."""
@@ -123,11 +127,14 @@ def autostart_list() -> list[LaunchSpec]:
 
 
 def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
-                  run_args: list[str] | None = None) -> None:
+                  run_args: list[str] | None = None,
+                  backend: str = "llama",
+                  env: dict[str, str] | None = None) -> None:
     """Upsert a launch spec into the autostart manifest (keyed by name)."""
     specs = [s for s in _load_autostart() if s.name != name]
     specs.append(LaunchSpec(name=name, cmd=list(cmd), port=port,
-                            model_path=model_path, run_args=list(run_args or [])))
+                            model_path=model_path, run_args=list(run_args or []),
+                            backend=backend, env=dict(env or {})))
     _save_autostart(specs)
 
 
@@ -174,7 +181,8 @@ def restore(names: list[str] | None = None) -> list[tuple[LaunchSpec, str]]:
             continue
         try:
             rec = start(name=spec.name, cmd=spec.cmd, port=spec.port,
-                        model_path=spec.model_path, run_args=spec.run_args)
+                        model_path=spec.model_path, run_args=spec.run_args,
+                        backend=spec.backend, env=spec.env)
             results.append((spec, f"started pid={rec.pid} port={rec.port}"))
         except Exception as e:  # never let one bad spec abort the rest
             results.append((spec, f"error: {e}"))
@@ -205,12 +213,17 @@ def find(identifier: str) -> RunningProcess | None:
 
 
 def start(*, name: str, cmd: list[str], port: int, model_path: str,
-          run_args: list[str] | None = None) -> RunningProcess:
+          run_args: list[str] | None = None,
+          backend: str = "llama",
+          env: dict[str, str] | None = None) -> RunningProcess:
+    """Launch ``cmd`` detached. ``env`` is layered over the current environment
+    (e.g. VLLM_* tuning knobs) and remembered so restore/restart reproduce it."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"{name}-{port}-{int(time.time())}.log"
     fh = open(log_file, "ab", buffering=0)
     proc = subprocess.Popen(
         cmd,
+        env={**os.environ, **(env or {})} if env else None,
         stdout=fh,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
@@ -225,13 +238,15 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
         model_path=model_path,
         log_file=str(log_file),
         cmd=list(cmd),
+        backend=backend,
+        env=dict(env or {}),
     )
     procs = reconcile()
     procs.append(rec)
     _save(procs)
     # Remember this launch so `restore` can bring it back after a reboot.
     autostart_add(name=name, cmd=cmd, port=port, model_path=model_path,
-                  run_args=run_args)
+                  run_args=run_args, backend=backend, env=env)
     return rec
 
 
