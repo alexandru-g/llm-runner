@@ -282,6 +282,20 @@ auto-attaches on `run`). Models downloaded before provenance tracking (or placed
 by hand) have no recorded repo — pass the repo id once and it's recorded going
 forward.
 
+### Delete a model with `llmctl rm`
+
+```bash
+llmctl rm                              # pick from the models on disk
+llmctl rm gemma-4-e4b-it-q8_0          # by model key; lists files + size, then asks
+llmctl rm gemma-4-e4b-it-q8_0 -y       # skip the confirmation
+```
+
+For a GGUF, the shared mmproj / drafter are only deleted along with the last
+quant in their folder, and the folder goes too once nothing but the
+provenance sidecar is left. A vllm checkpoint is deleted as a whole directory.
+`rm` refuses while the model is running and drops it from the autostart
+manifest.
+
 ### Layout convention
 
 `llmctl download` writes one folder per HF repo; multiple quants of the same

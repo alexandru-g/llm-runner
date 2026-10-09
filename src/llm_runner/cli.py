@@ -1110,7 +1110,8 @@ def _pick_instance_interactively(running: list[proc.RunningProcess]) -> proc.Run
     return selected
 
 
-def _pick_model_interactively(specs: dict[str, ModelSpec]) -> str:
+def _pick_model_interactively(specs: dict[str, ModelSpec],
+                              prompt: str = "Select a model to run:") -> str:
     try:
         import questionary
     except ImportError as e:
@@ -1129,7 +1130,7 @@ def _pick_model_interactively(specs: dict[str, ModelSpec]) -> str:
         for key, spec in specs.items()
     ]
     selected = questionary.select(
-        "Select a model to run:",
+        prompt,
         choices=choices,
         use_shortcuts=False,
     ).ask()
@@ -1473,6 +1474,87 @@ def update(target: str | None, filename: str | None, no_mmproj: bool,
     hf = _read_source(target_dir).get("format") == "hf"
     _run_download(repo_id, filename, no_mmproj, no_draft, subdir=None,
                   revalidate=True, target_dir=target_dir, hf=hf)
+
+
+# Non-model leftovers a download leaves in a model folder: the provenance
+# sidecar and huggingface_hub's local_dir cache. A folder holding nothing else
+# once its models are gone is removed too.
+_FOLDER_LEFTOVERS = {_SOURCE_FILE, ".cache"}
+
+
+def _removal_plan(spec: ModelSpec) -> list[Path]:
+    """Paths to delete for ``spec``: the checkpoint dir (vllm), or the GGUF
+    plus companions (mmproj / drafter) when no other base GGUF in its folder
+    still uses them — and the folder itself once nothing else is left."""
+    if spec.model_path.is_dir():
+        return [spec.model_path]
+    folder = spec.model_path.parent
+    paths = [spec.model_path]
+    siblings = [s for s in discover_models().values()
+                if s.model_path.parent == folder and s.model_path != spec.model_path
+                and not s.model_path.is_dir()]
+    if not siblings:
+        paths += [p for p in (spec.mmproj_path, spec.draft_path) if p]
+        rest = {e.name for e in folder.iterdir()} - {p.name for p in paths}
+        if folder != MODELS_DIR and rest <= _FOLDER_LEFTOVERS:
+            return [folder]
+    return paths
+
+
+@cli.command("rm")
+@click.argument("model", required=False)
+@click.option("--yes", "-y", is_flag=True, help="Don't ask for confirmation.")
+def rm(model: str | None, yes: bool) -> None:
+    """Delete a downloaded MODEL from disk.
+
+    GGUF: removes the file, plus its mmproj / drafter (and the folder) when no
+    other quant in the folder still uses them. vllm: removes the checkpoint
+    directory. Refuses while the model is running, and drops it from the
+    autostart manifest. With no MODEL, pick one interactively.
+    """
+    specs = discover_models()
+    if not specs:
+        raise click.UsageError("No models found on disk.")
+    if not model:
+        model = _pick_model_interactively(specs, "Select a model to delete:")
+    if model not in specs:
+        available = "\n  ".join(specs)
+        raise click.BadArgumentUsage(
+            f"Unknown model '{model}'. Available:\n  {available}")
+    spec = specs[model]
+
+    running = [p for p in proc.list_running()
+               if Path(p.model_path).resolve() == spec.model_path.resolve()]
+    if running:
+        names = ", ".join(f"{p.name} (pid {p.pid})" for p in running)
+        raise click.UsageError(f"'{model}' is running: {names}. `llmctl stop` it first.")
+
+    paths = _removal_plan(spec)
+    base = MODELS_DIR.resolve()
+    for p in paths:
+        # Never reach outside the models dir (e.g. through a symlinked folder).
+        if p.resolve() == base or not p.resolve().is_relative_to(base):
+            raise click.ClickException(f"Refusing to delete {p}: outside {base}.")
+
+    total = 0
+    for p in paths:
+        size = (backends.hf_dir_size(p) if p.is_dir() else p.stat().st_size)
+        total += size
+        click.echo(f"  {_fmt_size(size).strip():>8}  {p}{'/' if p.is_dir() else ''}")
+    if not yes and not click.confirm(
+            f"Delete {model} ({_fmt_size(total).strip()})?", default=False):
+        raise click.Abort()
+
+    for p in paths:
+        if p.is_dir():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+    for s in proc.autostart_list():
+        if Path(s.model_path).resolve() == spec.model_path.resolve():
+            proc.autostart_remove(s.name)
+            click.echo(f"Removed {s.name} from the autostart manifest.")
+    click.echo(f"Deleted {model}.")
 
 
 if __name__ == "__main__":
