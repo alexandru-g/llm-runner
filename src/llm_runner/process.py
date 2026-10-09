@@ -130,8 +130,13 @@ def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
                   run_args: list[str] | None = None,
                   backend: str = "llama",
                   env: dict[str, str] | None = None) -> None:
-    """Upsert a launch spec into the autostart manifest (keyed by name)."""
-    specs = [s for s in _load_autostart() if s.name != name]
+    """Upsert a launch spec into the autostart manifest (keyed by name).
+
+    Ports are pinned, so a port can only be restored to one model: entries
+    for other models on the same port are dropped. They are leftovers from
+    launches that died without an explicit ``stop`` (crash, failed load,
+    external kill) and would otherwise fight over the port at boot."""
+    specs = [s for s in _load_autostart() if s.name != name and s.port != port]
     specs.append(LaunchSpec(name=name, cmd=list(cmd), port=port,
                             model_path=model_path, run_args=list(run_args or []),
                             backend=backend, env=dict(env or {})))
@@ -147,6 +152,25 @@ def autostart_remove(name: str) -> None:
     kept = [s for s in specs if s.name != name]
     if len(kept) != len(specs):
         _save_autostart(kept)
+
+
+def autostart_sync() -> tuple[list[LaunchSpec], list[LaunchSpec]]:
+    """Rewrite the manifest to exactly the live models. Returns ``(kept,
+    dropped)``. A live model's existing entry keeps its ``run_args`` (port
+    and launch details refreshed from the live record); one without an entry
+    gets a legacy-style spec from its resolved argv."""
+    old = {s.name: s for s in _load_autostart()}
+    kept = [
+        LaunchSpec(name=p.name, cmd=list(p.cmd), port=p.port,
+                   model_path=p.model_path,
+                   run_args=old[p.name].run_args if p.name in old else [],
+                   backend=p.backend, env=dict(p.env))
+        for p in list_running()
+    ]
+    live = {s.name for s in kept}
+    dropped = [s for s in old.values() if s.name not in live]
+    _save_autostart(kept)
+    return kept, dropped
 
 
 def restore(names: list[str] | None = None) -> list[tuple[LaunchSpec, str]]:
@@ -169,6 +193,9 @@ def restore(names: list[str] | None = None) -> list[tuple[LaunchSpec, str]]:
             else:
                 specs.append(LaunchSpec(name=n, cmd=[], port=0, model_path=""))
     results: list[tuple[LaunchSpec, str]] = []
+    # A server launched earlier in this loop may not have bound its port yet,
+    # so port_in_use() alone can't stop two entries racing for the same port.
+    claimed: set[int] = set()
     for spec in specs:
         if not spec.cmd:
             results.append((spec, "error: not in autostart manifest"))
@@ -176,9 +203,10 @@ def restore(names: list[str] | None = None) -> list[tuple[LaunchSpec, str]]:
         if spec.name in live:
             results.append((spec, "already running"))
             continue
-        if port_in_use(spec.port):
+        if spec.port in claimed or port_in_use(spec.port):
             results.append((spec, f"error: port {spec.port} is in use"))
             continue
+        claimed.add(spec.port)
         try:
             rec = start(name=spec.name, cmd=spec.cmd, port=spec.port,
                         model_path=spec.model_path, run_args=spec.run_args,

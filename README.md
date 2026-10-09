@@ -538,6 +538,7 @@ back after a reboot:
 llmctl restore            # relaunch everything that was running pre-reboot
 llmctl restore NAME...    # only these entries
 llmctl autostart list     # show what restore would bring back
+llmctl autostart sync     # reset the manifest to exactly what's running now
 ```
 
 `restore` is idempotent — anything already running is left alone. To run it

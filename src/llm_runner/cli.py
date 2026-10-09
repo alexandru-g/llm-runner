@@ -989,6 +989,23 @@ def autostart_list_cmd() -> None:
         click.echo(f"{'':<24}  {_fmt_run_line(s)}")
 
 
+@autostart.command("sync")
+def autostart_sync_cmd() -> None:
+    """Make the manifest mirror the currently running models.
+
+    Drops entries for models that aren't running (crashed, failed to load,
+    killed without `llmctl stop`) and adds any running model that's missing.
+    """
+    kept, dropped = proc.autostart_sync()
+    for s in dropped:
+        click.echo(f"- {s.name:<24}  port={s.port}  (not running, removed)")
+    for s in kept:
+        click.echo(f"  {s.name:<24}  port={s.port}")
+        click.echo(f"  {'':<24}  {_fmt_run_line(s)}")
+    if not kept:
+        click.echo("(nothing running — manifest is now empty)")
+
+
 @autostart.command("install")
 def autostart_install() -> None:
     """Install + enable the systemd user service that runs `llmctl restore`."""
