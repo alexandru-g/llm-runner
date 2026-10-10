@@ -18,5 +18,9 @@ systemone-proxy serve --backend http://127.0.0.1:8080 --port 8090   # profile de
 Images: H2O-Lightning-4B reads up to 4 images per request when llama-server
 runs with a vision projector (`systemone-proxy spec --profile h2o-lightning-4b`).
 
+Docs: [client guide](docs/client-guide.md) (calling an endpoint, reading a
+model's spec) and [adding a profile](docs/adding-a-profile.md) (supporting a new
+decision model).
+
 Install: `uv tool install ./packages/systemone-proxy` (or `pipx install`).
 Tests: `uv run pytest` from this directory.

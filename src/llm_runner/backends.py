@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -258,6 +259,10 @@ _DECISION_SIDECARS = ("quyet_config.json",)
 # ones like "classification" / "calibration" are left out on purpose.
 _DECISION_TAGS = {"decision-model", "decision-making", "typed-decisions",
                   "typed-classification", "jevbench"}
+# File names of known decision-model GGUFs, for headers without tags (e.g.
+# Livesport's rune-26b-a4b-v3-Q8_0.gguf carries neither tags nor a basename).
+_DECISION_FILENAMES = re.compile(
+    r"^(rune-26b-a4b|xor-26b-a4b|bobcat-flash|h2o-lightning|quyet-1\.0)", re.I)
 
 
 def is_decision_model(path: Path) -> bool:
@@ -266,7 +271,12 @@ def is_decision_model(path: Path) -> bool:
     folder = path if path.is_dir() else path.parent
     if any((folder / s).is_file() for s in _DECISION_SIDECARS):
         return True
-    return path.suffix == ".gguf" and bool(_DECISION_TAGS & set(_gguf_general_tags(path)))
+    if path.suffix != ".gguf":
+        return False
+    tags = _gguf_general_tags(path)
+    if tags:
+        return bool(_DECISION_TAGS & set(tags))
+    return bool(_DECISION_FILENAMES.match(path.name))
 
 
 def is_decider_model_dir(path: Path) -> bool:

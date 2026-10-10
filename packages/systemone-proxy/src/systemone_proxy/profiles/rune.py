@@ -135,11 +135,16 @@ class Rune(Profile):
         # The GGUF header says only basename "rune", arch gemma4, name "Rune Bf16 Hf",
         # size_label "128x2.6B": v1 and v3 look the same, so only a filename that
         # names another version is refused.
+        # Livesport's own Q8_0 has a stripped header (no basename, no tags,
+        # name "Hf"); then only its file name says what it is.
         base = str(meta.get("general.basename", "")).lower()
         arch = str(meta.get("general.architecture", "")).lower()
-        if base != "rune" or arch != "gemma4":
+        name = filename.lower()
+        if arch != "gemma4":
             return False
-        return not _OTHER_VERSION.search(filename.lower())
+        if base != "rune" and not (not base and name.startswith("rune-26b-a4b")):
+            return False
+        return not _OTHER_VERSION.search(name)
 
     def __init__(self, tok):
         super().__init__(tok)
@@ -285,7 +290,9 @@ class Rune(Profile):
                 "Not supported: surogate's 'thinking' extension (think before answering when unsure) and "
                 "'order_averaging' (re-read with options reversed). Both fields are ignored.",
                 "Rune v1 and v3 GGUFs carry the same general.* metadata (basename 'rune'); a GGUF whose "
-                "filename names v1 or v2 is not matched, any other 'rune' gemma4 GGUF is assumed to be v3.",
+                "filename names v1 or v2 is not matched, any other 'rune' gemma4 GGUF is assumed to be v3. "
+                "Livesport's Q8_0 has a stripped header (no basename); it is recognised by its file name "
+                "(rune-26b-a4b*), so keep that name.",
                 "The Livesport GGUFs are text-only (no vision tower): images are not supported.",
             ],
         }

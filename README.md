@@ -670,7 +670,10 @@ curl -s localhost:8090/v1/systemone -H 'Content-Type: application/json' -d '{
 - **One contract:** `llmctl decide spec [MODEL] [--json]` prints the request
   and response format plus the model's specifics (label order, temperatures,
   limits, state truncation, extras). A running endpoint serves the same at
-  `GET /v1/spec`.
+  `GET /v1/spec`. The [client guide](packages/systemone-proxy/docs/client-guide.md)
+  explains how to read it and write a client;
+  [adding a profile](packages/systemone-proxy/docs/adding-a-profile.md) covers
+  supporting a new model.
 - **Self-test:** at startup the proxy checks that the GGUF tokenizes exactly
   like the vendor's tokenizer; it refuses to serve a mismatched model.
 - **Lifecycle:** the endpoint is a tracked instance named `<model>.decide`

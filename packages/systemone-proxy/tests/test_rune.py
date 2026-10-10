@@ -215,6 +215,11 @@ def test_matches():
     assert not Rune.matches(meta, "Rune_V2.Q8_0.gguf")
     assert not Rune.matches({**meta, "general.architecture": "gemma3"}, "rune-v3.gguf")
     assert not Rune.matches({**meta, "general.basename": "quyet-1.0"}, "rune-v3.gguf")
+    # Livesport's Q8_0: stripped header, identified by its file name only
+    stripped = {"general.architecture": "gemma4", "general.name": "Hf", "general.size_label": "128x2.6B"}
+    assert Rune.matches(stripped, "rune-26b-a4b-v3-Q8_0.gguf")
+    assert not Rune.matches(stripped, "rune-26b-a4b-v1-Q8_0.gguf")
+    assert not Rune.matches(stripped, "gemma-4-26b-a4b-it-Q8_0.gguf")
 
 
 def test_spec_without_instance():
