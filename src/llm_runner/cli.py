@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -23,7 +24,7 @@ from llm_runner import backends
 from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner import registry
-from llm_runner.backends import DECIDER, LLAMA, VLLM
+from llm_runner.backends import DECIDER, GATEWAY, LLAMA, VLLM
 from llm_runner.registry import MODELS_DIR, ModelSpec, discover_models
 
 
@@ -304,6 +305,8 @@ def config_show() -> None:
         click.echo("  (vllm overridden by $LLM_RUNNER_VLLM_BIN)")
     if os.environ.get("LLM_RUNNER_DECIDER_DIR"):
         click.echo("  (decider overridden by $LLM_RUNNER_DECIDER_DIR)")
+    gw_port = config_mod.get_gateway_port()
+    click.echo(f"\nGateway: {'off' if gw_port is None else f'port {gw_port}'}")
 
 
 @config.command("vllm-bin")
@@ -364,6 +367,31 @@ def config_decider_dir(path: Path | None, clear: bool) -> None:
     click.echo(f"decider_dir set to {saved}")
     if os.environ.get("LLM_RUNNER_DECIDER_DIR"):
         click.echo("note: $LLM_RUNNER_DECIDER_DIR is set and overrides this.", err=True)
+
+
+@config.command("gateway")
+@click.argument("port", required=False, type=click.IntRange(1, 65535))
+@click.option("--off", is_flag=True, help="Don't start the gateway with the first model.")
+def config_gateway(port: int | None, off: bool) -> None:
+    """Set the all-models gateway port (default 9000), or turn it off.
+
+    The gateway starts with the first `llmctl run` and serves every running
+    model on one port. With no PORT, print the current setting.
+    """
+    if off:
+        config_mod.set_gateway_port(None)
+        click.echo("gateway off (a running one keeps going: `llmctl gateway stop`)")
+        return
+    if port is None:
+        current = config_mod.get_gateway_port()
+        click.echo("off" if current is None else str(current))
+        return
+    config_mod.set_gateway_port(port)
+    click.echo(f"gateway port set to {port}")
+    gw = _gateway_record()
+    if gw and gw.port != port:
+        click.echo(f"note: the running gateway is on {gw.port}; "
+                   "`llmctl gateway stop && llmctl gateway start` moves it.", err=True)
 
 
 @config.command("models-dir")
@@ -697,6 +725,10 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                                spec_n_max=spec_n_max, n_parallel=n_parallel,
                                cache_ram=cache_ram, kv_unified=kv_unified,
                                extra=extra_args)
+        # Report the llmctl name as the model id (as vLLM's --served-model-name
+        # does) instead of the GGUF path, so it matches the gateway's /v1/models.
+        if not any(a in ("--alias", "-a") for a in extra_args):
+            cmd += ["--alias", name]
         # Decision endpoints never reuse the prompt cache (cache_prompt off), but
         # llama-server still saves up to 32 context checkpoints per slot, each
         # tens to hundreds of MB on a long prompt. That OOM-killed Quyet on the
@@ -713,6 +745,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                      model_path=str(model_path), run_args=run_args,
                      backend=backend, env=env)
     click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  backend={backend}")
+    _ensure_gateway()
     if env:
         click.echo("Env:     " + " ".join(f"{k}={v}" for k, v in env.items()))
     if draft_path:
@@ -751,6 +784,9 @@ def ps_cmd() -> None:
     for p in procs:
         started = dt.datetime.fromtimestamp(p.started_at).strftime("%Y-%m-%d %H:%M:%S")
         click.echo(f"{p.pid:<8} {p.port:<6} {p.backend:<8} {started:<20} {p.name}")
+    gw = _gateway_record()
+    if gw:
+        click.echo(f"\nAll models: {_gateway_url(gw.port)}  (GET /v1/models lists them)")
 
 
 @cli.command()
@@ -762,7 +798,7 @@ def stop(identifier: str | None) -> None:
     otherwise show an interactive picker.
     """
     if identifier is None:
-        running = proc.list_running()
+        running = _models_running()
         if not running:
             raise click.UsageError("No running models.")
         target = running[0] if len(running) == 1 else _pick_instance_interactively(running)
@@ -776,12 +812,17 @@ def stop(identifier: str | None) -> None:
         for p in _proxy_attached_to(rec.port):
             proc.stop(str(p.pid))
             click.echo(f"Stopped {p.name}  pid={p.pid}  port={p.port}")
+    # The gateway came up with the first model and goes down with the last.
+    gw = _gateway_record()
+    if gw and rec.backend != GATEWAY and not _models_running():
+        proc.stop(str(gw.pid))
+        click.echo(f"Stopped gateway  pid={gw.pid}  port={gw.port}  (no models left)")
 
 
 def _resolve_running_target(identifier: str | None) -> proc.RunningProcess:
     """Find a running instance by NAME/PID, or pick interactively if omitted."""
     if identifier is None:
-        running = proc.list_running()
+        running = _models_running()
         if not running:
             raise click.UsageError("No running models.")
         return running[0] if len(running) == 1 else _pick_instance_interactively(running)
@@ -828,7 +869,7 @@ def logs(identifier: str | None, lines: int, follow: bool) -> None:
     otherwise show an interactive picker.
     """
     if identifier is None:
-        running = proc.list_running()
+        running = _models_running()
         if not running:
             raise click.UsageError("No running models.")
         if len(running) == 1:
@@ -941,6 +982,8 @@ def restore(names: tuple[str, ...]) -> None:
     for spec, status in results:
         failed |= status.startswith("error")
         click.echo(f"{spec.name:<24}  {status}")
+    if _models_running():
+        _ensure_gateway()
     if failed:
         raise SystemExit(1)
 
@@ -961,7 +1004,7 @@ def restart(ctx: click.Context, identifier: str | None,
     The port is kept the same. Pass --port to move it deliberately.
     """
     if identifier is None:
-        running = proc.list_running()
+        running = _models_running()
         if not running:
             raise click.UsageError(
                 "No models running. Pass a name from `llmctl autostart list`.")
@@ -1101,6 +1144,7 @@ def decide_start(identifier: str | None, port: int | None, profile: str | None, 
     click.echo(f"Contract: llmctl decide spec {target.name}   "
                f"or GET http://127.0.0.1:{rec.port}/v1/spec")
     click.echo(f"Logs:     llmctl logs {rec.name}")
+    _ensure_gateway()
     if wait and not _wait_healthy(rec, timeout=300):
         raise SystemExit(1)
 
@@ -1137,6 +1181,101 @@ def decide_profiles() -> None:
     raise SystemExit(subprocess.run([binary, "profiles"]).returncode)
 
 
+def _models_running() -> list[proc.RunningProcess]:
+    """Running instances other than the gateway (what pickers offer)."""
+    return [p for p in proc.list_running() if p.backend != GATEWAY]
+
+
+def _gateway_record() -> proc.RunningProcess | None:
+    return next((p for p in proc.list_running() if p.backend == GATEWAY), None)
+
+
+def _gateway_url(port: int) -> str:
+    return f"http://{socket.gethostname()}:{port}/v1"
+
+
+def _start_gateway(port: int) -> proc.RunningProcess:
+    cmd = [sys.executable, "-m", "llm_runner", "gateway", "serve", "--port", str(port)]
+    return proc.start(name="gateway", cmd=cmd, port=port, model_path="", backend=GATEWAY)
+
+
+def _ensure_gateway() -> None:
+    """Start the gateway if it's enabled and not up yet. Never fails a launch."""
+    port = config_mod.get_gateway_port()
+    if port is None or _gateway_record():
+        return
+    if _port_in_use(port):
+        click.echo(f"note: gateway not started, port {port} is taken "
+                   "(`llmctl config gateway PORT` to move it).", err=True)
+        return
+    rec = _start_gateway(port)
+    click.echo(f"Gateway: {_gateway_url(rec.port)}  (all running models; pid={rec.pid})")
+
+
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def gateway(ctx: click.Context) -> None:
+    """One port (default 9000) for every running model.
+
+    \b
+      GET  /v1/models                     the running models (+ an `llmctl` block)
+      POST /v1/chat/completions ...       routed by the body's "model"
+      POST /v1/systemone                  routed to a decision endpoint the same way
+      ANY  /m/<name>/<path>               any path of that model (/completion, /props, ...)
+
+    "model" may be an exact name or a unique prefix; with one model running it
+    may be left out. It starts with the first `llmctl run`, stops with the
+    last `llmctl stop`, and comes back with autostart. `llmctl config gateway
+    --off` disables that.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    gw = _gateway_record()
+    if gw is None:
+        port = config_mod.get_gateway_port()
+        click.echo("Gateway not running" + (" (turned off: `llmctl config gateway 9000`)"
+                                             if port is None else
+                                             f"; it starts with the next model on port {port}."))
+        return
+    click.echo(f"Gateway: {_gateway_url(gw.port)}  pid={gw.pid}")
+    for p in _models_running():
+        click.echo(f"  {p.name:<36}  {p.backend:<8} :{p.port}")
+
+
+@gateway.command("start")
+@click.option("--port", "-p", type=click.IntRange(1, 65535), default=None,
+              help="Port (default: `llmctl config gateway`, 9000).")
+def gateway_start(port: int | None) -> None:
+    """Start the gateway now (it normally starts with the first model)."""
+    gw = _gateway_record()
+    if gw:
+        raise click.UsageError(f"The gateway is already running on port {gw.port}.")
+    port = port or config_mod.get_gateway_port() or config_mod.DEFAULT_GATEWAY_PORT
+    if _port_in_use(port):
+        raise click.UsageError(f"Port {port} is already in use.")
+    rec = _start_gateway(port)
+    click.echo(f"Gateway: {_gateway_url(rec.port)}  pid={rec.pid}")
+
+
+@gateway.command("stop")
+def gateway_stop() -> None:
+    """Stop the gateway (the next `llmctl run` starts it again)."""
+    gw = _gateway_record()
+    if gw is None:
+        raise click.UsageError("The gateway is not running.")
+    proc.stop(str(gw.pid))
+    click.echo(f"Stopped gateway  pid={gw.pid}  port={gw.port}")
+
+
+@gateway.command("serve", hidden=True)
+@click.option("--port", "-p", type=int, default=config_mod.DEFAULT_GATEWAY_PORT)
+@click.option("--host", default="0.0.0.0")
+def gateway_serve(port: int, host: str) -> None:
+    """Run the gateway in the foreground (what `start` launches)."""
+    from llm_runner import gateway as gw_mod
+    gw_mod.serve(port, host)
+
+
 @cli.group()
 def autostart() -> None:
     """Restart the last-running models on boot via a systemd user service."""
@@ -1147,6 +1286,8 @@ def _fmt_run_line(s: proc.LaunchSpec) -> str:
     entries recorded before run args were tracked."""
     if s.backend == backends.DECIDE:
         return f"llmctl decide {s.name.removesuffix('.decide')} --port {s.port}"
+    if s.backend == GATEWAY:
+        return f"llmctl gateway start --port {s.port}"
     if s.run_args:
         return f"llmctl {shlex.join(s.run_cmd())}"
     return "(run args not recorded — `llmctl run` it again with your flags to capture them)"

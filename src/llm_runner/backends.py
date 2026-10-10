@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
 
 LLAMA = "llama"
@@ -38,6 +39,9 @@ DECIDER = "decider"
 # Not a model server: the systemone-proxy started by `llmctl decide` in front
 # of a running llama-server.
 DECIDE = "decide"
+# Not a model server either: the `llmctl gateway` router that puts every
+# running model behind one port. Started with the first model.
+GATEWAY = "gateway"
 BACKENDS = (LLAMA, VLLM, DECIDER)
 
 
@@ -154,6 +158,8 @@ def find(backend: str) -> str | None:
         return find_decider()
     if backend == DECIDE:
         return find_systemone_proxy()
+    if backend == GATEWAY:
+        return sys.executable    # it is llmctl itself (python -m llm_runner)
     return find_vllm()
 
 

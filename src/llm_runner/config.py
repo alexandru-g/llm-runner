@@ -7,7 +7,9 @@ across invocations regardless of cwd. Override the location with
 
 Settings: ``models_dir`` (where GGUF / HF checkpoints live), ``vllm_bin``
 (path to the ``vllm`` CLI when it isn't on PATH) and ``decider_dir`` (the
-Mapika/decider clone whose venv serves decider checkpoints). Environment variables still
+Mapika/decider clone whose venv serves decider checkpoints) and
+``gateway_port`` (the all-models port started with the first model, or
+``"off"``). Environment variables still
 take precedence over persisted config (see ``registry._resolve_models_dir``
 and ``backends.find_vllm``).
 """
@@ -98,3 +100,19 @@ def set_decider_dir(path: Path | None) -> Path | None:
     cfg["decider_dir"] = str(resolved)
     save(cfg)
     return resolved
+
+
+DEFAULT_GATEWAY_PORT = 9000
+
+
+def get_gateway_port() -> int | None:
+    """The gateway port, or None when the gateway is turned off."""
+    val = load().get("gateway_port", DEFAULT_GATEWAY_PORT)
+    return None if val == "off" else int(val)
+
+
+def set_gateway_port(port: int | None) -> None:
+    """Persist the gateway port (None turns the gateway off)."""
+    cfg = load()
+    cfg["gateway_port"] = "off" if port is None else int(port)
+    save(cfg)

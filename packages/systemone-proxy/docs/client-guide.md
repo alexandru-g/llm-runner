@@ -39,6 +39,14 @@ curl -s localhost:8090/v1/systemone -H 'Content-Type: application/json' -d '{
 
 (The numbers are illustrative.)
 
+Through the llmctl gateway (port 9000, started with the first model), the
+same request goes to `http://<host>:9000/v1/systemone` with a `"model"`
+field naming the decision endpoint (its llmctl name, e.g.
+`"rune-26b-a4b-v3-iq4_xs-dyn.decide"`, or a unique prefix such as `"rune"`).
+`model` may be left out when only one decision endpoint is running.
+`GET http://<host>:9000/v1/models` lists them with `"llmctl": {"api":
+"systemone", ...}`, and the spec is at `GET /m/<name>/v1/spec`.
+
 ## Getting the spec
 
 Three equivalent sources:

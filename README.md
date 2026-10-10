@@ -548,6 +548,7 @@ llmctl ps
 ```
 
 Prints PID, port, start time, and name. Dead entries are pruned automatically.
+When the gateway is up, its all-models URL is printed underneath.
 
 ### Stop a running model
 
@@ -764,6 +765,40 @@ llmctl ps
 Each instance gets its own port and log file. The auto-port picker walks up
 from 8080, so omitting `-p` for the second model also works. Backends mix
 freely; `ps`, `show` and `autostart list` report which one each instance uses.
+
+### One port for all of them: the gateway
+
+The first `llmctl run` also starts a gateway on port 9000 that serves every
+running model through one OpenAI-compatible base URL. Each model keeps its
+own port; the gateway routes by the request's `model` field, the way the
+OpenAI API does:
+
+```bash
+curl http://orin:9000/v1/models          # what's running (+ an "llmctl" block)
+curl http://orin:9000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "gemma-4-26b", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+- `GET /v1/models` lists the running models. `id` is the llmctl name, and
+  `llmctl` adds backend, port, API (`openai` or `systemone`), context,
+  vision, decision flag and status (`ready` / `loading` / `down`).
+- `model` may be the exact name or a unique prefix (`"gemma-4-26b"` above),
+  and may be left out when only one model is running. An unknown or
+  ambiguous name gets an OpenAI-style `404 model_not_found` /
+  `400 model_ambiguous` that lists the running ids.
+- `POST /v1/systemone` is routed the same way among the decision endpoints
+  (`llmctl decide`); `GET /v1/spec` takes the model in an `X-Model` header.
+- `/m/<name>/<path>` reaches any other endpoint of one model, e.g.
+  `/m/glm-ocr/props` or llama-server's native `/completion`.
+- Streaming (SSE) passes through as it is generated; a client that hangs up
+  stops the generation.
+
+It stops with the last `llmctl stop`, is restored at boot with the models,
+and shows in `llmctl ps`. `llmctl gateway` prints its URL and routes;
+`llmctl gateway start|stop` control it by hand, `llmctl config gateway PORT`
+moves it and `llmctl config gateway --off` keeps it from starting.
+llama-server instances now get `--alias <name>`, so their responses report
+the same model id the gateway lists.
 
 ## Configuration
 
