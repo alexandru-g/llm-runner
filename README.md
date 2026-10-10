@@ -780,6 +780,8 @@ freely; `ps`, `show` and `autostart list` report which one each instance uses.
 
 ### One port for all of them: the gateway
 
+Writing a client? See the [gateway client guide](docs/gateway-client-guide.md).
+
 The first `llmctl run` also starts a gateway on port 9000 that serves every
 running model through one OpenAI-compatible base URL. Each model keeps its
 own port; the gateway routes by the request's `model` field, the way the
