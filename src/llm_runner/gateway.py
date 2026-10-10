@@ -404,6 +404,7 @@ def make_handler(gw: Gateway):
         # ---------------------------------------------------------- replies --
         def _json(self, status: int, payload: dict) -> None:
             body = json.dumps(payload).encode()
+            self._replied = True
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -444,6 +445,17 @@ def make_handler(gw: Gateway):
 
         # ---------------------------------------------------------- routing --
         def _handle(self) -> None:
+            self._replied = False
+            try:
+                self._route()
+            except Exception as e:  # never drop a connection without an answer
+                import traceback
+                traceback.print_exc()
+                self.close_connection = True
+                if not self._replied:
+                    self._error(500, "gateway_error", f"llmctl gateway: {type(e).__name__}: {e}")
+
+        def _route(self) -> None:
             path, _, query = self.path.partition("?")
             body = self._body()
             if body is None:
@@ -525,6 +537,7 @@ def make_handler(gw: Gateway):
         def _busy(self) -> None:
             body = json.dumps({"error": {"message": "all slots busy", "type": "server_error",
                                          "param": None, "code": "busy"}}).encode()
+            self._replied = True
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
             self.send_header(BUSY_HEADER, "1")
@@ -648,6 +661,7 @@ def make_handler(gw: Gateway):
                 conn.close()
 
         def _relay(self, resp: http.client.HTTPResponse, data: bytes | None = None) -> None:
+            self._replied = True
             self.send_response(resp.status, resp.reason)
             length = str(len(data)) if data is not None else resp.getheader("Content-Length")
             for k, v in resp.getheaders():

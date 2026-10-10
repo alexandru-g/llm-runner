@@ -154,22 +154,51 @@ def pick(instances: list[Instance], requested: object, api: str,
 _IMAGE_PART_TYPES = {"image_url", "input_image", "image"}
 
 
-def has_images(payload: object, depth: int = 0) -> bool:
-    """Whether a JSON request carries images: OpenAI content parts, the
-    SystemOne ``images`` field, or llama-server's ``multimodal_data``."""
+def _is_image_part(part: object) -> bool:
+    # "type" is not always a string: in a JSON schema (response_format,
+    # tools) it can be an object or a list.
+    return isinstance(part, dict) and isinstance(part.get("type"), str) \
+        and part["type"] in _IMAGE_PART_TYPES
+
+
+def _state_has_image(state: object, depth: int = 0) -> bool:
+    """SystemOne ``state``: data-URL strings or image parts anywhere in it."""
     if depth > 8:
         return False
-    if isinstance(payload, dict):
-        if payload.get("type") in _IMAGE_PART_TYPES:
+    if isinstance(state, str):
+        return state.startswith("data:image/")
+    if isinstance(state, dict):
+        if _is_image_part(state) or (state.get("type") == "base64"
+                                     and isinstance(state.get("data"), str)):
             return True
-        for key in ("images", "multimodal_data"):
-            if payload.get(key):
-                return True
-        return any(has_images(v, depth + 1) for v in payload.values()
-                   if isinstance(v, (dict, list)))
-    if isinstance(payload, list):
-        return any(has_images(v, depth + 1) for v in payload if isinstance(v, (dict, list)))
+        return any(_state_has_image(v, depth + 1) for v in state.values())
+    if isinstance(state, list):
+        return any(_state_has_image(v, depth + 1) for v in state)
     return False
+
+
+def has_images(payload: object) -> bool:
+    """Whether a JSON request carries images, looking only where the APIs put
+    them: chat/Responses content parts, SystemOne ``images`` and ``state``,
+    llama-server's ``multimodal_data``. Anything else (a JSON schema in
+    ``response_format`` or ``tools``, say) is never taken for an image."""
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("images") or payload.get("multimodal_data"):
+        return True
+    prompts = payload.get("prompt")
+    for prompt in prompts if isinstance(prompts, list) else [prompts]:
+        if isinstance(prompt, dict) and prompt.get("multimodal_data"):
+            return True
+    for key in ("messages", "input"):
+        items = payload.get(key)
+        for item in items if isinstance(items, list) else []:
+            if _is_image_part(item):
+                return True
+            content = item.get("content") if isinstance(item, dict) else None
+            if isinstance(content, list) and any(_is_image_part(p) for p in content):
+                return True
+    return "state" in payload and _state_has_image(payload["state"])
 
 
 _CONTEXT_ERROR = re.compile(

@@ -100,7 +100,20 @@ def test_vision_filter():
     ({"state": "x", "images": ["AA"], "questions": {}}, True),
     ({"state": "x", "images": [], "questions": {}}, False),
     ({"prompt": {"prompt_string": "x", "multimodal_data": ["AA"]}}, True),
+    ({"input": [{"role": "user", "content": [{"type": "input_image", "image_url": "data:"}]}]}, True),
+    ({"state": {"photo": "data:image/png;base64,AA"}, "questions": {}}, True),
+    ({"state": {"doc": {"type": "base64", "data": "AA"}}, "questions": {}}, True),
     (None, False),
+    # JSON schemas: "type" may be an object or a list, and property names
+    # like "images" are not images.
+    ({"messages": [{"role": "user", "content": "hi"}],
+      "response_format": {"type": "json_schema", "json_schema": {"schema": {
+          "type": "object", "properties": {
+              "images": {"type": "array", "items": {"type": "string"}},
+              "kind": {"type": ["string", "null"]},
+              "box": {"type": {"weird": True}}}}}}}, False),
+    ({"messages": [{"role": "user", "content": [{"type": {"x": 1}}]}],
+      "tools": [{"type": "function", "function": {"parameters": {"type": "object"}}}]}, False),
 ])
 def test_has_images(payload, expected):
     assert cl.has_images(payload) is expected
@@ -392,3 +405,27 @@ def test_spill_off_and_busy_reply(cluster):
     assert status == 503 and out["error"]["code"] == "busy"
     # Without the spill header a hop queues as before.
     assert _who(rtx, "quyet", **{cl.HOP_HEADER: "orin", cl.TOKEN_HEADER: TOKEN}) == "rtx"
+
+
+def test_schema_requests_route_and_errors_keep_the_connection(cluster):
+    orin = cluster["orin"]
+    schema = {"type": "json_schema", "json_schema": {"name": "r", "schema": {
+        "type": "object", "properties": {"images": {"type": {"x": 1}},
+                                         "t": {"type": ["string", "null"]}}}}}
+    conn = http.client.HTTPConnection("127.0.0.1", orin.port, timeout=5)
+    for model, expect in (("nope", 404), ("glm-ocr", 200), ("glm-ocr", 200)):
+        conn.request("POST", "/v1/chat/completions", headers={"Content-Type": "application/json"},
+                     body=json.dumps({"model": model, "response_format": schema,
+                                      "messages": [{"role": "user", "content": "x" * 3000}]}))
+        resp = conn.getresponse()
+        resp.read()
+        assert resp.status == expect
+    conn.close()
+
+
+def test_unexpected_errors_answer_500(cluster, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("kaboom")
+    monkeypatch.setattr(gw, "pick", boom)
+    status, out = _call(cluster["orin"], "POST", "/v1/chat/completions", {"model": "glm-ocr"})
+    assert status == 500 and out["error"]["code"] == "gateway_error" and "kaboom" in out["error"]["message"]
