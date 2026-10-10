@@ -573,6 +573,7 @@ landed on) in a manifest, so you never have to remember the args again:
 llmctl autostart list                        # shows each entry's `llmctl run …` line
 llmctl restart gemma-4-26b-a4b-it-ud-q4_k_m  # stop (if running) + relaunch, same args, same port
 llmctl restart gemma-4-26b-a4b-it-ud-q4_k_m --n-parallel 8   # …with one flag changed
+llmctl restart                               # everything running, one at a time
 llmctl restore gemma-4-26b-a4b-it-ud-q4_k_m  # relaunch only if not already running
 ```
 
@@ -581,6 +582,13 @@ remembered set. **Ports are pinned**: a model always comes back on the port it
 was first started on. If that port is taken, `restart`/`restore` report an
 error rather than silently moving it — pass `--port N` to `restart` to move
 it deliberately.
+
+Bare `llmctl restart` restarts everything that is running: the models first,
+each back and answering `/health` before the next one stops (so memory never
+holds two copies of one, which matters on the Orin), then the decision
+endpoints, then the gateway. Handy after `./install.sh` or a deploy, so every
+process runs the new llmctl and picks up launch defaults added since (e.g.
+`--alias`, groups).
 
 ### Auto-restart running models on boot
 

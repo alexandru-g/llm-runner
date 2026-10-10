@@ -1077,13 +1077,47 @@ def restart(ctx: click.Context, identifier: str | None,
       llmctl restart gemma-4-26b-a4b-it-ud-q4_k_m --n-parallel 8
 
     The port is kept the same. Pass --port to move it deliberately.
+
+    With no IDENTIFIER, restart everything that is running, one at a time:
+    each model is back and answering before the next one stops (so memory
+    never holds two copies), then the decision endpoints, then the gateway.
     """
     if identifier is None:
-        running = _models_running()
-        if not running:
-            raise click.UsageError(
-                "No models running. Pass a name from `llmctl autostart list`.")
-        identifier = _pick_instance_interactively(running).name
+        if overrides:
+            raise click.UsageError("Overrides need a model name: llmctl restart NAME --flag ...")
+        return _restart_all(ctx)
+    _restart_one(ctx, identifier, overrides)
+
+
+def _restart_all(ctx: click.Context) -> None:
+    running = proc.list_running()
+    if not running:
+        raise click.UsageError("Nothing is running. Pass a name from `llmctl autostart list`.")
+    # Models before the decision endpoints in front of them; the gateway last,
+    # so it comes back on the freshly installed llmctl after everything else.
+    rank = {backends.DECIDE: 1, GATEWAY: 2}
+    order = sorted(running, key=lambda p: (rank.get(p.backend, 0), p.started_at))
+    click.echo("Restarting one at a time: " + ", ".join(p.name for p in order))
+    failed = []
+    for p in order:
+        click.echo(f"\n== {p.name}")
+        try:
+            rec = _restart_one(ctx, p.name, ())
+        except click.UsageError as e:
+            click.echo(f"skipped: {e.format_message()}", err=True)
+            failed.append(p.name)
+            continue
+        slow = rec is not None and rec.backend in (VLLM, DECIDER)
+        if rec is None or not _wait_healthy(rec, timeout=600 if slow else 300):
+            failed.append(p.name)
+    if failed:
+        click.echo(f"\nNot back: {', '.join(failed)}", err=True)
+        raise SystemExit(1)
+    click.echo(f"\nAll {len(order)} restarted.")
+
+
+def _restart_one(ctx: click.Context, identifier: str,
+                 overrides: tuple[str, ...]) -> proc.RunningProcess | None:
     live = proc.find(identifier)
     name = live.name if live else identifier
     spec = proc.autostart_find(name)
@@ -1109,11 +1143,13 @@ def restart(ctx: click.Context, identifier: str | None,
             time.sleep(0.25)
 
     if not spec.run_args:
-        # Legacy manifest entry: relaunch the resolved server command as-is.
+        # Recorded without `run` args (a decision endpoint, the gateway, or a
+        # legacy entry): relaunch the resolved server command as-is.
         rec = proc.start(name=spec.name, cmd=spec.cmd, port=spec.port,
-                         model_path=spec.model_path, backend=spec.backend)
+                         model_path=spec.model_path, backend=spec.backend,
+                         env=spec.env, group=spec.group)
         click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}")
-        return
+        return rec
 
     # Re-issue `llmctl run` with the remembered args; overrides come last so
     # they win, and `run` re-records the merged set in the manifest.
@@ -1122,6 +1158,7 @@ def restart(ctx: click.Context, identifier: str | None,
     sub = run.make_context("llmctl run", args, parent=ctx)
     with sub:
         run.invoke(sub)
+    return proc.find(name)
 
 
 class _DecideGroup(click.Group):
