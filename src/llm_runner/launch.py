@@ -13,16 +13,19 @@ entry here; nothing in ``run`` changes.
 from __future__ import annotations
 
 import json
+import re
+import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import click
 
 from llm_runner import process as proc
-from llm_runner.backends import DECIDER, LLAMA, VLLM
-from llm_runner.registry import ModelSpec
+from llm_runner.backends import DECIDER, GATEWAY, LLAMA, VLLM
+from llm_runner.registry import ModelSpec, default_group
 
 CHOICES_FILE = proc.STATE_DIR / "launch.json"
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,7 @@ class Setting:
     label: str
     values: Callable[[Target], list[tuple[Any, str]]]   # (value, title), default first
     applies: Callable[[Target], bool]
+    custom: str | None = None       # offer "other…": a typed value, with this prompt
 
 
 def _ctx_values(t: Target) -> list[tuple[Any, str]]:
@@ -58,6 +62,30 @@ def _kv_values(t: Target) -> list[tuple[Any, str]]:
 def _checkpoint_values(t: Target) -> list[tuple[Any, str]]:
     auto = "auto (off: decision model)" if t.decision else "auto (llama-server: 32)"
     return [(None, auto), (0, "off"), (4, "4"), (32, "32")]
+
+
+def _cluster_groups() -> list[str]:
+    """Groups running anywhere the local gateway can see (best effort)."""
+    gw = next((p for p in proc.list_running() if p.backend == GATEWAY), None)
+    if gw is None:
+        return []
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{gw.port}/v1/models", timeout=1) as r:
+            data = json.loads(r.read())["data"]
+    except (OSError, ValueError, KeyError):
+        return []
+    return sorted({m["llmctl"]["group"] for m in data
+                   if m.get("llmctl", {}).get("group") and "members" not in m["llmctl"]})
+
+
+def _group_values(t: Target) -> list[tuple[Any, str]]:
+    auto = default_group(t.spec.model_path)
+    vals: list[tuple[Any, str]] = [(None, f"auto ({auto})" if auto else "auto (none)"),
+                                   ("none", "none")]
+    for g in _cluster_groups():
+        if g != auto:
+            vals.append((g, f"{g}  (running)"))
+    return vals
 
 
 def _draft_title(t: Target) -> str:
@@ -83,6 +111,8 @@ SETTINGS: list[Setting] = [
     Setting("n_parallel", "Parallel slots",
             lambda t: [(None, "auto"), (1, "1"), (2, "2"), (4, "4"), (8, "8")],
             lambda t: True),
+    Setting("group_name", "Group", _group_values, lambda t: True,
+            custom="Group name (letters, digits, . _ -):"),
 ]
 
 
@@ -129,7 +159,7 @@ def configure(ctx: click.Context, target: Target) -> bool:
         valid = [v for v, _ in s.values(target)]
         if ctx.get_parameter_source(s.param) == src.COMMANDLINE:
             current[s.param] = ctx.params[s.param]       # typed: wins
-        elif s.param in remembered and remembered[s.param] in valid:
+        elif s.param in remembered and (remembered[s.param] in valid or s.custom):
             current[s.param] = remembered[s.param]
         else:
             current[s.param] = defaults[s.param]
@@ -160,16 +190,28 @@ def configure(ctx: click.Context, target: Target) -> bool:
             continue
         s = next(x for x in settings if x.param == picked)
         values = s.values(target)
-        if len(values) == 2:
+        if current[s.param] not in [v for v, _ in values]:
+            values.append((current[s.param], str(current[s.param])))   # a typed one
+        if len(values) == 2 and not s.custom:
             current[s.param] = values[1][0] if current[s.param] == values[0][0] else values[0][0]
         else:
             sub = [questionary.Choice(title, value=i) for i, (_, title) in enumerate(values)]
+            if s.custom:
+                sub.append(questionary.Choice("other…", value="custom"))
             at = next((i for i, (v, _) in enumerate(values) if v == current[s.param]), 0)
             i = questionary.select(f"{s.label}:", choices=sub, default=sub[at],
                                    use_shortcuts=False, instruction=" ").ask()
             if i is None:
                 raise click.Abort()
-            current[s.param] = values[i][0]
+            if i == "custom":
+                typed = questionary.text(
+                    s.custom, validate=lambda x: bool(_NAME.fullmatch(x.strip())) or
+                    "letters, digits, '.', '_' and '-'").ask()
+                if typed is None:
+                    raise click.Abort()
+                current[s.param] = typed.strip()
+            else:
+                current[s.param] = values[i][0]
         cursor = s.param
 
     for name, value in current.items():

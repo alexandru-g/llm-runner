@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from llm_runner import gateway as gw
+from llm_runner.cluster import OPENAI, SYSTEMONE, Instance, Unroutable, pick
 
 
 class _Upstream(BaseHTTPRequestHandler):
@@ -78,7 +79,7 @@ def env(tmp_path):
         _record("gateway", 1, backend="gateway"),
     ]
     state.write_text(json.dumps(records))
-    httpd = gw.make_server(0, "127.0.0.1", gw.Registry(state))
+    httpd = gw.make_server(0, "127.0.0.1", gw.Gateway(gw.LocalModels(state)))
     threading.Thread(target=httpd.serve_forever, args=(0.05,), daemon=True).start()
     yield {"port": httpd.server_address[1], "state": state, "records": records}
     for s in (a, b, d, httpd):
@@ -181,11 +182,11 @@ def test_dead_and_unreachable_models(env):
     assert status == 502 and out["error"]["code"] == "upstream_unavailable"
 
 
-def test_resolve_with_one_model_needs_no_name():
-    m = gw.Model("only", 1, 8080, "llama", 0.0, "", ())
-    assert gw.resolve([m], None, gw.OPENAI) is m
-    with pytest.raises(gw.Unroutable) as e:
-        gw.resolve([m], None, gw.SYSTEMONE)
+def test_one_model_needs_no_name():
+    m = Instance("only", "pc", 0, True, {"api": "openai", "status": "ready"})
+    assert pick([m], None, OPENAI) == [m]
+    with pytest.raises(Unroutable) as e:
+        pick([m], None, SYSTEMONE)
     assert e.value.status == 503
 
 

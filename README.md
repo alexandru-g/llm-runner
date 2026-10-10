@@ -380,6 +380,7 @@ to that model, with **Start** on top so Enter launches with what's shown:
      KV cache        f16
      Checkpoints     auto (off: decision model)
      Parallel slots  auto
+     Group           auto (h2o-lightning-4b)
    ↺ Reset to defaults
 ```
 
@@ -387,7 +388,10 @@ Enter on a two-valued setting toggles it; the others open a value list. The
 choices are remembered per model (state dir, `launch.json`) and preselected
 next time, and they're recorded like typed flags, so `restart` and autostart
 reuse them. `-i` shows the menu for a named model, `--no-menu` skips it. Flags
-you type still apply and show in the menu. Settings are a table in
+you type still apply and show in the menu. **Group** offers auto (the
+model's folder), none, the groups already running in the cluster, and
+"other…" to type a name (see [the registry](#several-machines-as-one-the-registry)).
+Settings are a table in
 `src/llm_runner/launch.py`; adding one is one entry.
 
 - Backend: from the model format (`--backend llama|vllm` to force; see
@@ -799,6 +803,66 @@ and shows in `llmctl ps`. `llmctl gateway` prints its URL and routes;
 moves it and `llmctl config gateway --off` keeps it from starting.
 llama-server instances now get `--alias <name>`, so their responses report
 the same model id the gateway lists.
+
+### Several machines as one: the registry
+
+Gateways on different machines can share one model list. One always-on box
+runs the registry; every machine (a *node*) reports its running models to it
+every 5 s and gets the rest of the cluster back. Any gateway, the registry's
+included, then lists and routes to every model in the cluster.
+
+```bash
+lab$  llmctl registry serve                     # prints the join command + token
+lab$  llmctl autostart install                  # keep it up across reboots
+rtx$  llmctl node set --name rtx --priority 0   # lower number = preferred
+rtx$  llmctl registry set 192.168.8.213 --token <token>
+orin$ llmctl node set --name orin --priority 1
+orin$ llmctl registry set 192.168.8.213 --token <token>
+any$  llmctl ps --all                           # every model, and where calls go
+```
+
+- **Routing.** A model running on several nodes goes to a `ready` instance
+  first, then the lowest priority number, then this machine. A call for
+  `quyet` made to the RTX's gateway goes to the Orin when only the Orin runs
+  it; a model on both goes to the RTX. `"model": "quyet@orin"` (or
+  `/m/quyet@orin/...`) pins a node.
+- **Failover.** If the chosen instance is unreachable, answers 502/503, has
+  just stopped, or refuses the prompt as longer than its context, the call
+  goes to the next instance. Only refusals that come before any reply is
+  sent count, so a generation is never repeated.
+- **Groups.** Every model also answers to its *group*: by default the
+  folder it sits in, which by the layout convention holds the quants of one
+  model. So `"model": "gemma-4-26b-a4b-it"` reaches the Q8 on the RTX or the
+  Q4 on the Orin, whichever routing prefers, and each gets the request under
+  its own exact name. A prefix that matches several quants of one group
+  (`"gemma-4-26b"`) means the group. `llmctl run MODEL --group NAME` puts a
+  model in another group (e.g. two different models you treat as
+  interchangeable), `--group none` in none. `/v1/models` lists a group as a
+  model of its own once it has two members (`llmctl.members`), and every
+  model shows its `llmctl.group`. Exact ids still mean exactly that model.
+- **Images** go only to instances that read them (a llama-server with its
+  mmproj, or a decision endpoint in front of one); otherwise
+  `400 vision_unavailable`.
+- **Health.** The heartbeat is the health check: a node silent for 15 s is
+  dropped, a gateway that stops says goodbye and is dropped at once. If the
+  registry itself is down, nodes keep the last list for 2 minutes and
+  failover covers machines that went away.
+- **Token.** Heartbeats and gateway-to-gateway calls carry the cluster token
+  (`llmctl registry token` prints it). Without it the registry refuses a node
+  and a gateway refuses a forwarded call, so no one can register a fake
+  model. Clients calling a gateway still need no key. The token travels in
+  plain HTTP: fine on a LAN or Tailscale, not across the internet.
+- **Versions.** Each heartbeat carries the llmctl version; differing ones
+  show as a warning in `llmctl registry` and `llmctl ps --all`, and a node on
+  an incompatible cluster protocol is refused with a message saying so.
+- In a cluster the gateway stays up with no local models (the machine still
+  routes to the others) and comes back with autostart.
+- `llmctl registry` shows the nodes, `registry clear` leaves the cluster,
+  `registry serve --off` stops hosting it. `node set --advertise URL` sets
+  the address others use for this machine when the one the registry sees
+  is wrong (NAT, Tailscale).
+- Each gateway port (9000) must be reachable from the other machines, e.g.
+  `sudo ufw allow from 192.168.8.0/24 to any port 9000 proto tcp`.
 
 ## Configuration
 

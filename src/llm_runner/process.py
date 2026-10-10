@@ -52,6 +52,8 @@ class RunningProcess:
     cmd: list[str] = field(default_factory=list)
     backend: str = "llama"  # default covers records written before vllm support
     env: dict[str, str] = field(default_factory=dict)  # extra vars set at launch
+    # Second name the gateway routes by (e.g. every quant of one model); "" = none.
+    group: str = ""
 
 
 @dataclass
@@ -70,6 +72,7 @@ class LaunchSpec:
     run_args: list[str] = field(default_factory=list)
     backend: str = "llama"
     env: dict[str, str] = field(default_factory=dict)
+    group: str = ""
 
     def run_cmd(self) -> list[str]:
         """The ``llmctl run …`` argv that reproduces this launch, port pinned."""
@@ -129,7 +132,7 @@ def autostart_list() -> list[LaunchSpec]:
 def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
                   run_args: list[str] | None = None,
                   backend: str = "llama",
-                  env: dict[str, str] | None = None) -> None:
+                  env: dict[str, str] | None = None, group: str = "") -> None:
     """Upsert a launch spec into the autostart manifest (keyed by name).
 
     Ports are pinned, so a port can only be restored to one model: entries
@@ -139,7 +142,7 @@ def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
     specs = [s for s in _load_autostart() if s.name != name and s.port != port]
     specs.append(LaunchSpec(name=name, cmd=list(cmd), port=port,
                             model_path=model_path, run_args=list(run_args or []),
-                            backend=backend, env=dict(env or {})))
+                            backend=backend, env=dict(env or {}), group=group))
     _save_autostart(specs)
 
 
@@ -164,7 +167,7 @@ def autostart_sync() -> tuple[list[LaunchSpec], list[LaunchSpec]]:
         LaunchSpec(name=p.name, cmd=list(p.cmd), port=p.port,
                    model_path=p.model_path,
                    run_args=old[p.name].run_args if p.name in old else [],
-                   backend=p.backend, env=dict(p.env))
+                   backend=p.backend, env=dict(p.env), group=p.group)
         for p in list_running()
     ]
     live = {s.name for s in kept}
@@ -210,7 +213,7 @@ def restore(names: list[str] | None = None) -> list[tuple[LaunchSpec, str]]:
         try:
             rec = start(name=spec.name, cmd=spec.cmd, port=spec.port,
                         model_path=spec.model_path, run_args=spec.run_args,
-                        backend=spec.backend, env=spec.env)
+                        backend=spec.backend, env=spec.env, group=spec.group)
             results.append((spec, f"started pid={rec.pid} port={rec.port}"))
         except Exception as e:  # never let one bad spec abort the rest
             results.append((spec, f"error: {e}"))
@@ -243,7 +246,7 @@ def find(identifier: str) -> RunningProcess | None:
 def start(*, name: str, cmd: list[str], port: int, model_path: str,
           run_args: list[str] | None = None,
           backend: str = "llama",
-          env: dict[str, str] | None = None) -> RunningProcess:
+          env: dict[str, str] | None = None, group: str = "") -> RunningProcess:
     """Launch ``cmd`` detached. ``env`` is layered over the current environment
     (e.g. VLLM_* tuning knobs) and remembered so restore/restart reproduce it."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -268,13 +271,14 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
         cmd=list(cmd),
         backend=backend,
         env=dict(env or {}),
+        group=group,
     )
     procs = reconcile()
     procs.append(rec)
     _save(procs)
     # Remember this launch so `restore` can bring it back after a reboot.
     autostart_add(name=name, cmd=cmd, port=port, model_path=model_path,
-                  run_args=run_args, backend=backend, env=env)
+                  run_args=run_args, backend=backend, env=env, group=group)
     return rec
 
 

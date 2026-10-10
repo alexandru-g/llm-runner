@@ -46,6 +46,9 @@ field naming the decision endpoint (its llmctl name, e.g.
 `model` may be left out when only one decision endpoint is running.
 `GET http://<host>:9000/v1/models` lists them with `"llmctl": {"api":
 "systemone", ...}`, and the spec is at `GET /m/<name>/v1/spec`.
+In a cluster of machines (`llmctl registry`), any machine's gateway reaches
+every node's decision endpoints the same way; `"model": "<name>@<node>"` pins
+one, and a request with images only goes to an endpoint that reads them.
 
 ## Getting the spec
 

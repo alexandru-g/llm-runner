@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -465,6 +466,10 @@ def list_cmd() -> None:
 @click.option("--name", "ft_name", default=None,
               help="Override the display name (useful with --ft). For vllm this "
                    "is also the model id clients send (--served-model-name).")
+@click.option("--group", "group_name", default=None,
+              help="Second name the gateway routes by, shared by interchangeable "
+                   "models (e.g. every quant of one model, across machines). Default: "
+                   "the model's folder, e.g. gemma-4-26b-a4b-it. 'none' for no group.")
 @click.option("--wait/--no-wait", "wait", default=False,
               help="Block until the server answers /health (or exits). Handy for "
                    "vllm, which takes a minute or more to load and compile.")
@@ -569,7 +574,7 @@ def list_cmd() -> None:
 @click.pass_context
 def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         ctx_size: int | None, ft_path: Path | None, ft_name: str | None,
-        wait: bool, menu: bool | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
+        group_name: str | None, wait: bool, menu: bool | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
         reasoning: bool,
         kv_quant: str, gpu_mem: float | None, tool_parser: str | None,
         reasoning_parser: str | None, trust_remote_code: bool,
@@ -741,10 +746,20 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     # Remember the llmctl-level invocation (with the interactively-picked model
     # made explicit) so `restart`/`autostart list` can show and re-issue it.
     run_args = ([] if ft_path else [model]) + _run_option_args(ctx)
+    if group_name is not None and group_name.lower() != "none" and \
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", group_name):
+        raise click.UsageError("A group name is letters, digits, '.', '_' and '-'.")
+    if group_name is None:
+        group = "" if ft_path else registry.default_group(model_path)
+    else:
+        group = "" if group_name.lower() == "none" else group_name
+    if group == name:
+        group = ""
     rec = proc.start(name=name, cmd=cmd, port=chosen_port,
                      model_path=str(model_path), run_args=run_args,
-                     backend=backend, env=env)
-    click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  backend={backend}")
+                     backend=backend, env=env, group=group)
+    click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  backend={backend}"
+               + (f"  group={group}" if group else ""))
     _ensure_gateway()
     if env:
         click.echo("Env:     " + " ".join(f"{k}={v}" for k, v in env.items()))
@@ -773,8 +788,12 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
 
 
 @cli.command("ps")
-def ps_cmd() -> None:
+@click.option("--all", "-a", "show_all", is_flag=True,
+              help="Every model in the cluster, with the node calls go to (needs the gateway).")
+def ps_cmd(show_all: bool) -> None:
     """List running models."""
+    if show_all:
+        return _ps_cluster()
     procs = proc.list_running()
     if not procs:
         click.echo("(no models running)")
@@ -787,6 +806,60 @@ def ps_cmd() -> None:
     gw = _gateway_record()
     if gw:
         click.echo(f"\nAll models: {_gateway_url(gw.port)}  (GET /v1/models lists them)")
+
+
+def _ps_cluster() -> None:
+    gw = _gateway_record()
+    if gw is None:
+        raise click.UsageError("The gateway is not running (it starts with the first model, "
+                               "or `llmctl gateway start`).")
+    # Groups are listed as models of their own; here each member shows its group.
+    models = [m for m in _gateway_get(gw.port, "/v1/models")["data"]
+              if "members" not in m["llmctl"]]
+    status = _gateway_get(gw.port, "/cluster/v1/status")
+    if not models:
+        click.echo("(no models running in the cluster)")
+    else:
+        w = max(len(m["id"]) for m in models)
+        gw_ = max([len(m["llmctl"].get("group") or "") for m in models] + [5])
+        click.echo(f"  {'MODEL':<{w}}  {'GROUP':<{gw_}}  {'NODE':<12} {'PRIO':<5} "
+                   f"{'STATUS':<8} {'PORT':<6} CTX")
+        click.echo("-" * (w + gw_ + 50))
+        for m in sorted(models, key=lambda m: (m["llmctl"].get("group") or m["id"], m["id"])):
+            group = m["llmctl"].get("group") or ""
+            for n, inst in enumerate(m["llmctl"]["nodes"]):
+                first = n == 0
+                node = inst["node"] + (" (here)" if inst["local"] else "")
+                click.echo(f"{'→' if first else ' '} {m['id'] if first else '':<{w}}  "
+                           f"{group if first else '':<{gw_}}  {node:<12} "
+                           f"{inst['priority']:<5} {inst['status']:<8} {inst['port'] or '':<6} "
+                           f"{inst['context'] or ''}")
+        click.echo("\n→ = where calls go (ready first, then lowest priority, then this machine)."
+                   "\nA GROUP name reaches its best member on any node.")
+    _echo_cluster_line(status)
+
+
+def _echo_cluster_line(status: dict) -> None:
+    if not status.get("cluster"):
+        click.echo("Not in a cluster (`llmctl registry set URL --token T`).")
+        return
+    reg = status["registry"]
+    if status["registry_ok"]:
+        click.echo(f"Cluster: node {status['node']} (priority {status['priority']}), "
+                   f"registry {reg}, last heartbeat {status['last_heartbeat_age']}s ago")
+    else:
+        click.echo(f"Cluster: node {status['node']}, registry {reg}: "
+                   f"{status['error'] or 'no heartbeat yet'}", err=True)
+    for w in status.get("warnings", []):
+        click.echo(f"warning: {w}", err=True)
+
+
+def _gateway_get(port: int, path: str) -> dict:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as r:
+            return json.loads(r.read())
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise click.ClickException(f"gateway on port {port} not answering: {e}") from None
 
 
 @cli.command()
@@ -812,9 +885,11 @@ def stop(identifier: str | None) -> None:
         for p in _proxy_attached_to(rec.port):
             proc.stop(str(p.pid))
             click.echo(f"Stopped {p.name}  pid={p.pid}  port={p.port}")
-    # The gateway came up with the first model and goes down with the last.
+    # The gateway came up with the first model and goes down with the last,
+    # unless this machine is in a cluster (it still routes to the others).
     gw = _gateway_record()
-    if gw and rec.backend != GATEWAY and not _models_running():
+    if gw and rec.backend != GATEWAY and not _models_running() \
+            and not config_mod.get_cluster().enabled:
         proc.stop(str(gw.pid))
         click.echo(f"Stopped gateway  pid={gw.pid}  port={gw.port}  (no models left)")
 
@@ -982,7 +1057,7 @@ def restore(names: tuple[str, ...]) -> None:
     for spec, status in results:
         failed |= status.startswith("error")
         click.echo(f"{spec.name:<24}  {status}")
-    if _models_running():
+    if _models_running() or config_mod.get_cluster().enabled:
         _ensure_gateway()
     if failed:
         raise SystemExit(1)
@@ -1137,7 +1212,8 @@ def decide_start(identifier: str | None, port: int | None, profile: str | None, 
            "--concurrency", str(concurrency), "--cache", cache,
            *[tok for chunk in extra for tok in shlex.split(chunk)]]
     rec = proc.start(name=name, cmd=cmd, port=chosen_port, model_path=target.model_path,
-                     backend=backends.DECIDE)
+                     backend=backends.DECIDE,
+                     group=f"{target.group}.decide" if target.group else "")
     click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  profile={profile}")
     click.echo(f"Endpoint: POST http://127.0.0.1:{rec.port}/v1/systemone  "
                f"(→ llama-server :{target.port})")
@@ -1212,6 +1288,44 @@ def _ensure_gateway() -> None:
     click.echo(f"Gateway: {_gateway_url(rec.port)}  (all running models; pid={rec.pid})")
 
 
+def _restart_gateway() -> None:
+    """Apply changed cluster settings: restart a running gateway, start one
+    that is now wanted, stop one that no longer is."""
+    gw = _gateway_record()
+    wanted = bool(_models_running()) or config_mod.get_cluster().enabled
+    if gw:
+        proc.stop(str(gw.pid))
+        if not wanted:
+            click.echo(f"Stopped gateway  pid={gw.pid}  port={gw.port}")
+            return
+        for _ in range(20):
+            if not _port_in_use(gw.port):
+                break
+            time.sleep(0.25)
+        rec = _start_gateway(gw.port)
+        click.echo(f"Restarted gateway  pid={rec.pid}  port={rec.port}")
+    elif wanted:
+        _ensure_gateway()
+
+
+def _wait_cluster(timeout: float = 12.0) -> dict | None:
+    """The gateway's cluster status once its first heartbeat is in."""
+    gw = _gateway_record()
+    if gw is None:
+        return None
+    deadline = time.time() + timeout
+    status = None
+    while time.time() < deadline:
+        try:
+            status = _gateway_get(gw.port, "/cluster/v1/status")
+            if status["registry_ok"] or status["error"]:
+                return status
+        except click.ClickException:
+            pass
+        time.sleep(0.5)
+    return status
+
+
 @cli.group(invoke_without_command=True)
 @click.pass_context
 def gateway(ctx: click.Context) -> None:
@@ -1227,6 +1341,9 @@ def gateway(ctx: click.Context) -> None:
     may be left out. It starts with the first `llmctl run`, stops with the
     last `llmctl stop`, and comes back with autostart. `llmctl config gateway
     --off` disables that.
+
+    In a cluster (`llmctl registry`), it lists and routes to the models of
+    every node, `model@node` pins one, and it stays up with no local models.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -1240,6 +1357,7 @@ def gateway(ctx: click.Context) -> None:
     click.echo(f"Gateway: {_gateway_url(gw.port)}  pid={gw.pid}")
     for p in _models_running():
         click.echo(f"  {p.name:<36}  {p.backend:<8} :{p.port}")
+    _echo_cluster_line(_gateway_get(gw.port, "/cluster/v1/status"))
 
 
 @gateway.command("start")
@@ -1265,6 +1383,9 @@ def gateway_stop() -> None:
         raise click.UsageError("The gateway is not running.")
     proc.stop(str(gw.pid))
     click.echo(f"Stopped gateway  pid={gw.pid}  port={gw.port}")
+    if config_mod.get_cluster().enabled:
+        click.echo("note: this machine is out of the cluster until the gateway is back "
+                   "(`llmctl gateway start`, the next `llmctl run`, or a restore).", err=True)
 
 
 @gateway.command("serve", hidden=True)
@@ -1274,6 +1395,189 @@ def gateway_serve(port: int, host: str) -> None:
     """Run the gateway in the foreground (what `start` launches)."""
     from llm_runner import gateway as gw_mod
     gw_mod.serve(port, host)
+
+
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def node(ctx: click.Context) -> None:
+    """This machine's name and priority in the cluster."""
+    if ctx.invoked_subcommand is not None:
+        return
+    c = config_mod.get_cluster()
+    click.echo(f"Name:      {c.node_name}")
+    click.echo(f"Priority:  {c.node_priority}  (lower wins when several nodes run a model)")
+    click.echo(f"Advertise: {c.node_advertise or '(address the registry sees)'}")
+
+
+@node.command("set")
+@click.option("--name", default=None, help="Node name (default: the hostname).")
+@click.option("--priority", type=int, default=None,
+              help="Lower is preferred: e.g. 0 for the fast workstation, 1 for the Orin.")
+@click.option("--advertise", default=None,
+              help="URL other nodes use to reach this gateway, e.g. http://orin.ts.net:9000 "
+                   "(default: the address the registry sees).")
+@click.option("--no-advertise", is_flag=True, help="Forget --advertise.")
+def node_set(name: str | None, priority: int | None, advertise: str | None,
+             no_advertise: bool) -> None:
+    """Set this machine's name, priority or advertised URL."""
+    if name is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+        raise click.UsageError("A node name is letters, digits, '.', '_' and '-'.")
+    values: dict = {}
+    if name is not None:
+        values["node_name"] = name
+    if priority is not None:
+        values["node_priority"] = priority
+    if advertise is not None:
+        values["node_advertise"] = _normalize_url(advertise)
+    if no_advertise:
+        values["node_advertise"] = None
+    if not values:
+        raise click.UsageError("Nothing to set (--name, --priority, --advertise).")
+    config_mod.update(**values)
+    c = config_mod.get_cluster()
+    click.echo(f"node {c.node_name}  priority={c.node_priority}"
+               + (f"  advertise={c.node_advertise}" if c.node_advertise else ""))
+    if _gateway_record():
+        _restart_gateway()
+
+
+def _require_gateway_on() -> None:
+    if config_mod.get_gateway_port() is None:
+        raise click.UsageError("The gateway is turned off; a cluster needs it "
+                               "(`llmctl config gateway 9000`).")
+
+
+def _normalize_url(url: str) -> str:
+    if "://" not in url:
+        url = "http://" + url
+    parts = urllib.parse.urlsplit(url)
+    if parts.port is None:
+        url = f"{parts.scheme}://{parts.hostname}:{config_mod.DEFAULT_GATEWAY_PORT}"
+    return url.rstrip("/")
+
+
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def registry(ctx: click.Context) -> None:
+    """Join machines into one cluster: every gateway lists and routes to the
+    models of all of them.
+
+    \b
+      lab$  llmctl registry serve                 # the always-on box; prints a token
+      rtx$  llmctl node set --name rtx --priority 0
+      rtx$  llmctl registry set lab --token T     # lab:9000
+      orin$ llmctl node set --name orin --priority 1
+      orin$ llmctl registry set lab --token T
+      any$  llmctl ps --all
+
+    Nodes send the registry a heartbeat every 5 s; one silent for 15 s is
+    dropped. With no subcommand, show the cluster as this machine sees it.
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(registry_status)
+
+
+@registry.command("serve")
+@click.option("--token", default=None, help="Cluster token (default: keep the current one, "
+                                            "or generate one).")
+@click.option("--off", is_flag=True, help="Stop being the registry.")
+def registry_serve(token: str | None, off: bool) -> None:
+    """Make this machine's gateway the registry (it stays up, models or not)."""
+    if off:
+        config_mod.update(registry_serve=None)
+        click.echo("This machine is no longer the registry.")
+        _restart_gateway()
+        return
+    _require_gateway_on()
+    import secrets
+    token = token or config_mod.get_cluster().token or secrets.token_urlsafe(18)
+    config_mod.update(registry_serve=True, cluster_token=token)
+    _restart_gateway()
+    gw = _gateway_record()
+    port = gw.port if gw else config_mod.get_gateway_port()
+    from llm_runner.gateway import lan_ip
+    click.echo(f"Registry on http://{lan_ip()}:{port}  (node {config_mod.get_cluster().node_name})")
+    click.echo("Join the other machines with:")
+    click.echo(f"  llmctl registry set {lan_ip()}:{port} --token {token}")
+    click.echo("Keep it up across reboots: `llmctl autostart install` (once).")
+
+
+@registry.command("set")
+@click.argument("url")
+@click.option("--token", default=None, help="The cluster token (`llmctl registry token` on "
+                                            "the registry).")
+def registry_set(url: str, token: str | None) -> None:
+    """Report to the registry at URL (host, host:port or http://host:port)."""
+    _require_gateway_on()
+    url = _normalize_url(url)
+    token = token or config_mod.get_cluster().token
+    if not token:
+        raise click.UsageError("--token is required (`llmctl registry token` on the registry).")
+    req = urllib.request.Request(f"{url}/registry/v1/nodes",
+                                 headers={"X-Llmctl-Token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            nodes = json.loads(r.read())["nodes"]
+        click.echo(f"Registry {url}: reachable, {len(nodes)} node(s) "
+                   f"({', '.join(n['node'] for n in nodes) or 'none yet'}).")
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise click.UsageError(f"{url} refused the token.") from None
+        if e.code == 404:
+            raise click.UsageError(f"{url} is a gateway but not the registry "
+                                   "(`llmctl registry serve` there).") from None
+        raise click.ClickException(f"{url}: HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        click.echo(f"warning: {url} not reachable now ({e}); saved anyway, the gateway "
+                   "keeps trying.", err=True)
+    config_mod.update(registry_url=url, cluster_token=token)
+    _restart_gateway()
+    status = _wait_cluster()
+    if status:
+        _echo_cluster_line(status)
+
+
+@registry.command("clear")
+def registry_clear() -> None:
+    """Leave the cluster (this machine's models stay up, local only)."""
+    c = config_mod.get_cluster()
+    config_mod.update(registry_url=None,
+                      cluster_token=c.token if c.registry_serve else None)
+    click.echo("Left the cluster.")
+    _restart_gateway()
+
+
+@registry.command("token")
+def registry_token() -> None:
+    """Print the cluster token (to join another machine)."""
+    token = config_mod.get_cluster().token
+    if not token:
+        raise click.UsageError("No token set (`llmctl registry serve` or `registry set`).")
+    click.echo(token)
+
+
+@registry.command("status")
+def registry_status() -> None:
+    """The cluster as this machine's gateway sees it."""
+    c = config_mod.get_cluster()
+    if not c.enabled:
+        click.echo("Not in a cluster. `llmctl registry set URL --token T` to join one, "
+                   "or `llmctl registry serve` to host it.")
+        return
+    gw = _gateway_record()
+    if gw is None:
+        raise click.UsageError("The gateway is not running (`llmctl gateway start`).")
+    status = _gateway_get(gw.port, "/cluster/v1/status")
+    _echo_cluster_line(status)
+    if status.get("registry_serve"):
+        click.echo("This machine is the registry.")
+    click.echo(f"\n  {'NODE':<14} {'PRIO':<5} {'VERSION':<9} {'SEEN':<7} {'URL':<28} MODELS")
+    rows = [{"node": status["node"] + " (here)", "priority": status["priority"],
+             "version": status["version"], "age": 0, "url": status.get("node_url") or "",
+             "models": status["local_models"]}] + status["nodes"]
+    for n in sorted(rows, key=lambda r: (r["priority"], r["node"])):
+        click.echo(f"  {n['node']:<14} {n['priority']:<5} {n['version']:<9} "
+                   f"{str(n['age']) + 's':<7} {n['url']:<28} {', '.join(n['models']) or '-'}")
 
 
 @cli.group()

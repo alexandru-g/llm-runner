@@ -163,3 +163,18 @@ def discover_models(models_dir: Path | None = None) -> dict[str, ModelSpec]:
                     decision=backends.is_decision_model(p),
                 )
     return dict(sorted(specs.items()))
+
+
+def default_group(model_path: Path, models_dir: Path | None = None) -> str:
+    """The group a model joins by default: its folder under MODELS_DIR, which
+    by the layout convention holds the quants of one model
+    (``gemma-4-26b-a4b-it/…-Q4_K_M.gguf`` and ``…-Q8_0.gguf``). "" for a GGUF
+    directly in MODELS_DIR, or a checkpoint directory (its name is its key)."""
+    base = (models_dir or MODELS_DIR).resolve()
+    path = Path(model_path)
+    if path.is_dir() or path.suffix != ".gguf":
+        return ""
+    folder = path.resolve().parent
+    if folder == base or not folder.is_relative_to(base):
+        return ""
+    return folder.name.lower()

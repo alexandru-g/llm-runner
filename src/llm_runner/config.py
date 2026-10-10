@@ -9,7 +9,9 @@ Settings: ``models_dir`` (where GGUF / HF checkpoints live), ``vllm_bin``
 (path to the ``vllm`` CLI when it isn't on PATH) and ``decider_dir`` (the
 Mapika/decider clone whose venv serves decider checkpoints) and
 ``gateway_port`` (the all-models port started with the first model, or
-``"off"``). Environment variables still
+``"off"``), plus the cluster settings: ``node_name``, ``node_priority``,
+``node_advertise``, ``registry_url``, ``cluster_token`` and
+``registry_serve`` (see ``cluster.py``). Environment variables still
 take precedence over persisted config (see ``registry._resolve_models_dir``
 and ``backends.find_vllm``).
 """
@@ -17,6 +19,8 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -47,6 +51,7 @@ def load() -> dict:
 def save(cfg: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
+    CONFIG_FILE.chmod(0o600)   # it can hold the cluster token
 
 
 def get_models_dir() -> Path | None:
@@ -115,4 +120,43 @@ def set_gateway_port(port: int | None) -> None:
     """Persist the gateway port (None turns the gateway off)."""
     cfg = load()
     cfg["gateway_port"] = "off" if port is None else int(port)
+    save(cfg)
+
+
+# ----------------------------------------------------------------- cluster --
+
+@dataclass(frozen=True)
+class Cluster:
+    node_name: str
+    node_priority: int
+    node_advertise: str | None     # URL other nodes use to reach this gateway
+    registry_url: str | None       # the registry this node reports to
+    token: str | None
+    registry_serve: bool           # this gateway is the registry
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.registry_url or self.registry_serve)
+
+
+def get_cluster() -> Cluster:
+    cfg = load()
+    return Cluster(
+        node_name=cfg.get("node_name") or socket.gethostname(),
+        node_priority=int(cfg.get("node_priority", 0)),
+        node_advertise=cfg.get("node_advertise") or None,
+        registry_url=cfg.get("registry_url") or None,
+        token=cfg.get("cluster_token") or None,
+        registry_serve=bool(cfg.get("registry_serve", False)),
+    )
+
+
+def update(**values) -> None:
+    """Set (or, with None, remove) top-level settings."""
+    cfg = load()
+    for key, val in values.items():
+        if val is None:
+            cfg.pop(key, None)
+        else:
+            cfg[key] = val
     save(cfg)
