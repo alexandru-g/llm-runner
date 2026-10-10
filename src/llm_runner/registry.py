@@ -178,3 +178,16 @@ def default_group(model_path: Path, models_dir: Path | None = None) -> str:
     if folder == base or not folder.is_relative_to(base):
         return ""
     return folder.name.lower()
+
+
+def group_of(name: str, backend: str, model_path: str, group: str | None) -> str:
+    """An instance's group: the recorded one, else (launched before groups
+    were recorded) the default its launch would have given it."""
+    if group is not None:
+        return group
+    if not model_path or backend not in (backends.LLAMA, backends.DECIDE):
+        return ""
+    base = default_group(Path(model_path))
+    if backend == backends.DECIDE:
+        return f"{base}.decide" if base else ""
+    return "" if base == name else base

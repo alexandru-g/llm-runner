@@ -1213,7 +1213,8 @@ def decide_start(identifier: str | None, port: int | None, profile: str | None, 
            *[tok for chunk in extra for tok in shlex.split(chunk)]]
     rec = proc.start(name=name, cmd=cmd, port=chosen_port, model_path=target.model_path,
                      backend=backends.DECIDE,
-                     group=f"{target.group}.decide" if target.group else "")
+                     group=f"{base}.decide" if (base := registry.group_of(
+                         target.name, target.backend, target.model_path, target.group)) else "")
     click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  profile={profile}")
     click.echo(f"Endpoint: POST http://127.0.0.1:{rec.port}/v1/systemone  "
                f"(→ llama-server :{target.port})")
@@ -1407,6 +1408,8 @@ def node(ctx: click.Context) -> None:
     click.echo(f"Name:      {c.node_name}")
     click.echo(f"Priority:  {c.node_priority}  (lower wins when several nodes run a model)")
     click.echo(f"Advertise: {c.node_advertise or '(address the registry sees)'}")
+    click.echo(f"Spill:     {'on' if c.spill else 'off'}  (calls to a busy model go to a free "
+               "copy elsewhere)")
 
 
 @node.command("set")
@@ -1417,9 +1420,12 @@ def node(ctx: click.Context) -> None:
               help="URL other nodes use to reach this gateway, e.g. http://orin.ts.net:9000 "
                    "(default: the address the registry sees).")
 @click.option("--no-advertise", is_flag=True, help="Forget --advertise.")
+@click.option("--spill", type=click.Choice(["on", "off"]), default=None,
+              help="on (default): a call for a model whose slots are all busy goes to a "
+                   "copy with a free slot, if any; off: always the preferred copy.")
 def node_set(name: str | None, priority: int | None, advertise: str | None,
-             no_advertise: bool) -> None:
-    """Set this machine's name, priority or advertised URL."""
+             no_advertise: bool, spill: str | None) -> None:
+    """Set this machine's name, priority, advertised URL or spill policy."""
     if name is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
         raise click.UsageError("A node name is letters, digits, '.', '_' and '-'.")
     values: dict = {}
@@ -1431,12 +1437,15 @@ def node_set(name: str | None, priority: int | None, advertise: str | None,
         values["node_advertise"] = _normalize_url(advertise)
     if no_advertise:
         values["node_advertise"] = None
+    if spill is not None:
+        values["node_spill"] = None if spill == "on" else False
     if not values:
-        raise click.UsageError("Nothing to set (--name, --priority, --advertise).")
+        raise click.UsageError("Nothing to set (--name, --priority, --advertise, --spill).")
     config_mod.update(**values)
     c = config_mod.get_cluster()
     click.echo(f"node {c.node_name}  priority={c.node_priority}"
-               + (f"  advertise={c.node_advertise}" if c.node_advertise else ""))
+               + (f"  advertise={c.node_advertise}" if c.node_advertise else "")
+               + ("" if c.spill else "  spill=off"))
     if _gateway_record():
         _restart_gateway()
 

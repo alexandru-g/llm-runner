@@ -840,6 +840,17 @@ any$  llmctl ps --all                           # every model, and where calls g
   interchangeable), `--group none` in none. `/v1/models` lists a group as a
   model of its own once it has two members (`llmctl.members`), and every
   model shows its `llmctl.group`. Exact ids still mean exactly that model.
+- **Spill-over.** Priority decides who gets a call, unless that instance is
+  full. When every slot of the preferred instance is busy (llama-server's
+  `/slots`; waiting requests on vLLM; a decision endpoint counts as busy as
+  the llama-server behind it), the call goes to the next instance that has a
+  free slot right now. If every instance is busy, it queues on the
+  preferred one as before, so work only moves to a slower machine when that
+  machine is idle. The busy check happens on the machine running the model
+  just before the request is sent (a ~1 ms localhost call); a busy remote
+  answers at once, nothing is generated twice. `llmctl node set --spill off`
+  makes a machine send its calls by priority only. With `--n-parallel 1`
+  (one slot), one running request makes an instance busy.
 - **Images** go only to instances that read them (a llama-server with its
   mmproj, or a decision endpoint in front of one); otherwise
   `400 vision_unavailable`.

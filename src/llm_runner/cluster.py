@@ -28,6 +28,10 @@ VIEW_TTL = 120.0             # a node forgets remote models after this long with
 
 TOKEN_HEADER = "X-Llmctl-Token"
 HOP_HEADER = "X-Llmctl-Hop"
+# On a hop: "the caller has other instances to try; if all your slots are
+# busy, say so (503 + BUSY_HEADER) instead of queueing the request".
+SPILL_HEADER = "X-Llmctl-Spill"
+BUSY_HEADER = "X-Llmctl-Busy"
 
 OPENAI = "openai"
 SYSTEMONE = "systemone"

@@ -52,8 +52,9 @@ class RunningProcess:
     cmd: list[str] = field(default_factory=list)
     backend: str = "llama"  # default covers records written before vllm support
     env: dict[str, str] = field(default_factory=dict)  # extra vars set at launch
-    # Second name the gateway routes by (e.g. every quant of one model); "" = none.
-    group: str = ""
+    # Second name the gateway routes by (e.g. every quant of one model); "" =
+    # none, None = not recorded (launched before groups: the default applies).
+    group: str | None = None
 
 
 @dataclass
@@ -72,7 +73,7 @@ class LaunchSpec:
     run_args: list[str] = field(default_factory=list)
     backend: str = "llama"
     env: dict[str, str] = field(default_factory=dict)
-    group: str = ""
+    group: str | None = None
 
     def run_cmd(self) -> list[str]:
         """The ``llmctl run …`` argv that reproduces this launch, port pinned."""
@@ -132,7 +133,7 @@ def autostart_list() -> list[LaunchSpec]:
 def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
                   run_args: list[str] | None = None,
                   backend: str = "llama",
-                  env: dict[str, str] | None = None, group: str = "") -> None:
+                  env: dict[str, str] | None = None, group: str | None = None) -> None:
     """Upsert a launch spec into the autostart manifest (keyed by name).
 
     Ports are pinned, so a port can only be restored to one model: entries
@@ -246,7 +247,7 @@ def find(identifier: str) -> RunningProcess | None:
 def start(*, name: str, cmd: list[str], port: int, model_path: str,
           run_args: list[str] | None = None,
           backend: str = "llama",
-          env: dict[str, str] | None = None, group: str = "") -> RunningProcess:
+          env: dict[str, str] | None = None, group: str | None = None) -> RunningProcess:
     """Launch ``cmd`` detached. ``env`` is layered over the current environment
     (e.g. VLLM_* tuning knobs) and remembered so restore/restart reproduce it."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)

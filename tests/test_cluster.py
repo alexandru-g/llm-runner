@@ -165,6 +165,8 @@ class _Fake(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             return self._reply(200, {"status": "ok"})
+        if self.path == "/slots":
+            return self._reply(200, [{"id": 0, "is_processing": getattr(self.server, "busy", False)}])
         self._reply(200, {"who": self.server.label, "path": self.path})
 
     def do_POST(self):
@@ -231,7 +233,8 @@ def cluster(tmp_path):
     for _ in range(2):
         for g in (lab, rtx, orin):
             g.heartbeat_once()
-    yield {"lab": lab, "rtx": rtx, "orin": orin, "rtx_q": rtx_q, "tmp": tmp_path}
+    yield {"lab": lab, "rtx": rtx, "orin": orin, "rtx_q": rtx_q, "orin_q": orin_q,
+           "tmp": tmp_path}
     for s in (rtx_q, orin_q, orin_ocr, lab_srv, rtx_srv, orin_srv):
         s.shutdown()
 
@@ -360,3 +363,32 @@ def test_group_routes_each_member_by_its_own_name(cluster):
     out = _call(orin, "POST", "/v1/chat/completions", {"model": "gemma", "long": True})[1]
     assert out == {"who": "orin", "model": "gemma-q4"}
     assert _call(cluster["rtx"], "GET", "/m/gemma/props")[1]["who"] == "rtx"
+
+
+def _who(g, model, **headers):
+    return _call(g, "POST", "/v1/chat/completions", {"model": model}, headers=headers)[1]["who"]
+
+
+def test_spill_to_a_free_instance(cluster):
+    lab, rtx, orin = cluster["lab"], cluster["rtx"], cluster["orin"]
+    cluster["rtx_q"].busy = True
+    assert _who(orin, "quyet") == "orin"          # rtx (remote) busy, own copy free
+    assert _who(rtx, "quyet") == "orin"           # own copy busy, orin free
+    assert _who(lab, "quyet") == "orin"           # the registry routes the same way
+    assert _who(orin, "gemma") == "orin"          # groups spill too (q8 busy → q4)
+    cluster["orin_q"].busy = True                 # everyone busy: queue on priority
+    assert _who(orin, "quyet") == "rtx"
+    assert _who(rtx, "quyet") == "rtx"
+
+
+def test_spill_off_and_busy_reply(cluster):
+    rtx, orin = cluster["rtx"], cluster["orin"]
+    cluster["rtx_q"].busy = True
+    orin.spill = False
+    assert _who(orin, "quyet") == "rtx"           # strict priority
+    status, out = _call(rtx, "POST", "/v1/chat/completions", {"model": "quyet"},
+                        headers={cl.HOP_HEADER: "orin", cl.TOKEN_HEADER: TOKEN,
+                                 cl.SPILL_HEADER: "1"})
+    assert status == 503 and out["error"]["code"] == "busy"
+    # Without the spill header a hop queues as before.
+    assert _who(rtx, "quyet", **{cl.HOP_HEADER: "orin", cl.TOKEN_HEADER: TOKEN}) == "rtx"

@@ -47,8 +47,9 @@ from llm_runner import __version__
 from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner.backends import DECIDE, DECIDER, GATEWAY, VLLM, is_decision_model
-from llm_runner.cluster import (HEARTBEAT_EVERY, HOP_HEADER, OPENAI, PROTOCOL, SYSTEMONE,
-                                TOKEN_HEADER, ClusterView, Instance, RegistryTable,
+from llm_runner.cluster import (BUSY_HEADER, HEARTBEAT_EVERY, HOP_HEADER, OPENAI, PROTOCOL,
+                                SPILL_HEADER, SYSTEMONE, TOKEN_HEADER, ClusterView,
+                                Instance, RegistryTable,
                                 Unroutable, has_images, is_context_error, order, pick,
                                 split_pin, token_ok)
 
@@ -97,14 +98,9 @@ def _is_decision(path: str) -> bool:
 
 
 def _group_of(rec: dict) -> str:
-    if "group" in rec:
-        return rec["group"]
-    # Launched before groups existed: the default `run` would have given it.
-    if rec.get("backend", "llama") != "llama" or not rec.get("model_path"):
-        return ""
-    from llm_runner.registry import default_group
-    group = default_group(Path(rec["model_path"]))
-    return "" if group == rec["name"] else group
+    from llm_runner.registry import group_of
+    return group_of(rec["name"], rec.get("backend", "llama"), rec.get("model_path", ""),
+                    rec.get("group"))
 
 
 class LocalModels:
@@ -139,6 +135,37 @@ class LocalModels:
             records = list(self._records)
         # A model that died without `llmctl stop` is still in the file.
         return [m for m in records if proc._alive(m.pid)]
+
+    def busy(self, name: str) -> bool:
+        """Every slot of this local model is working, so a new request would
+        queue. Unknown (no /slots, an error) counts as free."""
+        models = self.models()
+        m = next((x for x in models if x.name == name), None)
+        if m is None:
+            return False
+        if m.backend == DECIDE:
+            # A decision endpoint is as busy as the llama-server behind it.
+            port = urlsplit(_flag(m.cmd, "--backend") or "").port
+            m = next((x for x in models if x.port == port), None)
+            if m is None:
+                return False
+        try:
+            if m.backend == VLLM:
+                with urllib.request.urlopen(f"http://127.0.0.1:{m.port}/metrics",
+                                            timeout=0.5) as r:
+                    for line in r.read().decode().splitlines():
+                        if line.startswith("vllm:num_requests_waiting"):
+                            return float(line.rsplit(" ", 1)[1]) > 0
+                return False
+            if m.backend != "llama":
+                return False
+            with urllib.request.urlopen(f"http://127.0.0.1:{m.port}/slots", timeout=0.5) as r:
+                slots = json.loads(r.read())
+            if not isinstance(slots, list) or not slots:
+                return False
+            return all(isinstance(sl, dict) and sl.get("is_processing") for sl in slots)
+        except (OSError, ValueError, KeyError, IndexError):
+            return False
 
     def status(self, m: Model) -> str:
         now = time.monotonic()
@@ -208,6 +235,7 @@ class Gateway:
         self.cluster = cluster if cluster and cluster.enabled else None
         self.node = cluster.node_name if cluster else socket.gethostname()
         self.priority = cluster.node_priority if cluster else 0
+        self.spill = cluster.spill if cluster else True
         self.port = port
         self.view = ClusterView()
         self.table = RegistryTable(__version__) if self.cluster and self.cluster.registry_serve \
@@ -476,6 +504,10 @@ def make_handler(gw: Gateway):
                              needs_vision=has_images(payload))
             except Unroutable as e:
                 return self._error(e.status, e.code, e.message)
+            if hop and self.headers.get(SPILL_HEADER) == "1":
+                cands = [c for c in cands if not gw.local.busy(c.id)]
+                if not cands:
+                    return self._busy()
             # A prefix, group, pin or nothing was sent: each instance gets its
             # own exact name (vLLM insists on it; a hop routes by it).
             bodies: dict[str, bytes] = {}
@@ -489,6 +521,16 @@ def make_handler(gw: Gateway):
             if by_header and requested is not None:
                 self.headers.replace_header("X-Model", cands[0].id)
             return self._forward(cands, lambda c: self.path, body_for)
+
+        def _busy(self) -> None:
+            body = json.dumps({"error": {"message": "all slots busy", "type": "server_error",
+                                         "param": None, "code": "busy"}}).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header(BUSY_HEADER, "1")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _registry(self, path: str, body: bytes) -> None:
             if gw.table is None:
@@ -519,24 +561,55 @@ def make_handler(gw: Gateway):
         # --------------------------------------------------------- forwarding --
         def _forward(self, cands: list[Instance], path_for, body_for) -> None:
             """Send to the best instance; on refusal before anything was relayed
-            (unreachable, 502/503, gone, prompt too long) try the next one."""
-            for n, c in enumerate(cands):
-                if c.id != cands[0].id and "X-Model" in self.headers:
+            (unreachable, 502/503, gone, prompt too long) try the next one.
+
+            With spill on and a choice of instances, a first pass skips any
+            whose slots are all busy, so a free one further down the list takes
+            the call. If every one is busy, the call queues on the best one."""
+            def attempt(c: Instance, last: bool, spill: bool) -> str:
+                if "X-Model" in self.headers:
                     self.headers.replace_header("X-Model", c.id)
-                if self._try(c, path_for(c), body_for(c), last=n == len(cands) - 1):
+                return self._try(c, path_for(c), body_for(c), last=last, spill=spill)
+
+            busy: list[Instance] = []
+            if gw.spill and len(cands) > 1:
+                for n, c in enumerate(cands):
+                    # The last one may relay its error, unless busy ones wait.
+                    last = n == len(cands) - 1 and not busy
+                    if c.local and gw.local.busy(c.id):
+                        result = "busy"
+                    else:
+                        result = attempt(c, last, spill=not c.local)
+                    if result == "done":
+                        return
+                    if result == "busy":
+                        busy.append(c)
+                if not busy:
+                    return
+                print(f"spill: every instance of {cands[0].id} is busy; queueing on "
+                      f"{busy[0].node}", flush=True)
+                cands = busy
+            for n, c in enumerate(cands):
+                if attempt(c, n == len(cands) - 1, spill=False) == "done":
                     return
 
-        def _try(self, c: Instance, path: str, body: bytes, last: bool) -> bool:
+        def _try(self, c: Instance, path: str, body: bytes, last: bool,
+                 spill: bool = False) -> str:
+            """"done" (a reply was relayed), "failed" (try the next instance) or
+            "busy" (a remote instance with every slot taken; only with spill)."""
             if c.local:
                 host, port, extra = "127.0.0.1", c.info["port"], {}
             else:
                 u = urlsplit(c.url)
                 host, port = u.hostname, u.port or 80
                 extra = {HOP_HEADER: gw.node, TOKEN_HEADER: gw.token or ""}
+                if spill:
+                    extra[SPILL_HEADER] = "1"
             conn = http.client.HTTPConnection(host, port, timeout=10)
             try:
                 headers = {k: v for k, v in self.headers.items()
-                           if k.lower() not in _HOP and k not in (HOP_HEADER, TOKEN_HEADER)}
+                           if k.lower() not in _HOP
+                           and k not in (HOP_HEADER, TOKEN_HEADER, SPILL_HEADER)}
                 headers.update(extra)
                 if body or self.command in ("POST", "PUT", "PATCH"):
                     headers["Content-Length"] = str(len(body))
@@ -549,10 +622,13 @@ def make_handler(gw: Gateway):
                     where = f"port {port}" if c.local else f"node {c.node} ({c.url})"
                     if not last:
                         print(f"failover: {c.id} on {c.node} unreachable ({e})", flush=True)
-                        return False
+                        return "failed"
                     self._error(502, "upstream_unavailable",
                                 f"{c.id} ({where}) is not answering: {e}")
-                    return True
+                    return "done"
+                if spill and resp.status == 503 and resp.getheader(BUSY_HEADER):
+                    resp.read()
+                    return "busy"
                 length = resp.getheader("Content-Length")
                 if not last and (resp.status in (502, 503) or (
                         resp.status in (400, 404, 413, 422) and length is not None
@@ -563,11 +639,11 @@ def make_handler(gw: Gateway):
                     gone = resp.status == 404 and not c.local and b"model_not_found" in data
                     if resp.status in (502, 503) or gone or is_context_error(resp.status, data):
                         print(f"failover: {c.id} on {c.node} answered {resp.status}", flush=True)
-                        return False
+                        return "failed"
                     self._relay(resp, data)
-                    return True
+                    return "done"
                 self._relay(resp)
-                return True
+                return "done"
             finally:
                 conn.close()
 

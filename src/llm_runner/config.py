@@ -133,6 +133,7 @@ class Cluster:
     registry_url: str | None       # the registry this node reports to
     token: str | None
     registry_serve: bool           # this gateway is the registry
+    spill: bool = True             # move calls off a busy instance to a free one
 
     @property
     def enabled(self) -> bool:
@@ -148,6 +149,7 @@ def get_cluster() -> Cluster:
         registry_url=cfg.get("registry_url") or None,
         token=cfg.get("cluster_token") or None,
         registry_serve=bool(cfg.get("registry_serve", False)),
+        spill=cfg.get("node_spill", True) is not False,
     )
 
 
