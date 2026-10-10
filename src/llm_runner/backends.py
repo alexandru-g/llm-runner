@@ -34,6 +34,9 @@ from pathlib import Path
 LLAMA = "llama"
 VLLM = "vllm"
 DECIDER = "decider"
+# Not a model server: the systemone-proxy started by `llmctl decide` in front
+# of a running llama-server.
+DECIDE = "decide"
 BACKENDS = (LLAMA, VLLM, DECIDER)
 
 
@@ -125,11 +128,31 @@ def find_decider() -> str | None:
     return None
 
 
+def find_systemone_proxy() -> str | None:
+    """The ``systemone-proxy`` CLI (packages/systemone-proxy in this repo):
+    ``$LLM_RUNNER_SYSTEMONE_PROXY`` → PATH → the package's own ``.venv``
+    in a source checkout. Absolute, so systemd restores find it."""
+    env = os.environ.get("LLM_RUNNER_SYSTEMONE_PROXY")
+    if env:
+        p = Path(env).expanduser()
+        return str(p.resolve()) if p.is_file() else None
+    on_path = shutil.which("systemone-proxy")
+    if on_path:
+        return str(Path(on_path).resolve())
+    local = (Path(__file__).resolve().parents[2] / "packages" / "systemone-proxy"
+             / ".venv" / "bin" / "systemone-proxy")
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    return None
+
+
 def find(backend: str) -> str | None:
     if backend == LLAMA:
         return find_llama_server()
     if backend == DECIDER:
         return find_decider()
+    if backend == DECIDE:
+        return find_systemone_proxy()
     return find_vllm()
 
 
@@ -138,6 +161,10 @@ def missing_hint(backend: str) -> str:
         return ("`llama-server` binary not found on PATH. Install llama.cpp "
                 "(https://github.com/ggml-org/llama.cpp) and ensure llama-server "
                 "is on PATH.")
+    if backend == DECIDE:
+        return ("`systemone-proxy` not found. Install it from this repo with "
+                "`uv tool install ./packages/systemone-proxy` (re-run ./install.sh), "
+                "or point at it with $LLM_RUNNER_SYSTEMONE_PROXY.")
     if backend == DECIDER:
         return ("decider clone not found. `git clone https://github.com/Mapika/decider`, "
                 "create its venv (`uv venv --python 3.12 .venv312 && uv pip install "

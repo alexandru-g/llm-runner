@@ -741,6 +741,11 @@ def stop(identifier: str | None) -> None:
     if rec is None:
         raise click.UsageError(f"No running model matches '{identifier}'.")
     click.echo(f"Stopped {rec.name}  pid={rec.pid}  port={rec.port}")
+    # A decision endpoint is useless without its model: take it down too.
+    if rec.backend != backends.DECIDE:
+        for p in _proxy_attached_to(rec.port):
+            proc.stop(str(p.pid))
+            click.echo(f"Stopped {p.name}  pid={p.pid}  port={p.port}")
 
 
 def _resolve_running_target(identifier: str | None) -> proc.RunningProcess:
@@ -971,6 +976,137 @@ def restart(ctx: click.Context, identifier: str | None,
         run.invoke(sub)
 
 
+class _DecideGroup(click.Group):
+    """`llmctl decide MODEL` is shorthand for `llmctl decide start MODEL`."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if not args or (args[0] not in self.commands and args[0] not in ("--help", "-h")):
+            args = ["start", *args]
+        return super().parse_args(ctx, args)
+
+
+@cli.group(cls=_DecideGroup)
+def decide() -> None:
+    """Serve a decision model's /v1/systemone API next to its llama-server.
+
+    \b
+      llmctl run rune-26b-a4b-v3-iq4_xs-dyn      # the model, as usual
+      llmctl decide rune-26b-a4b-v3-iq4_xs-dyn   # + the decision endpoint
+      llmctl decide spec rune-26b-a4b-v3-iq4_xs-dyn   # how it answers
+
+    The endpoint is systemone-proxy (packages/systemone-proxy): it rebuilds
+    the model vendor's exact prompt, reads the option-letter probabilities
+    from llama-server and answers in one format for every supported model.
+    """
+
+
+def _proxy_attached_to(port: int) -> list[proc.RunningProcess]:
+    needle = f"http://127.0.0.1:{port}"
+    return [p for p in proc.list_running() if p.backend == backends.DECIDE and needle in p.cmd]
+
+
+@decide.command("start")
+@click.argument("identifier", required=False)
+@click.option("--port", "-p", type=int, default=None,
+              help="Port for the decision endpoint (default: first free from 8090).")
+@click.option("--profile", default=None,
+              help="Force a systemone-proxy profile (default: detected from the GGUF).")
+@click.option("--cache", type=click.Choice(["off", "request"]), default="off", show_default=True,
+              help="llama-server prompt-cache reuse: off, or within one request only.")
+@click.option("--concurrency", type=int, default=None,
+              help="Backend calls in flight per request (default: the model's --parallel).")
+@click.option("--wait/--no-wait", "wait", default=True, show_default=True,
+              help="Wait until the endpoint is up (it self-tests the GGUF first).")
+@click.option("--extra", "-X", "extra", multiple=True,
+              help="Extra argument(s) for `systemone-proxy serve`.")
+def decide_start(identifier: str | None, port: int | None, profile: str | None, cache: str,
+                 concurrency: int | None, wait: bool, extra: tuple[str, ...]) -> None:
+    """Start the decision endpoint for a running llama-server model (NAME or PID)."""
+    llama = [p for p in proc.list_running() if p.backend == LLAMA]
+    if identifier is None:
+        flagged = [p for p in llama if backends.is_decision_model(Path(p.model_path))]
+        if not flagged:
+            raise click.UsageError("No running decision model. `llmctl run <model>` first "
+                                   "(`llmctl list` flags them in the DECISION column).")
+        target = flagged[0] if len(flagged) == 1 else _pick_instance_interactively(flagged)
+    else:
+        target = proc.find(identifier)
+        if target is None:
+            raise click.UsageError(f"No running model matches '{identifier}'. "
+                                   f"`llmctl run {identifier}` first.")
+        if target.backend != LLAMA:
+            raise click.UsageError(f"'{target.name}' runs on {target.backend}; `llmctl decide` "
+                                   "needs a llama-server instance.")
+
+    binary = _require_backend(backends.DECIDE)
+    if profile is None:
+        res = subprocess.run([binary, "detect", target.model_path], capture_output=True, text=True)
+        if res.returncode != 0:
+            known = subprocess.run([binary, "profiles"], capture_output=True, text=True).stdout
+            raise click.UsageError(f"systemone-proxy has no profile for {Path(target.model_path).name}."
+                                   f"\nSupported models:\n{known.rstrip()}")
+        profile = res.stdout.strip()
+
+    name = f"{target.name}.decide"
+    if proc.find(name):
+        live = proc.find(name)
+        raise click.UsageError(f"{name} is already running on port {live.port}.")
+    if port is not None and _port_in_use(port):
+        raise click.UsageError(f"Port {port} is already in use.")
+    chosen_port = port or _next_free_port(8090)
+    if concurrency is None:
+        cmd = target.cmd
+        concurrency = (int(cmd[cmd.index("--parallel") + 1])
+                       if "--parallel" in cmd[:-1] and cmd[cmd.index("--parallel") + 1].isdigit()
+                       else 1)
+    cmd = [binary, "serve", "--backend", f"http://127.0.0.1:{target.port}",
+           "--port", str(chosen_port), "--profile", profile,
+           "--concurrency", str(concurrency), "--cache", cache,
+           *[tok for chunk in extra for tok in shlex.split(chunk)]]
+    rec = proc.start(name=name, cmd=cmd, port=chosen_port, model_path=target.model_path,
+                     backend=backends.DECIDE)
+    click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  profile={profile}")
+    click.echo(f"Endpoint: POST http://127.0.0.1:{rec.port}/v1/systemone  "
+               f"(→ llama-server :{target.port})")
+    click.echo(f"Contract: llmctl decide spec {target.name}   "
+               f"or GET http://127.0.0.1:{rec.port}/v1/spec")
+    click.echo(f"Logs:     llmctl logs {rec.name}")
+    if wait and not _wait_healthy(rec, timeout=300):
+        raise SystemExit(1)
+
+
+@decide.command("spec")
+@click.argument("target", required=False)
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON.")
+def decide_spec(target: str | None, as_json: bool) -> None:
+    """Print the request/response contract a client should implement.
+
+    TARGET is a running instance, a model key from `llmctl list`, or a profile
+    id from `llmctl decide profiles`. Without TARGET: the common contract only.
+    """
+    binary = _require_backend(backends.DECIDE)
+    args = [binary, "spec"]
+    if target:
+        live = proc.find(target)
+        specs = {} if live else discover_models()
+        if live:
+            args += ["--gguf", live.model_path]
+        elif target in specs:
+            args += ["--gguf", str(specs[target].model_path)]
+        else:
+            args += ["--profile", target]
+    if as_json:
+        args.append("--json")
+    raise SystemExit(subprocess.run(args).returncode)
+
+
+@decide.command("profiles")
+def decide_profiles() -> None:
+    """List the decision models systemone-proxy supports."""
+    binary = _require_backend(backends.DECIDE)
+    raise SystemExit(subprocess.run([binary, "profiles"]).returncode)
+
+
 @cli.group()
 def autostart() -> None:
     """Restart the last-running models on boot via a systemd user service."""
@@ -979,6 +1115,8 @@ def autostart() -> None:
 def _fmt_run_line(s: proc.LaunchSpec) -> str:
     """The `llmctl run …` line that reproduces a manifest entry, or a hint for
     entries recorded before run args were tracked."""
+    if s.backend == backends.DECIDE:
+        return f"llmctl decide {s.name.removesuffix('.decide')} --port {s.port}"
     if s.run_args:
         return f"llmctl {shlex.join(s.run_cmd())}"
     return "(run args not recorded — `llmctl run` it again with your flags to capture them)"

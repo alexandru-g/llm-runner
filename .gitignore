@@ -9,3 +9,4 @@ build/
 uv.lock
 models/*
 !models/.gitkeep
+.pytest_cache/

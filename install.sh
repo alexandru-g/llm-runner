@@ -48,6 +48,24 @@ fi
 
 say "Installed. Binary should be at: $BIN_DIR/llmctl"
 
+# systemone-proxy: the decision endpoint `llmctl decide` starts. Its own
+# package (packages/systemone-proxy), installed the same way.
+PROXY_DIR="$REPO_DIR/packages/systemone-proxy"
+if command -v uv >/dev/null 2>&1; then
+    say "Installing systemone-proxy via 'uv tool install'"
+    uv tool install --force --reinstall --from "$PROXY_DIR" systemone-proxy >&2
+elif command -v pipx >/dev/null 2>&1; then
+    say "Installing systemone-proxy via 'pipx install'"
+    pipx install --force "$PROXY_DIR" >&2
+else
+    venv="$HOME/.local/share/llm-runner/systemone-proxy-venv"
+    say "Installing systemone-proxy via python venv at $venv"
+    python3 -m venv "$venv"
+    "$venv/bin/pip" install --quiet --upgrade pip
+    "$venv/bin/pip" install --quiet "$PROXY_DIR"
+    ln -sf "$venv/bin/systemone-proxy" "$HOME/.local/bin/systemone-proxy"
+fi
+
 if ! command -v llmctl >/dev/null 2>&1; then
     warn "'llmctl' is not on your PATH yet."
     warn "Add this to your shell rc and re-source it:"

@@ -37,8 +37,11 @@ on your `PATH`. Then:
 llmctl --help
 ```
 
+`install.sh` also installs `systemone-proxy` (the decision endpoint behind
+`llmctl decide`, from `packages/systemone-proxy`).
+
 To upgrade after pulling changes: re-run `./install.sh`. To uninstall:
-`uv tool uninstall llm-runner` (or `pipx uninstall llm-runner`).
+`uv tool uninstall llm-runner systemone-proxy` (or `pipx uninstall …`).
 
 **Hacking on the code instead?** Use `uv sync` to create a local `.venv/` and
 invoke via `uv run llmctl ...` from inside the repo — that picks up edits
@@ -612,6 +615,51 @@ clients:
       - name: local
 model: local:local
 ```
+
+### Decision endpoints with `llmctl decide`
+
+Calibrated decision models (`DECISION yes` in `llmctl list`) answer typed
+questions with probabilities, not chat. Each vendor ships its own prompt
+format and calibration, served by its own wrapper. `llmctl decide` starts
+**systemone-proxy** (`packages/systemone-proxy`, installed by `./install.sh`)
+next to the model's llama-server. It rebuilds the vendor's exact prompt (as
+token ids), reads the option-letter probabilities from llama-server, applies
+the vendor's temperatures, and answers on one `POST /v1/systemone` API that is
+the same for every supported model:
+
+```bash
+llmctl run rune-26b-a4b-v3-iq4_xs-dyn -p 8180 -c 16384   # the model, as usual
+llmctl decide rune-26b-a4b-v3-iq4_xs-dyn                 # + endpoint on :8090
+llmctl decide spec rune-26b-a4b-v3-iq4_xs-dyn            # the client contract
+llmctl decide profiles                                   # supported models
+```
+
+```bash
+curl -s localhost:8090/v1/systemone -H 'Content-Type: application/json' -d '{
+  "state": {"message": "Please close my card, I lost it yesterday."},
+  "questions": {
+    "urgent": {"type": "noul", "instructions": "The request is urgent."},
+    "intent": {"type": "choice", "instructions": "What does the customer want?",
+               "criteria": {"cancel": "close the card", "limit": "change the limit"}}}}'
+```
+
+- **Supported:** Quyet-1.0-Large, Rune 26B-A4B v3, Xor 26B-A4B, Bobcat Flash
+  1.2 and H2O-Lightning-4B. The profile is picked from the GGUF's metadata.
+- **One contract:** `llmctl decide spec [MODEL] [--json]` prints the request
+  and response format plus the model's specifics (label order, temperatures,
+  limits, state truncation, extras). A running endpoint serves the same at
+  `GET /v1/spec`.
+- **Self-test:** at startup the proxy checks that the GGUF tokenizes exactly
+  like the vendor's tokenizer; it refuses to serve a mismatched model.
+- **Lifecycle:** the endpoint is a tracked instance named `<model>.decide`
+  (backend `decide` in `llmctl ps`). `llmctl stop <model>` stops its endpoint
+  too, and autostart brings both back (the proxy waits for llama-server to
+  load).
+- **Prompt cache:** off by default (`--cache off`), so every call is computed
+  fresh. Gemma 4's sliding-window attention made cached prefixes change
+  answers. `--cache request` reuses the state prefix within one request only.
+- **Quantisation:** temperatures were fitted on bf16/fp8 weights. Prefer Q8_0
+  where it fits; Q4 keeps the chosen option but shifts the probabilities.
 
 ### vLLM specifics
 
