@@ -1456,9 +1456,9 @@ def _normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 
-@cli.group(invoke_without_command=True)
+@cli.group("registry", invoke_without_command=True)
 @click.pass_context
-def registry(ctx: click.Context) -> None:
+def registry_group(ctx: click.Context) -> None:
     """Join machines into one cluster: every gateway lists and routes to the
     models of all of them.
 
@@ -1477,7 +1477,7 @@ def registry(ctx: click.Context) -> None:
         ctx.invoke(registry_status)
 
 
-@registry.command("serve")
+@registry_group.command("serve")
 @click.option("--token", default=None, help="Cluster token (default: keep the current one, "
                                             "or generate one).")
 @click.option("--off", is_flag=True, help="Stop being the registry.")
@@ -1502,7 +1502,7 @@ def registry_serve(token: str | None, off: bool) -> None:
     click.echo("Keep it up across reboots: `llmctl autostart install` (once).")
 
 
-@registry.command("set")
+@registry_group.command("set")
 @click.argument("url")
 @click.option("--token", default=None, help="The cluster token (`llmctl registry token` on "
                                             "the registry).")
@@ -1537,7 +1537,7 @@ def registry_set(url: str, token: str | None) -> None:
         _echo_cluster_line(status)
 
 
-@registry.command("clear")
+@registry_group.command("clear")
 def registry_clear() -> None:
     """Leave the cluster (this machine's models stay up, local only)."""
     c = config_mod.get_cluster()
@@ -1547,7 +1547,7 @@ def registry_clear() -> None:
     _restart_gateway()
 
 
-@registry.command("token")
+@registry_group.command("token")
 def registry_token() -> None:
     """Print the cluster token (to join another machine)."""
     token = config_mod.get_cluster().token
@@ -1556,7 +1556,7 @@ def registry_token() -> None:
     click.echo(token)
 
 
-@registry.command("status")
+@registry_group.command("status")
 def registry_status() -> None:
     """The cluster as this machine's gateway sees it."""
     c = config_mod.get_cluster()

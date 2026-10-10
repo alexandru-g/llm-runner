@@ -19,3 +19,10 @@ def test_group_values_offer_auto_none_and_running_groups(tmp_path, monkeypatch):
                       ("qwen-small", "qwen-small  (running)")]
     group = next(s for s in launch.SETTINGS if s.param == "group_name")
     assert group.custom and group.applies(target)
+
+
+def test_cli_registry_module_is_not_shadowed():
+    # The `registry` click group once hid the registry module from `run`.
+    from llm_runner import cli, registry
+    assert cli.registry is registry
+    assert "registry" in cli.cli.commands
