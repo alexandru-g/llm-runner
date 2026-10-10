@@ -406,14 +406,15 @@ def list_cmd() -> None:
         return
     key_w = max(20, max(len(k) for k in specs))
     click.echo("")
-    click.echo(f"{'KEY':<{key_w}}  {'BACKEND':<7}  {'SIZE':>8}  {'VISION':<6}  {'DRAFT':<6}  PATH")
-    click.echo("-" * (key_w + 57))
+    click.echo(f"{'KEY':<{key_w}}  {'BACKEND':<7}  {'SIZE':>8}  {'VISION':<6}  {'DRAFT':<6}  {'DECISION':<8}  PATH")
+    click.echo("-" * (key_w + 67))
     for key, spec in specs.items():
         size = _fmt_size(spec.size).strip()
         vision = "yes" if spec.has_vision else ""
         draft = "yes" if spec.has_draft else ""
+        decision = "yes" if spec.decision else ""
         rel = spec.model_path.relative_to(MODELS_DIR) if spec.model_path.is_relative_to(MODELS_DIR) else spec.model_path
-        click.echo(f"{key:<{key_w}}  {spec.backend:<7}  {size:>8}  {vision:<6}  {draft:<6}  {rel}")
+        click.echo(f"{key:<{key_w}}  {spec.backend:<7}  {size:>8}  {vision:<6}  {draft:<6}  {decision:<8}  {rel}")
 
 
 @cli.command()
@@ -586,6 +587,12 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     if backend == VLLM and kv_quant == "q4_0":
         raise click.UsageError("vllm has no 4-bit KV cache; use --kv-quant q8_0 "
                                "(→ fp8) or f16.")
+    # decider.serve speaks the decision protocol itself; on llama/vllm a
+    # decision model only serves raw completions.
+    if backend != DECIDER and (spec.decision if spec else backends.is_decision_model(model_path)):
+        click.echo(f"note: '{model_path.name}' is a decision model — its answers are "
+                   "letter logprobs over a vendor-specific prompt, read by its own "
+                   "client. Chat output from it is not meaningful.", err=True)
 
     # Default embeddings mode by filename when the user didn't force it.
     stem = model_path.stem if model_path.is_file() else model_path.name
@@ -1124,7 +1131,8 @@ def _pick_model_interactively(specs: dict[str, ModelSpec],
             title=f"{key:<{key_w}}  {spec.backend:<5}  "
                   f"{_fmt_size(spec.size).strip():>8}  "
                   f"{'[vision]' if spec.has_vision else '        '}  "
-                  f"{'[mtp]' if spec.has_draft else '     '}",
+                  f"{'[mtp]' if spec.has_draft else '     '}  "
+                  f"{'[decision]' if spec.decision else ''}",
             value=key,
         )
         for key, spec in specs.items()

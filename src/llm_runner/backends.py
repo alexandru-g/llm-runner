@@ -180,6 +180,68 @@ def hf_has_vision(path: Path) -> bool:
         "ForConditionalGeneration" in a for a in cfg.get("architectures", []))
 
 
+def _gguf_general_tags(path: Path) -> list[str]:
+    """``general.tags`` from a GGUF header, or [] if absent/unreadable. Only
+    the leading ``general.*`` block is read (a few KB), never the tensors."""
+    import struct
+    scalar = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?",
+              10: "Q", 11: "q", 12: "d"}
+    try:
+        with path.open("rb") as f:
+            def read(fmt: str):
+                n = struct.calcsize(fmt)
+                return struct.unpack(fmt, f.read(n))
+
+            def string() -> str:
+                (n,) = read("<Q")
+                return f.read(n).decode("utf-8", "replace")
+
+            def value(t: int):
+                if t == 8:
+                    return string()
+                if t == 9:
+                    et, n = read("<IQ")
+                    return [value(et) for _ in range(n)]
+                return read("<" + scalar[t])[0]
+
+            if f.read(4) != b"GGUF":
+                return []
+            (version,) = read("<I")
+            if version < 2:
+                return []
+            _, n_kv = read("<QQ")
+            for _ in range(n_kv):
+                key = string()
+                (t,) = read("<I")
+                if not key.startswith("general."):
+                    return []  # writers emit general.* first; tags would be there
+                v = value(t)
+                if key == "general.tags":
+                    return [str(x) for x in v] if isinstance(v, list) else []
+    except (OSError, struct.error, KeyError, ValueError):
+        pass
+    return []
+
+
+# Weights that are an ordinary LLM checkpoint but are meant to be read as a
+# calibrated decision (letter-logprob readout over a vendor-specific prompt,
+# e.g. Quyet), not chatted with.
+_DECISION_SIDECARS = ("quyet_config.json",)
+# GGUF ``general.tags`` (copied from the model card) that mark one. Generic
+# ones like "classification" / "calibration" are left out on purpose.
+_DECISION_TAGS = {"decision-model", "decision-making", "typed-decisions",
+                  "typed-classification", "jevbench"}
+
+
+def is_decision_model(path: Path) -> bool:
+    """Best-effort: a decision-model checkpoint dir (vendor config sidecar) or
+    GGUF (one of ``_DECISION_TAGS`` in its header, or the sidecar beside it)."""
+    folder = path if path.is_dir() else path.parent
+    if any((folder / s).is_file() for s in _DECISION_SIDECARS):
+        return True
+    return path.suffix == ".gguf" and bool(_DECISION_TAGS & set(_gguf_general_tags(path)))
+
+
 def is_decider_model_dir(path: Path) -> bool:
     """A decider checkpoint: an HF checkpoint dir that also ships
     ``decider_config.json`` (fitted temperature, version, option limits)."""

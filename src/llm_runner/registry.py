@@ -78,6 +78,9 @@ class ModelSpec:
     backend: str = backends.LLAMA
     # HF checkpoints declare vision in config.json rather than via an mmproj.
     hf_vision: bool = False
+    # Calibrated decision model (e.g. Quyet): needs its own prompt + letter
+    # readout client; plain chat output is meaningless.
+    decision: bool = False
 
     @property
     def has_vision(self) -> bool:
@@ -148,6 +151,7 @@ def discover_models(models_dir: Path | None = None) -> dict[str, ModelSpec]:
                     size=backends.hf_dir_size(p),
                     backend=backends.infer_backend(p),
                     hf_vision=backends.hf_has_vision(p),
+                    decision=backends.is_decision_model(p),
                 )
             else:
                 specs[key] = ModelSpec(
@@ -156,5 +160,6 @@ def discover_models(models_dir: Path | None = None) -> dict[str, ModelSpec]:
                     mmproj_path=_find_mmproj(p.parent),
                     size=p.stat().st_size,
                     draft_path=_find_draft(p.parent),
+                    decision=backends.is_decision_model(p),
                 )
     return dict(sorted(specs.items()))

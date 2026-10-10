@@ -336,17 +336,25 @@ llmctl list
 Shows discovered models with key, size, vision/draft markers, and path:
 
 ```
-KEY                     SIZE  VISION  DRAFT  PATH
-gemma-4-e4b-it-q4_k_m   2.4G  yes            gemma-4-e4b-it/gemma-4-E4B-it-Q4_K_M.gguf
-gemma-4-e4b-it-q8_0     5.0G  yes            gemma-4-e4b-it/gemma-4-E4B-it-Q8_0.gguf
-gemma-4-31b-it-q4_k_m   17G           yes    gemma-4-31b-it/gemma-4-31B-it-Q4_K_M.gguf
-qwen3-8b-q5_k_m         5.4G                 qwen3-8b/Qwen3-8B-Q5_K_M.gguf
+KEY                     SIZE  VISION  DRAFT  DECISION  PATH
+gemma-4-e4b-it-q4_k_m   2.4G  yes                      gemma-4-e4b-it/gemma-4-E4B-it-Q4_K_M.gguf
+gemma-4-e4b-it-q8_0     5.0G  yes                      gemma-4-e4b-it/gemma-4-E4B-it-Q8_0.gguf
+gemma-4-31b-it-q4_k_m   17G           yes              gemma-4-31b-it/gemma-4-31B-it-Q4_K_M.gguf
+qwen3-8b-q5_k_m         5.4G                           qwen3-8b/Qwen3-8B-Q5_K_M.gguf
 ```
 
 The key is the filename stem lowercased; collisions across folders are
 disambiguated by prefixing with the parent dir name. A `DRAFT` marker means a
 speculative/MTP drafter sits alongside and is auto-attached on `run` (see
 [Speculative decoding](#speculative-decoding-mtp-drafters)).
+
+A `DECISION` marker flags a calibrated decision model (e.g. Quyet): an
+ordinary checkpoint whose answer is the next-token probability of option
+letters under a vendor-specific prompt, rescaled with fitted temperatures. It
+is detected from a `quyet_config.json` beside the weights or a
+`decision-model` tag in the GGUF header. `run` still serves it on llama/vllm
+(and prints a note), but only a client that builds its prompt and reads the
+letter logprobs gets meaningful answers.
 
 ### Start a model
 
