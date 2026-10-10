@@ -208,7 +208,8 @@ def _require_backend(backend: str) -> str:
 _LLAMA_ONLY_PARAMS = {
     "reasoning": "--reasoning", "n_gpu_layers": "--n-gpu-layers",
     "no_vision": "--no-vision", "kv_unified": "--kv-unified/--no-kv-unified",
-    "cache_ram": "--cache-ram", "pooling": "--pooling",
+    "cache_ram": "--cache-ram", "ctx_checkpoints": "--ctx-checkpoints",
+    "pooling": "--pooling",
     "batch_size": "--batch-size", "ubatch_size": "--ubatch-size",
 }
 _VLLM_ONLY_PARAMS = {
@@ -509,6 +510,12 @@ def list_cmd() -> None:
               help="Share one KV buffer across all slots (llama-server "
                    "--kv-unified) so each slot may use the full --ctx-size "
                    "rather than ctx/N. Default: on when --n-parallel > 1.")
+@click.option("--ctx-checkpoints", "ctx_checkpoints", type=click.IntRange(min=0), default=None,
+              help="Context checkpoints llama-server keeps per slot for prompt-cache "
+                   "reuse (llama-server --ctx-checkpoints; its default is 32). Each "
+                   "can be hundreds of MB on long prompts. Default: 0 (off) for "
+                   "decision models, which never reuse the cache; llama-server's "
+                   "own default otherwise.")
 @click.option("--cache-ram", "cache_ram", type=int, default=0, show_default=True,
               help="Host-RAM prompt cache in MiB (llama-server --cache-ram). "
                    "0 disables it. Only worth enabling for long prompts that "
@@ -542,7 +549,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         embeddings: bool | None, pooling: str, batch_size: int | None,
         ubatch_size: int | None, draft_spec: str | None, no_draft: bool,
         spec_type: str, spec_n_max: int, n_parallel: int | None,
-        cache_ram: int, kv_unified: bool | None) -> None:
+        cache_ram: int, kv_unified: bool | None, ctx_checkpoints: int | None) -> None:
     """Start MODEL in the background.
 
     GGUF models run on llama-server; Hugging Face checkpoint directories run
@@ -693,10 +700,12 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         # Decision endpoints never reuse the prompt cache (cache_prompt off), but
         # llama-server still saves up to 32 context checkpoints per slot, each
         # tens to hundreds of MB on a long prompt. That OOM-killed Quyet on the
-        # 64 GB Orin. Turn them off unless -X sets them.
-        if decision and not any(a in ("--ctx-checkpoints", "-ctxcp", "--swa-checkpoints")
-                                for a in extra_args):
-            cmd += ["--ctx-checkpoints", "0"]
+        # 64 GB Orin, so they default to off there (unless -X sets them).
+        if ctx_checkpoints is None and decision and not any(
+                a in ("--ctx-checkpoints", "-ctxcp", "--swa-checkpoints") for a in extra_args):
+            ctx_checkpoints = 0
+        if ctx_checkpoints is not None:
+            cmd += ["--ctx-checkpoints", str(ctx_checkpoints)]
     # Remember the llmctl-level invocation (with the interactively-picked model
     # made explicit) so `restart`/`autostart list` can show and re-issue it.
     run_args = ([] if ft_path else [model]) + _run_option_args(ctx)

@@ -30,6 +30,10 @@ class Target:
     spec: ModelSpec
     backend: str            # resolved: llama | vllm | decider
 
+    @property
+    def decision(self) -> bool:
+        return self.backend != DECIDER and self.spec.decision
+
 
 @dataclass(frozen=True)
 class Setting:
@@ -51,6 +55,11 @@ def _kv_values(t: Target) -> list[tuple[Any, str]]:
     return vals
 
 
+def _checkpoint_values(t: Target) -> list[tuple[Any, str]]:
+    auto = "auto (off: decision model)" if t.decision else "auto (llama-server: 32)"
+    return [(None, auto), (0, "off"), (4, "4"), (32, "32")]
+
+
 def _draft_title(t: Target) -> str:
     return f"on ({t.spec.draft_path.name})" if t.spec.draft_path else "on"
 
@@ -69,6 +78,8 @@ SETTINGS: list[Setting] = [
             lambda t: t.backend in (LLAMA, VLLM)),
     Setting("kv_quant", "KV cache", _kv_values,
             lambda t: t.backend in (LLAMA, VLLM)),
+    Setting("ctx_checkpoints", "Checkpoints", _checkpoint_values,
+            lambda t: t.backend == LLAMA),
     Setting("n_parallel", "Parallel slots",
             lambda t: [(None, "auto"), (1, "1"), (2, "2"), (4, "4"), (8, "8")],
             lambda t: True),

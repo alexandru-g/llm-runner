@@ -342,7 +342,7 @@ needs (e.g. h2o's `threshold`/`decision`) are extra keys, listed in
 9. **Memory on long prompts.** llama-server keeps up to 32 context
    checkpoints per slot even when the request sets `cache_prompt: false`; on a
    long prompt they grow to hundreds of MB and OOM-killed Quyet on the Orin.
-   `llmctl run` adds `--ctx-checkpoints 0` for flagged decision models, which
+   `llmctl run` defaults `--ctx-checkpoints` to 0 for flagged decision models, which
    is one more reason step 6 (flagging) matters. Test long states on a
    machine with headroom, and keep one slot (`--np 1`) where memory is tight.
 10. **Quantisation.** Temperatures were fitted on bf16/fp8. Validate numbers

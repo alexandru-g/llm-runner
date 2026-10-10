@@ -378,6 +378,7 @@ to that model, with **Start** on top so Enter launches with what's shown:
      Reasoning       off
    * Context         8,192
      KV cache        f16
+     Checkpoints     auto (off: decision model)
      Parallel slots  auto
    ↺ Reset to defaults
 ```
@@ -686,7 +687,8 @@ curl -s localhost:8090/v1/systemone -H 'Content-Type: application/json' -d '{
 - **Memory:** `llmctl run` starts decision models with `--ctx-checkpoints 0`.
   The endpoint never reuses llama-server's prompt cache, and the checkpoints
   it would otherwise keep (up to 32 per slot, large on long prompts) once
-  ran the Orin out of memory. Pass `-X '--ctx-checkpoints N'` to override.
+  ran the Orin out of memory. Override with `--ctx-checkpoints N` or the
+  Checkpoints setting in the launch menu.
 - **Quantisation:** temperatures were fitted on bf16/fp8 weights. Prefer Q8_0
   where it fits; Q4 keeps the chosen option but shifts the probabilities.
 - **Images (H2O-Lightning-4B only):** send them in a top-level `images` list,
