@@ -15,5 +15,8 @@ systemone-proxy spec --profile rune-26b-a4b-v3   # the client contract for one m
 systemone-proxy serve --backend http://127.0.0.1:8080 --port 8090   # profile detected from the GGUF
 ```
 
+Images: H2O-Lightning-4B reads up to 4 images per request when llama-server
+runs with a vision projector (`systemone-proxy spec --profile h2o-lightning-4b`).
+
 Install: `uv tool install ./packages/systemone-proxy` (or `pipx install`).
 Tests: `uv run pytest` from this directory.

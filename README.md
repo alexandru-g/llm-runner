@@ -362,10 +362,32 @@ letter logprobs gets meaningful answers.
 ### Start a model
 
 ```bash
-llmctl run                          # interactive picker
+llmctl run                          # interactive picker, then the launch-options menu
 llmctl run gemma-4-e4b-it-q4_k_m    # by key → llama-server
+llmctl run gemma-4-e4b-it-q4_k_m -i # by key, with the launch-options menu
 llmctl run qwen3-8b --wait          # HF checkpoint → vllm; --wait blocks until /health
 ```
+
+After an interactive pick, a launch-options menu lists the settings that apply
+to that model, with **Start** on top so Enter launches with what's shown:
+
+```
+? Launch h2o-lightning-4b.q8_0 on llama  (Enter starts; * = not default)
+ » ▶ Start
+   * Vision          off (saves ~1 GB)
+     Reasoning       off
+   * Context         8,192
+     KV cache        f16
+     Parallel slots  auto
+   ↺ Reset to defaults
+```
+
+Enter on a two-valued setting toggles it; the others open a value list. The
+choices are remembered per model (state dir, `launch.json`) and preselected
+next time, and they're recorded like typed flags, so `restart` and autostart
+reuse them. `-i` shows the menu for a named model, `--no-menu` skips it. Flags
+you type still apply and show in the menu. Settings are a table in
+`src/llm_runner/launch.py`; adding one is one entry.
 
 - Backend: from the model format (`--backend llama|vllm` to force; see
   [vLLM specifics](#vllm-specifics)).
@@ -660,6 +682,18 @@ curl -s localhost:8090/v1/systemone -H 'Content-Type: application/json' -d '{
   answers. `--cache request` reuses the state prefix within one request only.
 - **Quantisation:** temperatures were fitted on bf16/fp8 weights. Prefer Q8_0
   where it fits; Q4 keeps the chosen option but shifts the probabilities.
+- **Images (H2O-Lightning-4B only):** send them in a top-level `images` list,
+  inline in `state` as data URIs, or as multipart file parts (up to 4, see
+  `llmctl decide spec`). llama-server needs a vision projector. The h2o GGUF
+  repo has none, but its vision tower is identical to Qwen3.5-4B's, so fetch
+  that one into the model's folder and run without `--no-vision`:
+
+  ```bash
+  llmctl download unsloth/Qwen3.5-4B-GGUF --file mmproj-F16.gguf --subdir h2o-lightning-4b
+  ```
+
+  Text-only models reject the `images` field. Without a projector, an image
+  request gets `503 vision_unavailable`.
 
 ### vLLM specifics
 

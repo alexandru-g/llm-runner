@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 
+from systemone_proxy.images import MEDIA, ImageSupport
 from systemone_proxy.profiles.base import Built, Profile, Row, py_json
 from systemone_proxy.questions import Limits, Option, Question, Request
 from systemone_proxy.readout import (argmax, binary_confidence, expected_index,
@@ -31,6 +32,13 @@ PREFILL = "Answer:"
 DEFAULT_INSTRUCTIONS = "Answer the question below."   # Contract default (not in the config)
 MAX_STATE_TOKENS = 32000
 NOUL_FLOOR = 0.801
+# serve_config.json "image" block; min_pixels and the 32-pixel grid (patch 16 ×
+# merge 2) from preprocessor_config.json
+IMAGE_SUPPORT = ImageSupport(max_images=4, max_pixels=1_048_576, min_pixels=65_536, factor=32)
+IMAGE_TEMPERATURE = 0.65
+# what Qwen3.5's template writes for one image part; vLLM expands the pad into
+# the image's tokens, llama.cpp wraps its image embeddings in the same two tokens
+VISION_SLOT = "<|vision_start|><|image_pad|><|vision_end|>"
 LABELS = (
     list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + list("abcdefghijklmnopqrstuvwxyz")
     + list("αβγδεζηθικλμνξοπστυφχψω")
@@ -134,6 +142,7 @@ class H2OLightning4B(Profile):
     tokenizer_source = H2O_LIGHTNING_TOKENIZER
     temperatures = {"choice": 0.75, "noul": 0.8, "score": 0.65}
     limits = Limits(max_choice=len(LABELS), max_score=len(LABELS))
+    image_support = IMAGE_SUPPORT
 
     @classmethod
     def matches(cls, meta: dict, filename: str) -> bool:
@@ -180,13 +189,32 @@ class H2OLightning4B(Profile):
 
     def build(self, req: Request) -> Built:
         state_text, n_state = self.truncate_state(render_state(req.state))
-        rows = [Row(q.qid, self.tok.encode(self.prompt_text(state_text, q), special=True),
-                    self.label_ids[:len(q.options)])
-                for q in req.questions]
-        # shim.respond: the head the questions share is counted once
-        shared = common_prefix_len([r.ids for r in rows])
+        if req.images:
+            # shim.image_prompt: the images ahead of the user text. Each one
+            # adds its grid's tokens minus the one <|image_pad|> the text form has.
+            n = len(req.images)
+            pngs = tuple(im.png for im in req.images)
+            extra = sum((im.width // IMAGE_SUPPORT.factor) * (im.height // IMAGE_SUPPORT.factor) - 1
+                        for im in req.images)
+            rows = [Row(q.qid,
+                        self.tok.encode(render_chat(VISION_SLOT * n + user_turn(state_text, q)),
+                                        special=True),
+                        self.label_ids[:len(q.options)],
+                        text=render_chat(MEDIA * n + user_turn(state_text, q)),
+                        images=pngs, extra_tokens=extra)
+                    for q in req.questions]
+        else:
+            extra = 0
+            rows = [Row(q.qid, self.tok.encode(self.prompt_text(state_text, q), special=True),
+                        self.label_ids[:len(q.options)])
+                    for q in req.questions]
+        # shim.respond: the head the questions share is counted once (the
+        # images are in it)
+        shared = common_prefix_len([r.ids for r in rows]) + (extra if len(rows) > 1 else 0)
         built = Built(rows=rows,
-                      input_tokens=sum(len(r.ids) for r in rows) - shared * (len(rows) - 1))
+                      input_tokens=sum(len(r.ids) + r.extra_tokens for r in rows)
+                      - shared * (len(rows) - 1),
+                      answer_kwargs={"image": bool(req.images)})
         if n_state is not None:
             built.truncated = {q.qid for q in req.questions}
             built.warnings.append({"code": "state_truncated", "state_tokens": n_state,
@@ -194,8 +222,9 @@ class H2OLightning4B(Profile):
         return built
 
     # -- answer ----------------------------------------------------------------
-    def answer(self, q: Question, logprobs: dict[str, list[float]]) -> dict:
-        p = softmax_t(logprobs["main"], self.temperatures[q.type])
+    def answer(self, q: Question, logprobs: dict[str, list[float]], image: bool = False) -> dict:
+        # shim.respond: an image request uses one temperature for every type
+        p = softmax_t(logprobs["main"], IMAGE_TEMPERATURE if image else self.temperatures[q.type])
         keys = q.keys
         if q.type == "choice":
             i = argmax(p)
@@ -246,6 +275,19 @@ class H2OLightning4B(Profile):
                       "\"truncated\": true and a state_truncated warning is added."),
             "limits": {"options": f"2..{len(LABELS)} for choice and score"},
             "calls": "one llama-server call per question",
+            "images": {
+                "max_images": IMAGE_SUPPORT.max_images,
+                "max_pixels": IMAGE_SUPPORT.max_pixels,
+                "temperature": IMAGE_TEMPERATURE,
+                "where": "the top-level images list, or inline in state (data URIs, image "
+                         "parts, bare base64 of PNG/JPEG/GIF/WebP); each inline image becomes "
+                         "\"[image N]\" in the state, top-level images numbered first",
+                "prompt": "all images go ahead of the question text, in that order",
+                "resize": f"Qwen smart_resize: sides multiples of {IMAGE_SUPPORT.factor}, area "
+                          f"{IMAGE_SUPPORT.min_pixels}..{IMAGE_SUPPORT.max_pixels} pixels; "
+                          "transparency flattened onto white",
+                "tokens": "each image adds (width/32)·(height/32) tokens after resizing",
+            },
             "extras": {
                 "threshold": "noul only, when the question gives a threshold (or the vendor's "
                              "noul_threshold alias): echoed back",
@@ -253,7 +295,7 @@ class H2OLightning4B(Profile):
             },
             "notes": [
                 "Temperatures are per question type, from serve_config.json: choice 0.75, "
-                "noul 0.8, score 0.65.",
+                "noul 0.8, score 0.65. A request with images uses 0.65 for every type.",
                 f"noul answers are floored as the vendor ships them: when max(p, 1 - p) < "
                 f"{NOUL_FLOOR}, P(true) is reported as {NOUL_FLOOR} (or {1 - NOUL_FLOOR:.3f}) on "
                 "its own side. The chosen side never changes, but there are no uncertain "
@@ -262,9 +304,10 @@ class H2OLightning4B(Profile):
                 "choice description falls back to the label, and a missing noul description "
                 "to \"the statement holds\" / \"it does not\". A null score level is "
                 "rendered as \"null\".",
-                "Images are not supported in this version (the vendor reads them through vLLM "
-                "chat completions; the GGUF repo has no mmproj). Image data in the state is "
-                "read as text.",
+                "Images need a vision projector next to the GGUF. The GGUF repo ships none, "
+                "and h2o's vision tower is unchanged from Qwen3.5-4B (its tensors are "
+                "identical to unsloth/Qwen3.5-4B-GGUF mmproj-F16.gguf), so use that file. "
+                "Without it, a request with images gets 503 vision_unavailable.",
                 "Special-token text inside the state or questions (e.g. <|im_end|>) is parsed "
                 "as special tokens, as vLLM does for the vendor's prompts.",
                 "usage.input_tokens counts the prompt head that the questions share only once, "

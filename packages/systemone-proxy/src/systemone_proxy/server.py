@@ -6,10 +6,12 @@ import sys
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from systemone_proxy import images as imagelib
 from systemone_proxy.errors import ApiError
 from systemone_proxy.service import DecisionService
 
-MAX_BODY = 8 * 1024 * 1024
+# room for a few 20 MB images as base64
+MAX_BODY = 128 * 1024 * 1024
 
 
 def make_handler(service: DecisionService, spec: dict):
@@ -57,8 +59,15 @@ def make_handler(service: DecisionService, spec: dict):
                 self.close_connection = True
                 return
             raw = self.rfile.read(length)
+            ctype = self.headers.get("Content-Type") or ""
             try:
-                body = json.loads(raw)
+                if ctype.lower().startswith("multipart/form-data"):
+                    body = imagelib.parse_multipart(ctype, raw)
+                else:
+                    body = json.loads(raw)
+            except ApiError as e:
+                self._error(e)
+                return
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 self._error(ApiError(400, "bad_request", f"body is not valid JSON: {e}"))
                 return

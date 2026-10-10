@@ -4,6 +4,7 @@ A request is::
 
     {"state": <string | object | array>,
      "questions": {"<id>": <question>, ...},
+     "images": [<data URI | base64 | image part>, ...],   (image models only)
      "model": <ignored>, "debug": <bool, optional>}
 
 A question is ``{"type", "instructions", "criteria", "threshold"?}``:
@@ -24,6 +25,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from systemone_proxy import images as imagelib
 from systemone_proxy.errors import ApiError, invalid
 
 TYPES = ("choice", "score", "noul")
@@ -54,6 +56,8 @@ class Request:
     state: Any
     questions: tuple[Question, ...]
     debug: bool = False
+    # fitted images, in [image N] order; the state then holds the placeholders
+    images: tuple[imagelib.Image, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -114,7 +118,8 @@ def parse_question(qid: str, q: Any, limits: Limits) -> Question:
     return Question(str(qid), t, instr, tuple(opts), threshold, q)
 
 
-def parse_request(body: Any, limits: Limits) -> Request:
+def parse_request(body: Any, limits: Limits,
+                  image_support: imagelib.ImageSupport | None = None) -> Request:
     if not isinstance(body, dict):
         raise ApiError(400, "bad_request", "the body must be a JSON object")
     if "state" not in body:
@@ -131,4 +136,12 @@ def parse_request(body: Any, limits: Limits) -> Request:
     if not isinstance(debug, bool):
         raise invalid("debug must be a boolean")
     parsed = tuple(parse_question(str(k), v, limits) for k, v in questions.items())
-    return Request(state, parsed, debug)
+    if image_support is None:
+        if body.get("images") is not None:
+            raise invalid("this model does not read images")
+        return Request(state, parsed, debug)
+    state, raws = imagelib.extract(body)
+    if len(raws) > image_support.max_images:
+        raise invalid(f"{len(raws)} images; this model reads at most "
+                      f"{image_support.max_images} per request")
+    return Request(state, parsed, debug, tuple(imagelib.fit(r, image_support) for r in raws))

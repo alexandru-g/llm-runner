@@ -55,6 +55,11 @@ COMMON = {
             "noul": "null or {\"true\"?: description, \"false\"?: description}",
         },
         "question.threshold": "optional number in [0, 1] (used by models that list it under extras)",
+        "images": "optional, image models only (see model.images): list of data URIs, base64 "
+                  "strings or image parts ({\"type\": \"image_url\", \"image_url\": {\"url\": "
+                  "data URI}}). Images may also sit inline in state. URLs are not fetched. "
+                  "Multipart/form-data works too: the JSON in a \"request\" field, each image a "
+                  "file part. A text-only model rejects the images field (422).",
         "debug": "optional bool: adds answers[id].debug with the raw label logprobs and prompt sizes",
         "model": "optional, ignored",
     },
@@ -65,8 +70,10 @@ COMMON = {
                                 "legend: {\"0\": description, ...}, probabilities: {\"0\": p, ...}}",
         "answers.<id> (noul)": "{type, noul: P(true), confidence}",
         "answers.<id>.truncated": "present (true) only when the model's protocol truncated the state",
-        "usage": "{input_tokens, output_tokens: 0, backend_calls}",
-        "warnings": "list of {code, ...}; codes: state_truncated, label_outside_top_n",
+        "usage": "{input_tokens, output_tokens: 0, backend_calls, images (only when present)}; "
+                 "input_tokens includes image tokens",
+        "warnings": "list of {code, ...}; codes: state_truncated, label_outside_top_n, "
+                    "image_read_as_text (a text-only model got image data in state)",
         "latency_ms": "wall time spent in the proxy",
     },
     "semantics": [
@@ -82,12 +89,14 @@ COMMON = {
         "shape": "{\"error\": {\"code\": str, \"message\": str}}",
         "400 bad_request": "body is not a JSON object",
         "404 not_found": "unknown path",
-        "413 body_too_large": "body over 8 MiB",
+        "413 body_too_large": "body over 128 MiB",
         "422 invalid_request": "a field breaks the contract (type, criteria, option count, …)",
         "422 input_too_long": "a question's prompt does not fit the model's context "
                               "(never truncated unless the model's protocol truncates)",
         "502 backend_error": "llama-server failed or is unreachable",
         "503 not_ready": "the proxy is still starting",
+        "503 vision_unavailable": "a request with images, but llama-server has no vision "
+                                  "projector loaded",
     },
 }
 

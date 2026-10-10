@@ -58,8 +58,13 @@ def cmd_serve(args) -> None:
                              "model (wrong model, or a broken conversion). Use --skip-selftest "
                              "to serve anyway.")
         _log("self-test passed: GGUF tokenizer matches the vendor tokenizer")
+    vision = backend.vision(props)
+    if cls.image_support is not None:
+        _log("images: enabled (llama-server has a vision projector)" if vision else
+             "images: unavailable — llama-server runs without a vision projector (mmproj); "
+             "requests with images get 503")
     service = DecisionService(profile, backend, n_ctx=n_ctx, n_probs=args.n_probs,
-                              cache=args.cache, concurrency=args.concurrency)
+                              cache=args.cache, concurrency=args.concurrency, vision=vision)
     serve(service, build_spec(cls, profile), args.host, args.port)
 
 

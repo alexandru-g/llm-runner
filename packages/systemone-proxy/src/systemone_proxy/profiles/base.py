@@ -22,6 +22,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from systemone_proxy.images import ImageSupport
 from systemone_proxy.questions import Limits, Question, Request
 from systemone_proxy.tokenizer import Tok, TokenizerSource
 
@@ -34,6 +35,12 @@ class Row:
     ids: list[int]
     label_ids: list[int]
     tag: str = "main"
+    # Image rows: the prompt as text with one images.MEDIA per image (llama-server
+    # tokenizes it around the images), the PNGs, and the tokens the images add
+    # beyond what ``ids`` (the vendor's text form of the prompt) counts.
+    text: str | None = None
+    images: tuple[bytes, ...] = ()
+    extra_tokens: int = 0
 
 
 @dataclass
@@ -43,6 +50,8 @@ class Built:
     truncated: set[str] = field(default_factory=set)
     # None → the service reports the sum of all row prompt lengths.
     input_tokens: int | None = None
+    # passed to answer() for every question of this request
+    answer_kwargs: dict = field(default_factory=dict)
 
 
 class Profile:
@@ -53,6 +62,8 @@ class Profile:
     tokenizer_source: ClassVar[TokenizerSource]
     temperatures: ClassVar[dict[str, float]]     # by question type
     limits: ClassVar[Limits] = Limits()
+    # None: text only (an "images" field is a 422, inline images stay text)
+    image_support: ClassVar[ImageSupport | None] = None
 
     def __init__(self, tok: Tok):
         self.tok = tok

@@ -45,6 +45,7 @@ class FakeBackend:
         self.calls = []
         self._lps = list(logprobs_by_call)
 
-    def next_token_logprobs(self, ids, *, n_probs, cache_prompt):
-        self.calls.append({"ids": ids, "n_probs": n_probs, "cache_prompt": cache_prompt})
+    def next_token_logprobs(self, ids, *, n_probs, cache_prompt, **image_args):
+        self.calls.append({"ids": ids, "n_probs": n_probs, "cache_prompt": cache_prompt,
+                           **image_args})
         return self._lps.pop(0)

@@ -250,7 +250,8 @@ def test_matches(meta, name, want):
 
 def test_spec_without_state():
     s = H2OLightning4B.__new__(H2OLightning4B).spec()
-    assert set(s) == {"confidence", "labels", "noul_order", "state", "limits", "calls", "extras", "notes"}
+    assert set(s) == {"confidence", "labels", "noul_order", "state", "limits", "calls", "extras",
+                      "notes", "images"}
     assert set(s["extras"]) == {"threshold", "decision"}
 
 

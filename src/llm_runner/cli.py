@@ -10,6 +10,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -170,12 +171,12 @@ def _run_option_args(ctx: click.Context) -> list[str]:
     """Rebuild the option part of the `llmctl run` argv from the params the
     user passed on the command line (defaults are omitted so re-detection —
     e.g. embeddings-by-filename — still applies on a re-run). ``--port`` is
-    left out: the manifest pins it separately. So is ``--wait``: it's about
-    this invocation, not the launch."""
+    left out: the manifest pins it separately. So are ``--wait`` and
+    ``--menu``: they're about this invocation, not the launch."""
     src = click.core.ParameterSource.COMMANDLINE
     args: list[str] = []
     for p in ctx.command.params:
-        if not isinstance(p, click.Option) or p.name in ("port", "wait"):
+        if not isinstance(p, click.Option) or p.name in ("port", "wait", "menu"):
             continue
         if ctx.get_parameter_source(p.name) != src:
             continue
@@ -438,6 +439,10 @@ def list_cmd() -> None:
 @click.option("--wait/--no-wait", "wait", default=False,
               help="Block until the server answers /health (or exits). Handy for "
                    "vllm, which takes a minute or more to load and compile.")
+@click.option("--menu/--no-menu", "-i", "menu", default=None,
+              help="Show the launch-options menu (vision, drafter, reasoning, "
+                   "context, KV cache, slots) before starting. On by default when "
+                   "MODEL is picked interactively; choices are remembered per model.")
 @click.option("--extra", "-X", "extra", multiple=True,
               help="Extra argument(s) appended verbatim to the server command; "
                    "repeatable, each value is shell-split. e.g. "
@@ -529,7 +534,7 @@ def list_cmd() -> None:
 @click.pass_context
 def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         ctx_size: int | None, ft_path: Path | None, ft_name: str | None,
-        wait: bool, extra: tuple[str, ...], env_pairs: tuple[str, ...],
+        wait: bool, menu: bool | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
         reasoning: bool,
         kv_quant: str, gpu_mem: float | None, tool_parser: str | None,
         reasoning_parser: str | None, trust_remote_code: bool,
@@ -557,7 +562,8 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                 "No models found on disk. Run `llmctl download <repo>` first, "
                 "or use --ft <path> to point at a GGUF directly."
             )
-        if not model:
+        picked = not model
+        if picked:
             model = _pick_model_interactively(specs)
         if model not in specs:
             available = "\n  ".join(specs)
@@ -565,6 +571,12 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                 f"Unknown model '{model}'. Available:\n  {available}"
             )
         spec = specs[model]
+        if (menu or (menu is None and picked)) and sys.stdin.isatty():
+            from llm_runner import launch
+            target = launch.Target(spec, spec.backend if backend == "auto" else backend)
+            if launch.configure(ctx, target):
+                # Start over with the chosen values, as if they had been typed.
+                return ctx.invoke(run.callback, **{**ctx.params, "model": model, "menu": False})
         model_path = spec.model_path
         mmproj = None if no_vision else spec.mmproj_path
         name = ft_name or spec.key
@@ -1444,6 +1456,14 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
             )
         selected = filename
 
+    # `--file <mmproj> --subdir <folder>` fetches only a vision projector into
+    # an existing model folder (e.g. a base model's mmproj for a fine-tune whose
+    # GGUF repo ships none): no companion prompts, and the folder keeps
+    # recording the repo its quant came from.
+    companion_only = selected in mmproj_names
+    if companion_only:
+        no_mmproj = no_draft = True
+
     chosen_mmproj: str | None = None
     if mmproj_names and not no_mmproj:
         if len(mmproj_names) == 1:
@@ -1521,7 +1541,8 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
                   else "updated" if after != before else "up to date")
         click.echo(f"    {status}: {dest.name}")
 
-    _write_source(target_dir, repo_id, to_download)
+    if not (companion_only and _read_source(target_dir).get("repo_id") not in (None, repo_id)):
+        _write_source(target_dir, repo_id, to_download)
 
     click.echo(f"\nFiles now in {target_dir}:")
     for p in sorted(target_dir.iterdir()):
@@ -1555,6 +1576,9 @@ def download(repo_id: str, filename: str | None, no_mmproj: bool, no_draft: bool
       llmctl download unsloth/gemma-4-E4B-it-GGUF
 
       llmctl download Qwen/Qwen3-8B            # → vllm
+
+      # a base model's vision projector into a fine-tune's folder
+      llmctl download unsloth/Qwen3.5-4B-GGUF --file mmproj-F16.gguf --subdir h2o-lightning-4b
 
     Records the source repo so `llmctl update` can re-check it later.
     """
