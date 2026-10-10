@@ -82,8 +82,9 @@ COMMON = {
         "confidence is computed with the vendor's formula (see model.confidence); compare it "
         "within one model, not across models.",
         "noul is always P(true), whatever label order the model uses internally.",
-        "label_outside_top_n means an option's token was not in llama-server's top-n list; "
-        "its logprob was bounded by the smallest returned one (the probability is tiny).",
+        "label_outside_top_n means an option's probability was too small to represent "
+        "(about 100 nats below the best option); it was bounded from above by the smallest "
+        "returned one. Effectively zero.",
     ],
     "errors": {
         "shape": "{\"error\": {\"code\": str, \"message\": str}}",

@@ -10,8 +10,8 @@ from systemone_proxy.errors import ApiError, too_long
 from systemone_proxy.profiles.base import Profile, Row
 from systemone_proxy.questions import parse_request
 
-# Extra top-n entries requested beyond the number of labels, so every label
-# of a well-behaved model comes back.
+# Extra top-n entries requested beyond the number of labels. The labels are
+# biased to the top (see LlamaServer.next_token_logprobs); the margin is slack.
 N_PROBS_MARGIN = 64
 
 
@@ -34,12 +34,14 @@ class DecisionService:
         # window) that changed answers depending on what the slot held before.
         cache_prompt = self.cache == "request" and not first
         top = self.backend.next_token_logprobs(row.ids, n_probs=n, cache_prompt=cache_prompt,
+                                               label_ids=row.label_ids,
                                                text=row.text, images=row.images,
                                                extra_tokens=row.extra_tokens)
         floor = min(top.values())
         missing = [i for i in row.label_ids if i not in top]
-        # A label outside the top n is at most as likely as the last one
-        # returned; use that bound (it can only overstate a tiny probability).
+        # Only a label whose probability underflowed (about 100 nats below the
+        # best one) can be missing. It is at most as likely as the least likely
+        # one returned; use that bound (it can only overstate a tiny probability).
         return [top.get(i, floor) for i in row.label_ids], [str(i) for i in missing]
 
     def decide(self, body) -> dict:

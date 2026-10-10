@@ -683,6 +683,10 @@ curl -s localhost:8090/v1/systemone -H 'Content-Type: application/json' -d '{
 - **Prompt cache:** off by default (`--cache off`), so every call is computed
   fresh. Gemma 4's sliding-window attention made cached prefixes change
   answers. `--cache request` reuses the state prefix within one request only.
+- **Memory:** `llmctl run` starts decision models with `--ctx-checkpoints 0`.
+  The endpoint never reuses llama-server's prompt cache, and the checkpoints
+  it would otherwise keep (up to 32 per slot, large on long prompts) once
+  ran the Orin out of memory. Pass `-X '--ctx-checkpoints N'` to override.
 - **Quantisation:** temperatures were fitted on bf16/fp8 weights. Prefer Q8_0
   where it fits; Q4 keeps the chosen option but shifts the probabilities.
 - **Images (H2O-Lightning-4B only):** send them in a top-level `images` list,

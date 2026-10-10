@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 import time
 import urllib.error
@@ -12,6 +13,11 @@ from systemone_proxy.errors import ApiError, backend_error, too_long
 from systemone_proxy.images import MEDIA
 
 _CONTEXT_ERROR = re.compile(r"context|too long|exceed", re.I)
+
+# Added to every label's logit so all labels rank above the rest of the
+# vocabulary. A common offset leaves the gaps between labels (all the readout
+# uses) unchanged; float32 rounding at this size is ~1e-5 nats.
+LABEL_BIAS = 50.0
 
 
 class LlamaServer:
@@ -77,12 +83,22 @@ class LlamaServer:
         return self._call("POST", "/detokenize", {"tokens": ids})["content"]
 
     def next_token_logprobs(self, ids: list[int], *, n_probs: int,
-                            cache_prompt: bool, text: str | None = None,
-                            images: tuple[bytes, ...] = (),
+                            cache_prompt: bool, label_ids: list[int] | None = None,
+                            text: str | None = None, images: tuple[bytes, ...] = (),
                             extra_tokens: int = 0) -> dict[int, float]:
-        """Top ``n_probs`` next-token log-probabilities after the prompt
-        ``ids``, from llama-server's pre-sampling full-vocabulary softmax of the
-        raw logits (no temperature, no samplers).
+        """Next-token log-probabilities after the prompt ``ids``.
+
+        With ``label_ids`` (the normal case), every label gets the same logit
+        bias and the probabilities are read after a sampler chain of just
+        temperature 1: a softmax of logits + bias over the full vocabulary. All
+        labels come back, however unlikely, and their log-probabilities differ
+        from the raw logits by one common constant, which the readout's softmax
+        over the labels cancels. (llama-server's pre-sampling top-n list, the
+        other option, can't reach a label at rank 200,000 without returning the
+        whole vocabulary: Quyet puts losing letters there.)
+
+        Without ``label_ids``: the top ``n_probs`` of the raw, pre-sampling
+        softmax.
 
         With ``images`` the prompt goes as ``text`` (one ``images.MEDIA`` per
         image) plus the image data; ``ids`` then only sets the expected token
@@ -92,12 +108,18 @@ class LlamaServer:
                       "multimodal_data": [base64.b64encode(b).decode("ascii") for b in images]}
         else:
             prompt = ids
-        out = self._call("POST", "/completion", {
-            "prompt": prompt, "n_predict": 1, "n_probs": n_probs, "temperature": 0.0,
-            "post_sampling_probs": False, "cache_prompt": cache_prompt,
-        })
+        body = {"prompt": prompt, "n_predict": 1, "n_probs": n_probs,
+                "cache_prompt": cache_prompt}
+        if label_ids:
+            body.update(post_sampling_probs=True, temperature=1.0, samplers=["temperature"],
+                        logit_bias=[[i, LABEL_BIAS] for i in label_ids])
+            key, field = "top_probs", "prob"
+        else:
+            body.update(post_sampling_probs=False, temperature=0.0)
+            key, field = "top_logprobs", "logprob"
+        out = self._call("POST", "/completion", body)
         try:
-            top = out["completion_probabilities"][0]["top_logprobs"]
+            top = out["completion_probabilities"][0][key]
         except (KeyError, IndexError, TypeError):
             raise backend_error("llama-server returned no completion_probabilities "
                                 "(is this a llama-server build with n_probs support?)") from None
@@ -109,4 +131,7 @@ class LlamaServer:
                            f"llama-server evaluated {out['tokens_evaluated']} tokens, expected {want}"
                            + (" (were llama-server's image token limits changed, e.g. "
                               "--image-max-tokens?)" if images else ""))
+        if field == "prob":
+            # a probability that underflowed to 0 counts as missing
+            return {int(t["id"]): math.log(t["prob"]) for t in top if t["prob"] > 0}
         return {int(t["id"]): float(t["logprob"]) for t in top}

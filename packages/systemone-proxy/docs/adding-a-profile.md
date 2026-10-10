@@ -329,28 +329,45 @@ needs (e.g. h2o's `threshold`/`decision`) are extra keys, listed in
 7. **Same tokenizer, different model.** All Gemma 4 fine-tunes share one
    tokenizer (sha256 `cc8d3a0c…`), so the startup self-test can't tell them
    apart. `matches` is what distinguishes them; keep it specific.
-8. **Labels outside the top-n.** llama-server returns the top `n_probs`
-   logprobs only. The service asks for at least labels + 64 and bounds any
-   missing label by the smallest returned logprob (warning
-   `label_outside_top_n`). A profile with hundreds of labels relies on this.
-9. **Quantisation.** Temperatures were fitted on bf16/fp8. Validate numbers
+8. **Losing labels sit deep in the vocabulary.** Some models only learned to
+   rank the labels against each other, not to put probability on them:
+   Quyet's best letter gets ~3% of the next-token mass, and losing letters
+   rank as low as 225,000th of 262,144. llama-server's top-n list can't
+   reach them without returning the whole vocabulary (27 MB, 4–15 s per
+   call). The backend therefore biases every label by the same +50 and reads
+   the post-sampling probabilities (see below). Don't go back to the plain
+   top-n list: it bounded missing labels from above, which flattened
+   Quyet's answers. A flat full-vocabulary distribution is normal for these
+   models; only the gaps between labels matter.
+9. **Memory on long prompts.** llama-server keeps up to 32 context
+   checkpoints per slot even when the request sets `cache_prompt: false`; on a
+   long prompt they grow to hundreds of MB and OOM-killed Quyet on the Orin.
+   `llmctl run` adds `--ctx-checkpoints 0` for flagged decision models, which
+   is one more reason step 6 (flagging) matters. Test long states on a
+   machine with headroom, and keep one slot (`--np 1`) where memory is tight.
+10. **Quantisation.** Temperatures were fitted on bf16/fp8. Validate numbers
    on Q8_0; Q4 moves them by a few hundredths.
-10. **JSON rendering.** Python's `json.dumps` defaults (`", "` separators,
+11. **JSON rendering.** Python's `json.dumps` defaults (`", "` separators,
     `ensure_ascii=True`, float repr) are part of the prompt. Use
     `base.py_json` with the vendor's exact options.
-11. **The vendor's docs and code disagree.** Rune's card writes
+12. **The vendor's docs and code disagree.** Rune's card writes
     `json.dumps(state)` but the protocol owner's code keeps non-ASCII raw.
     Follow the code that served the published numbers, and say so in
     `notes`.
 
 ## llama-server facts the backend relies on
 
-- `/completion` with `prompt` as a token-id array, `n_predict: 1`,
-  `n_probs: N`, `post_sampling_probs: false` returns
-  `completion_probabilities[0].top_logprobs`: a log-softmax of the **raw
-  logits over the full vocabulary** (no temperature, no samplers). Softmax
-  over the label logprobs divided by T therefore equals the vendor's softmax
-  over label logits divided by T.
+- The readout call is `/completion` with `prompt` as a token-id array,
+  `n_predict: 1`, `n_probs: labels + 64`, `logit_bias: [[label_id, 50], ...]`,
+  `post_sampling_probs: true`, `temperature: 1`, `samplers: ["temperature"]`.
+  `completion_probabilities[0].top_probs` is then a softmax of logits + bias
+  over the **full vocabulary**. Every label carries the same +50, so the
+  labels rank first and `log p_i − log p_j = logit_i − logit_j` (float32
+  rounding ~1e-5). Softmax over the label log-probabilities divided by T
+  therefore equals the vendor's softmax over label logits divided by T.
+  Checked on Quyet against a full-vocabulary raw read: gaps agree to 3e-6.
+- Without a bias, `post_sampling_probs: false` gives `top_logprobs`, the raw
+  log-softmax, but only the top `n_probs`, and the bias doesn't apply to it.
 - `/tokenize` (`parse_special`) and `/detokenize` back the self-test.
 - `/props` gives `model_path`, `default_generation_settings.n_ctx`,
   `modalities.vision` and the per-process random `media_marker`.

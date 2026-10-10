@@ -601,7 +601,9 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                                "(→ fp8) or f16.")
     # decider.serve speaks the decision protocol itself; on llama/vllm a
     # decision model only serves raw completions.
-    if backend != DECIDER and (spec.decision if spec else backends.is_decision_model(model_path)):
+    decision = backend != DECIDER and (spec.decision if spec
+                                         else backends.is_decision_model(model_path))
+    if decision:
         click.echo(f"note: '{model_path.name}' is a decision model — its answers are "
                    "letter logprobs over a vendor-specific prompt, read by its own "
                    "client. Chat output from it is not meaningful.", err=True)
@@ -688,6 +690,13 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                                spec_n_max=spec_n_max, n_parallel=n_parallel,
                                cache_ram=cache_ram, kv_unified=kv_unified,
                                extra=extra_args)
+        # Decision endpoints never reuse the prompt cache (cache_prompt off), but
+        # llama-server still saves up to 32 context checkpoints per slot, each
+        # tens to hundreds of MB on a long prompt. That OOM-killed Quyet on the
+        # 64 GB Orin. Turn them off unless -X sets them.
+        if decision and not any(a in ("--ctx-checkpoints", "-ctxcp", "--swa-checkpoints")
+                                for a in extra_args):
+            cmd += ["--ctx-checkpoints", "0"]
     # Remember the llmctl-level invocation (with the interactively-picked model
     # made explicit) so `restart`/`autostart list` can show and re-issue it.
     run_args = ([] if ft_path else [model]) + _run_option_args(ctx)
