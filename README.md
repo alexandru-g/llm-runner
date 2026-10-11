@@ -374,6 +374,7 @@ to that model, with **Start** on top so Enter launches with what's shown:
 ```
 ? Launch h2o-lightning-4b.q8_0 on llama  (Enter starts; * = not default)
  » ▶ Start
+     Profile         last  ▸
    * Vision          off (saves ~1 GB)
      Reasoning       off
    * Context         8,192
@@ -393,6 +394,33 @@ model's folder), none, the groups already running in the cluster, and
 "other…" to type a name (see [the registry](#several-machines-as-one-the-registry)).
 Settings are a table in
 `src/llm_runner/launch.py`; adding one is one entry.
+
+**Profiles** set every row at once. The **Profile** row, right under Start,
+opens the list; pick one and press Enter on Start. The menu opens on `last`.
+
+| Profile | For | Sets |
+|---|---|---|
+| `last` | any model | what this model ran with last time (including its group) |
+| `default` | any model | llmctl's defaults |
+| `fast` | chat models with a drafter | MTP on, f16 KV, one slot |
+| `long` | chat models | 128K context, q8_0 KV, drafter off, one slot |
+| `multi` | chat models on llama | 8 GB RAM prompt cache, one slot: several long conversations take turns without reprocessing |
+| `serve` | chat models | 4 slots sharing 64K, q8_0 KV, drafter off, 4 checkpoints |
+| `lean` | chat models | 8K context, no vision, q8_0 KV, drafter off, no checkpoints |
+
+"Chat models" means llama or vLLM, not decision or embedding models; those
+get only `last` and `default`. A profile resets the rows it doesn't set to
+their defaults, except the group. The profiles that quantize the KV cache turn
+the drafter off, because quantized KV drops MTP acceptance to ~0% (the menu
+warns if you combine them by hand). After a profile, change any row; the
+Profile row then reads `long (modified)`.
+
+**Save as profile…** stores the current rows under a name in `profiles.json`.
+Your profile is offered for models on the same backend that have every row it
+sets. `llmctl profile` lists the profiles, `llmctl profile rm NAME` deletes one,
+and `llmctl run MODEL --profile NAME` applies one without the menu (flags typed
+alongside it win). `restart` and autostart record the flags a profile set, not
+its name, so editing a profile never changes a running model.
 
 - Backend: from the model format (`--backend llama|vllm` to force; see
   [vLLM specifics](#vllm-specifics)).
@@ -470,11 +498,12 @@ llmctl run gemma-4-31b-it-q4_k_m --spec-draft-n-max 4
   (`llama-server --kv-unified`), so a slot can use the full `--ctx-size`
   instead of ctx/N. Default on when `--n-parallel > 1`.
 - `--cache-ram <MiB>` — host-RAM prompt cache (`llama-server --cache-ram`),
-  default `0` (off). Enable it (e.g. `16384`) only for workloads whose prompts
-  are long and share a long prefix. On Gemma 4 each saved prompt also carries
-  its sliding-window context checkpoints (~1.7 GB per ~900-token prompt), so
-  for many short, distinct prompts the save costs more than the prefill it
-  spares.
+  default `0` (off). Turn it on (the `multi` profile uses `8192`) when several
+  long conversations take turns on one slot: a 9K-token Gemma conversation
+  came back in 1.3 s instead of 16 s on the Orin, holding ~1.1 GB of RAM.
+  Leave it off for many short, distinct prompts: each call saves its state
+  (~75 MB on Gemma 26B), +33% per call on the RTX, and the cache fills its
+  limit.
 
 Drafters are ignored in `--embeddings` mode.
 

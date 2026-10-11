@@ -39,20 +39,6 @@ def _next_free_port(start: int = 8080) -> int:
     return p
 
 
-# Substrings that mark a GGUF as an embedding model, so `run` can default to
-# --embeddings without an explicit flag. Matched case-insensitively against the
-# model's filename stem. Override either way with --embeddings/--no-embeddings.
-_EMBEDDING_NAME_HINTS = (
-    "bge", "e5", "gte", "nomic-embed", "mxbai-embed", "arctic-embed",
-    "minilm", "embed",
-)
-
-
-def _looks_like_embedding_model(name: str) -> bool:
-    low = name.lower()
-    return any(hint in low for hint in _EMBEDDING_NAME_HINTS)
-
-
 def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size: int,
                      reasoning: bool, *, kv_quant: str = "f16",
                      n_gpu_layers: int = 999, embeddings: bool = False,
@@ -92,12 +78,12 @@ def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size:
         "--ctx-size", str(ctx_size),
         "--flash-attn", "on",
         "--cache-reuse", "256",
-        # Host-RAM prompt cache. Off by default: on models with sliding-window
-        # layers (Gemma 4) every saved prompt carries its SWA context
-        # checkpoints (~1.7 GB for a 900-token prompt), so the save costs more
-        # than the prefill it spares unless prompts are long AND share a long
-        # prefix. Measured on the enersec v2 pipeline: 330 ms/call of cache
-        # memcpy vs 225 ms/call of inference. See --cache-ram.
+        # Host-RAM prompt cache. Off by default: every call saves its state
+        # (~75 MB for a short prompt on Gemma 26B), so short, distinct prompts
+        # pay ~+33% per call on the RTX (llama.cpp b9780; the enersec v2
+        # pipeline once paid +147%) and the cache fills its RAM limit. It pays
+        # off when long conversations take turns on a slot: see --cache-ram
+        # and the `multi` launch profile.
         "--cache-ram", str(cache_ram),
         "--threads", "8",
         "--port", str(port),
@@ -173,12 +159,13 @@ def _run_option_args(ctx: click.Context) -> list[str]:
     """Rebuild the option part of the `llmctl run` argv from the params the
     user passed on the command line (defaults are omitted so re-detection —
     e.g. embeddings-by-filename — still applies on a re-run). ``--port`` is
-    left out: the manifest pins it separately. So are ``--wait`` and
-    ``--menu``: they're about this invocation, not the launch."""
+    left out: the manifest pins it separately. So are ``--wait``, ``--menu``
+    and ``--profile``: they're about this invocation, not the launch (a
+    profile's values are recorded as the flags they set)."""
     src = click.core.ParameterSource.COMMANDLINE
     args: list[str] = []
     for p in ctx.command.params:
-        if not isinstance(p, click.Option) or p.name in ("port", "wait", "menu"):
+        if not isinstance(p, click.Option) or p.name in ("port", "wait", "menu", "profile"):
             continue
         if ctx.get_parameter_source(p.name) != src:
             continue
@@ -448,6 +435,65 @@ def list_cmd() -> None:
         click.echo(f"{key:<{key_w}}  {spec.backend:<7}  {size:>8}  {vision:<6}  {draft:<6}  {decision:<8}  {rel}")
 
 
+def _profile_flags(values: dict) -> str:
+    """A profile's values as the `run` flags they stand for."""
+    opts = {p.name: p for p in run.params if isinstance(p, click.Option)}
+    out = []
+    for name, value in values.items():
+        o = opts.get(name)
+        if o is None:
+            continue
+        if o.is_flag:
+            if value:
+                out.append(o.opts[0])
+        elif value is not None:
+            out.append(f"{o.opts[0]} {value}")
+    return " ".join(out) or "(defaults)"
+
+
+@cli.group("profile", invoke_without_command=True)
+@click.pass_context
+def profile_group(ctx: click.Context) -> None:
+    """Launch profiles: named sets of `run` options.
+
+    Pick one in the launch menu's Profile row, or with `llmctl run MODEL
+    --profile NAME`. Save your own from the menu (Save as profile…).
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(profile_list)
+
+
+@profile_group.command("list")
+def profile_list() -> None:
+    """List the built-in profiles and yours."""
+    from llm_runner import launch
+    rows = [("last", "any model", "its last run (launch.json)", ""),
+            ("default", "any model", "llmctl's defaults", "")]
+    rows += [(p.name, p.audience, p.blurb,
+              _profile_flags(p.values)) for p in launch.PROFILES]
+    rows += [(n, f"chat on {r.get('backend', '?')}", "yours", _profile_flags(r["values"]))
+             for n, r in sorted(launch.user_profiles().items())]
+    w = [max(len(r[i]) for r in rows) for i in range(3)]
+    click.echo(f"{'NAME':<{w[0]}}  {'FOR':<{w[1]}}  {'USE':<{w[2]}}  SETS")
+    for name, for_, use, sets in rows:
+        click.echo(f"{name:<{w[0]}}  {for_:<{w[1]}}  {use:<{w[2]}}  {sets}".rstrip())
+    click.echo("\nchat: llama or vllm, not decision or embedding models. A profile "
+               "resets the rows it doesn't set to their defaults; the group stays.")
+
+
+@profile_group.command("rm")
+@click.argument("name")
+def profile_rm(name: str) -> None:
+    """Delete one of your profiles."""
+    from llm_runner import launch
+    if name in launch.RESERVED:
+        raise click.UsageError(f"'{name}' is built in.")
+    if not launch.delete_profile(name):
+        raise click.UsageError(f"No profile '{name}'. Yours: "
+                               + (", ".join(launch.user_profiles()) or "(none)"))
+    click.echo(f"Deleted profile '{name}'.")
+
+
 @cli.command()
 @click.argument("model", required=False)
 @click.option("--backend", type=click.Choice(["auto", LLAMA, VLLM, DECIDER]), default="auto",
@@ -477,6 +523,11 @@ def list_cmd() -> None:
               help="Show the launch-options menu (vision, drafter, reasoning, "
                    "context, KV cache, slots) before starting. On by default when "
                    "MODEL is picked interactively; choices are remembered per model.")
+@click.option("--profile", "profile", default=None, metavar="NAME",
+              help="Set the launch options from a profile: last, default, fast, "
+                   "long, multi, serve, lean, or one saved from the menu (`llmctl "
+                   "profile list`). Flags typed alongside it win. With the menu, "
+                   "the menu opens on it.")
 @click.option("--extra", "-X", "extra", multiple=True,
               help="Extra argument(s) appended verbatim to the server command; "
                    "repeatable, each value is shell-split. e.g. "
@@ -551,10 +602,12 @@ def list_cmd() -> None:
                    "own default otherwise.")
 @click.option("--cache-ram", "cache_ram", type=int, default=0, show_default=True,
               help="Host-RAM prompt cache in MiB (llama-server --cache-ram). "
-                   "0 disables it. Only worth enabling for long prompts that "
-                   "share a long prefix (e.g. 16384 for a multi-KB system prompt "
-                   "reused across calls); for many short, mostly-distinct "
-                   "prompts the per-call state save costs more than it saves.")
+                   "0 disables it. Worth enabling when several long conversations "
+                   "take turns on one slot: each comes back from RAM instead of "
+                   "being reprocessed (a 9K-token Gemma switch on the Orin: 16 s "
+                   "-> 1.3 s; ~1.1 GB of RAM each). Short, distinct prompts pay "
+                   "for the per-call save (+33% with Gemma 26B on the RTX) and "
+                   "fill the limit. The `multi` profile sets it.")
 @click.option("--embeddings/--no-embeddings", "embeddings", default=None,
               help="Run as an embedding server instead of a chat/completion "
                    "server (drops flash-attn, prompt cache, reasoning). "
@@ -574,7 +627,7 @@ def list_cmd() -> None:
 @click.pass_context
 def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         ctx_size: int | None, ft_path: Path | None, ft_name: str | None,
-        group_name: str | None, wait: bool, menu: bool | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
+        group_name: str | None, wait: bool, menu: bool | None, profile: str | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
         reasoning: bool,
         kv_quant: str, gpu_mem: float | None, tool_parser: str | None,
         reasoning_parser: str | None, trust_remote_code: bool,
@@ -591,6 +644,8 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     """
     spec: ModelSpec | None = None
     if ft_path:
+        if profile:
+            raise click.UsageError("--profile needs a model from the registry, not --ft.")
         name = ft_name or f"ft:{ft_path.stem if ft_path.is_file() else ft_path.name}"
         model_path = ft_path.resolve()
         mmproj: Path | None = None
@@ -611,12 +666,18 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                 f"Unknown model '{model}'. Available:\n  {available}"
             )
         spec = specs[model]
-        if (menu or (menu is None and picked)) and sys.stdin.isatty():
+        if ((menu or (menu is None and picked)) and sys.stdin.isatty()) or profile:
             from llm_runner import launch
             target = launch.Target(spec, spec.backend if backend == "auto" else backend)
-            if launch.configure(ctx, target):
+            if (menu or (menu is None and picked)) and sys.stdin.isatty():
+                shown = launch.configure(ctx, target, profile)
+            else:
+                launch.apply_profile(ctx, target, profile)
+                shown = True
+            if shown:
                 # Start over with the chosen values, as if they had been typed.
-                return ctx.invoke(run.callback, **{**ctx.params, "model": model, "menu": False})
+                return ctx.invoke(run.callback, **{**ctx.params, "model": model,
+                                                   "menu": False, "profile": None})
         model_path = spec.model_path
         mmproj = None if no_vision else spec.mmproj_path
         name = ft_name or spec.key
@@ -651,7 +712,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     # Default embeddings mode by filename when the user didn't force it.
     stem = model_path.stem if model_path.is_file() else model_path.name
     if embeddings is None:
-        embeddings = _looks_like_embedding_model(stem)
+        embeddings = registry.looks_like_embedding_model(stem)
         if embeddings:
             click.echo(f"Detected embedding model '{stem}' — starting "
                        "in --embeddings mode (use --no-embeddings to override).")
@@ -1202,6 +1263,11 @@ def _proxy_attached_to(port: int) -> list[proc.RunningProcess]:
               help="Backend calls in flight per request (default: the model's --parallel).")
 @click.option("--wait/--no-wait", "wait", default=True, show_default=True,
               help="Wait until the endpoint is up (it self-tests the GGUF first).")
+@click.option("--profile", "profile", default=None, metavar="NAME",
+              help="Set the launch options from a profile: last, default, fast, "
+                   "long, multi, serve, lean, or one saved from the menu (`llmctl "
+                   "profile list`). Flags typed alongside it win. With the menu, "
+                   "the menu opens on it.")
 @click.option("--extra", "-X", "extra", multiple=True,
               help="Extra argument(s) for `systemone-proxy serve`.")
 def decide_start(identifier: str | None, port: int | None, profile: str | None, cache: str,

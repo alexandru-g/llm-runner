@@ -5,6 +5,12 @@ it (vision, drafter, reasoning, context, ...) with Start on top, so Enter
 launches straight away. Picking a setting toggles it (two values) or opens
 its value list. Choices are remembered per model and offered next time.
 
+A *profile* fills every row at once: ``last`` (this model's previous run),
+``default``, the built-in :data:`PROFILES` (fast, long, multi, serve, lean) and the
+user's own, saved from the menu. Only profiles that fit the model are
+offered: ``fast`` needs a drafter, and decision and embedding models get no
+profiles at all (their defaults are their profile).
+
 Each setting is a row in :data:`SETTINGS` naming a ``run`` option: the menu
 writes the chosen values into the click context as if typed on the command
 line, so ``restart`` and autostart reproduce them. Adding a setting is one
@@ -22,9 +28,10 @@ import click
 
 from llm_runner import process as proc
 from llm_runner.backends import DECIDER, GATEWAY, LLAMA, VLLM
-from llm_runner.registry import ModelSpec, default_group
+from llm_runner.registry import ModelSpec, default_group, looks_like_embedding_model
 
 CHOICES_FILE = proc.STATE_DIR / "launch.json"
+PROFILES_FILE = proc.STATE_DIR / "profiles.json"
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 
 
@@ -108,6 +115,10 @@ SETTINGS: list[Setting] = [
             lambda t: t.backend in (LLAMA, VLLM)),
     Setting("ctx_checkpoints", "Checkpoints", _checkpoint_values,
             lambda t: t.backend == LLAMA),
+    Setting("cache_ram", "Prompt cache",
+            lambda t: [(0, "off"), (2048, "2 GB of RAM"), (8192, "8 GB of RAM"),
+                       (16384, "16 GB of RAM")],
+            lambda t: t.backend == LLAMA),
     Setting("n_parallel", "Parallel slots",
             lambda t: [(None, "auto"), (1, "1"), (2, "2"), (4, "4"), (8, "8")],
             lambda t: True),
@@ -116,22 +127,90 @@ SETTINGS: list[Setting] = [
 ]
 
 
-def _load_choices() -> dict:
+@dataclass(frozen=True)
+class Profile:
+    name: str
+    blurb: str
+    values: dict[str, Any]      # the rows it sets; every other row goes to its default
+    applies: Callable[[Target], bool] = lambda t: True
+    user: bool = False
+    audience: str = "chat"          # for `llmctl profile list`
+
+
+def _chat(t: Target) -> bool:
+    return t.backend in (LLAMA, VLLM)
+
+
+# Quantized KV zeroes MTP acceptance in llama.cpp, so the profiles that
+# quantize it also drop the drafter (and free its memory).
+PROFILES: list[Profile] = [
+    Profile("fast", "single-user speed",
+            {"no_draft": False, "kv_quant": "f16", "n_parallel": 1},
+            lambda t: _chat(t) and t.spec.has_draft, audience="chat, drafter"),
+    Profile("long", "long documents and code",
+            {"ctx_size": 131072, "kv_quant": "q8_0", "no_draft": True, "n_parallel": 1}, _chat),
+    # Gemma's sliding-window attention can't resume a conversation another
+    # one has replaced in the slot; the RAM cache brings it back (on the Orin,
+    # a 9K-token switch went from 16 s to 1.3 s; short prompts pay ~8%).
+    Profile("multi", "several long conversations in turn",
+            {"cache_ram": 8192, "n_parallel": 1}, lambda t: t.backend == LLAMA,
+            audience="chat on llama"),
+    Profile("serve", "many clients at once",
+            {"ctx_size": 65536, "kv_quant": "q8_0", "no_draft": True, "n_parallel": 4,
+             "ctx_checkpoints": 4}, _chat),
+    Profile("lean", "least memory",
+            {"no_vision": True, "ctx_size": 8192, "kv_quant": "q8_0", "no_draft": True,
+             "ctx_checkpoints": 0, "n_parallel": 1}, _chat),
+]
+RESERVED = {"last", "default"} | {p.name for p in PROFILES}
+# Who the model is, not how it runs: profiles neither set nor reset these.
+KEEP = {"group_name"}
+
+
+def _load(path) -> dict:
     try:
-        data = json.loads(CHOICES_FILE.read_text())
+        data = json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _store(path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _load_choices() -> dict:
+    return _load(CHOICES_FILE)
 
 
 def _save_choices(key: str, chosen: dict) -> None:
     data = _load_choices()
     data[key] = chosen
     try:
-        CHOICES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CHOICES_FILE.write_text(json.dumps(data, indent=2) + "\n")
+        _store(CHOICES_FILE, data)
     except OSError:
         pass  # remembering is a convenience
+
+
+def user_profiles() -> dict[str, dict]:
+    """``{name: {"backend": ..., "values": {...}}}`` from profiles.json."""
+    return {k: v for k, v in _load(PROFILES_FILE).items()
+            if isinstance(v, dict) and isinstance(v.get("values"), dict)}
+
+
+def save_profile(name: str, backend: str, values: dict) -> None:
+    data = _load(PROFILES_FILE)
+    data[name] = {"backend": backend, "values": values}
+    _store(PROFILES_FILE, data)
+
+
+def delete_profile(name: str) -> bool:
+    data = _load(PROFILES_FILE)
+    if data.pop(name, None) is None:
+        return False
+    _store(PROFILES_FILE, data)
+    return True
 
 
 def _title(values: list[tuple[Any, str]], value: Any) -> str:
@@ -141,51 +220,193 @@ def _title(values: list[tuple[Any, str]], value: Any) -> str:
     return str(value)
 
 
-def configure(ctx: click.Context, target: Target) -> bool:
+class _Menu:
+    """The settings that apply to one launch, their defaults, and the
+    profiles that fit."""
+
+    def __init__(self, ctx: click.Context, target: Target):
+        params = {p.name: p for p in ctx.command.params}
+        self.ctx, self.target = ctx, target
+        self.settings = [s for s in SETTINGS if s.applies(target) and s.param in params]
+        self.defaults = {s.param: params[s.param].default for s in self.settings}
+        self.remembered = _load_choices().get(target.spec.key)
+
+    def typed(self, param: str) -> bool:
+        return self.ctx.get_parameter_source(param) == click.core.ParameterSource.COMMANDLINE
+
+    @property
+    def tunable(self) -> bool:
+        """Whether profiles apply: chat models on llama or vLLM."""
+        emb = self.ctx.params.get("embeddings")
+        if emb is None:
+            path = self.target.spec.model_path
+            emb = looks_like_embedding_model(path.stem if path.is_file() else path.name)
+        return _chat(self.target) and not self.target.decision and not emb
+
+    def _valid(self, s: Setting, value: Any) -> bool:
+        return (s.custom is not None and isinstance(value, str)) or \
+            value in [v for v, _ in s.values(self.target)]
+
+    def _fits(self, values: dict) -> bool:
+        by_param = {s.param: s for s in self.settings}
+        return all(k in by_param and self._valid(by_param[k], v) for k, v in values.items())
+
+    def profiles(self) -> list[Profile]:
+        out = []
+        if self.remembered is not None:
+            # The one profile that also restores the group.
+            out.append(Profile("last", "this model's last run", dict(self.remembered)))
+        out.append(Profile("default", "llmctl's defaults", {}))
+        if not self.tunable:
+            return out
+        out += [p for p in PROFILES if p.applies(self.target)]
+        for name, rec in sorted(user_profiles().items()):
+            values = {k: v for k, v in rec["values"].items() if k not in KEEP}
+            if name not in RESERVED and rec.get("backend") == self.target.backend \
+                    and self._fits(values):
+                out.append(Profile(name, "yours", values, user=True))
+        return out
+
+    def find(self, name: str) -> Profile:
+        found = {p.name: p for p in self.profiles()}
+        if name not in found:
+            raise click.BadParameter(
+                f"no profile '{name}' for {self.target.spec.key} on {self.target.backend}; "
+                f"choose from: {', '.join(found)}", param_hint="'--profile'")
+        return found[name]
+
+    def resolve(self, profile: Profile, current: dict) -> dict:
+        """Every row as ``profile`` sets it: its values, defaults elsewhere
+        (rows in :data:`KEEP` stay as they are unless it names them)."""
+        out = {}
+        for s in self.settings:
+            if s.param in profile.values and self._valid(s, profile.values[s.param]):
+                out[s.param] = profile.values[s.param]
+            else:
+                out[s.param] = current[s.param] if s.param in KEEP else self.defaults[s.param]
+        return out
+
+    def summary(self, values: dict) -> str:
+        parts = [f"{s.label} {_title(s.values(self.target), values[s.param])}"
+                 for s in self.settings
+                 if s.param not in KEEP and values[s.param] != self.defaults[s.param]]
+        return " · ".join(parts) or "all defaults"
+
+    def warning(self, current: dict) -> str | None:
+        if self.target.backend == LLAMA and self.target.spec.has_draft \
+                and current.get("no_draft") is False and current.get("kv_quant", "f16") != "f16":
+            return ("quantized KV drops MTP acceptance to ~0%: "
+                    "turn the drafter off, or use f16")
+        return None
+
+    def commit(self, current: dict) -> None:
+        src = click.core.ParameterSource
+        for name, value in current.items():
+            self.ctx.params[name] = value
+            # As if typed, so `restart` / autostart re-issue it; a default stays
+            # unrecorded so run's own defaulting still applies on re-runs.
+            self.ctx.set_parameter_source(
+                name, src.COMMANDLINE if value != self.defaults[name] else src.DEFAULT)
+        _save_choices(self.target.spec.key,
+                      {k: v for k, v in current.items() if v != self.defaults[k]})
+
+
+def apply_profile(ctx: click.Context, target: Target, name: str) -> None:
+    """``run --profile NAME`` without the menu: set its rows in ``ctx.params``
+    (flags typed alongside it win)."""
+    m = _Menu(ctx, target)
+    current = m.resolve(m.find(name), {s.param: ctx.params[s.param] for s in m.settings})
+    for s in m.settings:
+        if m.typed(s.param):
+            current[s.param] = ctx.params[s.param]
+    m.commit(current)
+
+
+def _ask(question):
+    answer = question.ask()
+    if answer is None:
+        raise click.Abort()
+    return answer
+
+
+def configure(ctx: click.Context, target: Target, profile: str | None = None) -> bool:
     """Show the menu and write the chosen values into ``ctx.params``. Returns
-    False when no setting applies (nothing shown)."""
+    False when no setting applies (nothing shown). ``profile`` preselects one;
+    otherwise the menu opens on ``last`` (or ``default`` the first time)."""
     import questionary
 
-    src = click.core.ParameterSource
-    params = {p.name: p for p in ctx.command.params}
-    settings = [s for s in SETTINGS if s.applies(target) and s.param in params]
-    if not settings:
+    m = _Menu(ctx, target)
+    if not m.settings:
         return False
+    settings, defaults = m.settings, m.defaults
 
-    defaults = {s.param: params[s.param].default for s in settings}
-    remembered = _load_choices().get(target.spec.key, {})
-    current: dict[str, Any] = {}
+    start = {s.param: ctx.params[s.param] for s in settings}
+    chosen = m.find(profile) if profile else m.profiles()[0]
+    current = m.resolve(chosen, start)
     for s in settings:
-        valid = [v for v, _ in s.values(target)]
-        if ctx.get_parameter_source(s.param) == src.COMMANDLINE:
+        if m.typed(s.param):
             current[s.param] = ctx.params[s.param]       # typed: wins
-        elif s.param in remembered and (remembered[s.param] in valid or s.custom):
-            current[s.param] = remembered[s.param]
-        else:
-            current[s.param] = defaults[s.param]
 
-    width = max(len(s.label) for s in settings)
+    width = max([len("Profile")] + [len(s.label) for s in settings])
     cursor: Any = "start"
     while True:
-        changed = [s for s in settings if current[s.param] != defaults[s.param]]
+        profiles = m.profiles()
+        matching = [p.name for p in profiles if m.resolve(p, current) == current]
+        if chosen.name not in matching and matching:
+            chosen = next(p for p in profiles if p.name == matching[0])
+        shown = chosen.name if chosen.name in matching else f"{chosen.name} (modified)"
         choices = [questionary.Choice("▶ Start", value="start")]
+        if len(profiles) > 1:
+            choices.append(questionary.Choice(
+                f"  {'Profile':<{width}}  {shown}  ▸", value="profile"))
         for s in settings:
             mark = "*" if current[s.param] != defaults[s.param] else " "
             choices.append(questionary.Choice(
                 f"{mark} {s.label:<{width}}  {_title(s.values(target), current[s.param])}",
                 value=s.param))
-        if changed:
+        warning = m.warning(current)
+        if warning:
+            choices.append(questionary.Separator(f"  ⚠ {warning}"))
+        if m.tunable:
+            choices.append(questionary.Choice("＋ Save as profile…", value="save"))
+        if any(current[s.param] != defaults[s.param] for s in settings):
             choices.append(questionary.Choice("↺ Reset to defaults", value="reset"))
-        picked = questionary.select(
+        picked = _ask(questionary.select(
             f"Launch {target.spec.key} on {target.backend}  (Enter starts; * = not default)",
             choices=choices, default=next((c for c in choices if c.value == cursor), choices[0]),
-            use_shortcuts=False, instruction=" ").ask()
-        if picked is None:
-            raise click.Abort()
+            use_shortcuts=False, instruction=" "))
         if picked == "start":
             break
         if picked == "reset":
             current = dict(defaults)
+            cursor = "start"
+            continue
+        if picked == "profile":
+            pw = max(len(p.name) for p in profiles)
+            bw = max(len(p.blurb) for p in profiles)
+            sub = [questionary.Choice(
+                f"{p.name:<{pw}}  {p.blurb:<{bw}}  [{m.summary(m.resolve(p, current))}]", value=i)
+                for i, p in enumerate(profiles)]
+            at = next((i for i, p in enumerate(profiles) if p.name == chosen.name), 0)
+            i = _ask(questionary.select("Profile:", choices=sub, default=sub[at],
+                                        use_shortcuts=False, instruction=" "))
+            chosen = profiles[i]
+            current = m.resolve(chosen, current)
+            cursor = "start"        # a profile is usually the last thing to pick
+            continue
+        if picked == "save":
+            name = _ask(questionary.text(
+                "Profile name:", validate=lambda x: (
+                    "letters, digits, '.', '_' and '-'" if not _NAME.fullmatch(x.strip())
+                    else f"'{x.strip()}' is built in; pick another name"
+                    if x.strip() in RESERVED else True))).strip()
+            if name in user_profiles() and not _ask(questionary.confirm(
+                    f"Replace your profile '{name}'?", default=False)):
+                continue
+            save_profile(name, target.backend,
+                         {k: v for k, v in current.items()
+                          if k not in KEEP and v != defaults[k]})
+            chosen = next(p for p in m.profiles() if p.name == name)
             cursor = "start"
             continue
         s = next(x for x in settings if x.param == picked)
@@ -199,25 +420,15 @@ def configure(ctx: click.Context, target: Target) -> bool:
             if s.custom:
                 sub.append(questionary.Choice("other…", value="custom"))
             at = next((i for i, (v, _) in enumerate(values) if v == current[s.param]), 0)
-            i = questionary.select(f"{s.label}:", choices=sub, default=sub[at],
-                                   use_shortcuts=False, instruction=" ").ask()
-            if i is None:
-                raise click.Abort()
+            i = _ask(questionary.select(f"{s.label}:", choices=sub, default=sub[at],
+                                        use_shortcuts=False, instruction=" "))
             if i == "custom":
-                typed = questionary.text(
+                current[s.param] = _ask(questionary.text(
                     s.custom, validate=lambda x: bool(_NAME.fullmatch(x.strip())) or
-                    "letters, digits, '.', '_' and '-'").ask()
-                if typed is None:
-                    raise click.Abort()
-                current[s.param] = typed.strip()
+                    "letters, digits, '.', '_' and '-'")).strip()
             else:
                 current[s.param] = values[i][0]
         cursor = s.param
 
-    for name, value in current.items():
-        ctx.params[name] = value
-        # As if typed, so `restart` / autostart re-issue it; a default stays
-        # unrecorded so run's own defaulting still applies on re-runs.
-        ctx.set_parameter_source(name, src.COMMANDLINE if value != defaults[name] else src.DEFAULT)
-    _save_choices(target.spec.key, {k: v for k, v in current.items() if v != defaults[k]})
+    m.commit(current)
     return True

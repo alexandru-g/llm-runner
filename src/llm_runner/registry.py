@@ -91,6 +91,20 @@ class ModelSpec:
         return self.draft_path is not None
 
 
+# Substrings that mark a GGUF as an embedding model, so `run` can default to
+# --embeddings without an explicit flag. Matched case-insensitively against the
+# model's filename stem. Override either way with --embeddings/--no-embeddings.
+_EMBEDDING_NAME_HINTS = (
+    "bge", "e5", "gte", "nomic-embed", "mxbai-embed", "arctic-embed",
+    "minilm", "embed",
+)
+
+
+def looks_like_embedding_model(name: str) -> bool:
+    low = name.lower()
+    return any(hint in low for hint in _EMBEDDING_NAME_HINTS)
+
+
 def _find_mmproj(folder: Path) -> Path | None:
     matches = sorted(f for f in folder.glob("*.gguf") if "mmproj" in f.name.lower())
     return matches[0] if matches else None
