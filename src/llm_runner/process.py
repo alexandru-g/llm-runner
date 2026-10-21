@@ -19,6 +19,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from llm_runner.backends import with_bind_host
+
 
 def _resolve_state_dir() -> Path:
     env = os.environ.get("LLM_RUNNER_STATE_DIR")
@@ -177,10 +179,12 @@ def autostart_sync() -> tuple[list[LaunchSpec], list[LaunchSpec]]:
     return kept, dropped
 
 
-def restore(names: list[str] | None = None) -> list[tuple[LaunchSpec, str]]:
+def restore(names: list[str] | None = None,
+            host: str | None = None) -> list[tuple[LaunchSpec, str]]:
     """Relaunch manifest models that aren't already running.
 
     ``names`` restricts the set (default: everything in the manifest).
+    ``host``, when given, replaces the listen address each entry recorded.
     Idempotent: a model whose name is already live is left alone. Ports are
     pinned — an entry whose port is taken is reported, not moved. Returns
     ``(spec, status)`` pairs for reporting, where status is ``"started …"``,
@@ -212,7 +216,8 @@ def restore(names: list[str] | None = None) -> list[tuple[LaunchSpec, str]]:
             continue
         claimed.add(spec.port)
         try:
-            rec = start(name=spec.name, cmd=spec.cmd, port=spec.port,
+            cmd = spec.cmd if host is None else with_bind_host(spec.cmd, spec.backend, host)
+            rec = start(name=spec.name, cmd=cmd, port=spec.port,
                         model_path=spec.model_path, run_args=spec.run_args,
                         backend=spec.backend, env=spec.env, group=spec.group)
             results.append((spec, f"started pid={rec.pid} port={rec.port}"))

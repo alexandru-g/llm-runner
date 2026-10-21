@@ -45,6 +45,19 @@ GATEWAY = "gateway"
 BACKENDS = (LLAMA, VLLM, DECIDER)
 
 
+def with_bind_host(cmd: list[str], backend: str, host: str) -> list[str]:
+    """``cmd`` set to listen on ``host``. A recorded command keeps the address
+    it was launched with, so replaying one (restore, restart) rewrites it to
+    the current ``llmctl config bind``."""
+    cmd = list(cmd)
+    if "--host" in cmd[:-1]:
+        cmd[cmd.index("--host") + 1] = host
+    elif backend in (DECIDE, GATEWAY):
+        # Recorded before llmctl passed --host; both default to 0.0.0.0.
+        cmd += ["--host", host]
+    return cmd
+
+
 # ---------------------------------------------------------------- binaries --
 
 def find_llama_server() -> str | None:
@@ -359,10 +372,11 @@ def build_vllm_cmd(vllm_bin: str, model_path: Path, *, name: str, port: int,
                    tool_parser: str | None = None,
                    reasoning_parser: str | None = None,
                    trust_remote_code: bool = False,
+                   host: str = "0.0.0.0",
                    extra: list[str] | None = None) -> list[str]:
     cmd = [
         vllm_bin, "serve", str(model_path),
-        "--host", "0.0.0.0",
+        "--host", host,
         "--port", str(port),
         # Stable model id for /v1 clients (otherwise it's the full path).
         "--served-model-name", name,
@@ -429,12 +443,13 @@ DECIDER_DEFAULT_ENV = {
 
 def build_decider_cmd(uvicorn_bin: str, decider_dir: Path, model_path: Path, *,
                       port: int, n_parallel: int | None = None,
+                      host: str = "0.0.0.0",
                       extra: list[str] | None = None) -> tuple[list[str], dict[str, str]]:
     """``(argv, env)`` for ``decider.serve``. The model and every knob travel
     in the environment (that is the server's interface); ``--app-dir`` makes
     the package importable without a cwd change."""
     cmd = [uvicorn_bin, "decider.serve:app", "--app-dir", str(decider_dir),
-           "--host", "0.0.0.0", "--port", str(port)]
+           "--host", host, "--port", str(port)]
     if extra:
         cmd += extra
     env = dict(DECIDER_DEFAULT_ENV)

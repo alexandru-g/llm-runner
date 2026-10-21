@@ -161,6 +161,45 @@ def test_streaming_passes_chunks_through(env):
     conn.close()
 
 
+class _BrokenStream(_Upstream):
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        self.wfile.write(b"9\r\ndata: 0\n\n\r\n")
+        self.wfile.flush()
+        self.close_connection = True       # dies before the last chunk
+
+
+def test_upstream_dying_mid_stream_is_logged(tmp_path, capsys):
+    up = _serve(_BrokenStream)
+    state = tmp_path / "running.json"
+    state.write_text(json.dumps([_record("gemma", up.server_address[1])]))
+    httpd = gw.make_server(0, "127.0.0.1", gw.Gateway(gw.LocalModels(state)))
+    threading.Thread(target=httpd.serve_forever, args=(0.05,), daemon=True).start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=5)
+        conn.request("POST", "/v1/chat/completions",
+                     body=json.dumps({"model": "gemma", "stream": True}),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        with pytest.raises(http.client.IncompleteRead):
+            resp.read()
+        conn.close()
+        out = ""
+        for _ in range(40):              # the gateway logs from its own thread
+            out += capsys.readouterr().out
+            if "relay:" in out:
+                break
+            time.sleep(0.05)
+        assert "relay: upstream broke: POST /v1/chat/completions" in out
+        assert "after 9 bytes" in out
+    finally:
+        up.shutdown(); httpd.shutdown()
+
+
 def test_keep_alive_serves_several_requests(env):
     conn = http.client.HTTPConnection("127.0.0.1", env["port"], timeout=5)
     for name in ("glm", "gemma", "glm"):

@@ -48,6 +48,7 @@ def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size:
                      n_parallel: int | None = None,
                      cache_ram: int = 0,
                      kv_unified: bool | None = None,
+                     host: str = "0.0.0.0",
                      extra: list[str] | None = None) -> list[str]:
     if embeddings:
         # Embedding models (e.g. BERT-style bge-m3) take no chat/generation
@@ -66,7 +67,7 @@ def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size:
             "--ubatch-size", str(ubatch),
             "--threads", "8",
             "--port", str(port),
-            "--host", "0.0.0.0",
+            "--host", host,
             "--embeddings",
             "--pooling", pooling,
             *(extra or []),
@@ -87,7 +88,7 @@ def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size:
         "--cache-ram", str(cache_ram),
         "--threads", "8",
         "--port", str(port),
-        "--host", "0.0.0.0",
+        "--host", host,
     ]
     if n_parallel is not None:
         cmd.extend(["--parallel", str(n_parallel)])
@@ -380,6 +381,37 @@ def config_gateway(port: int | None, off: bool) -> None:
     if gw and gw.port != port:
         click.echo(f"note: the running gateway is on {gw.port}; "
                    "`llmctl gateway stop && llmctl gateway start` moves it.", err=True)
+
+
+@config.command("bind")
+@click.argument("host", required=False)
+@click.option("--reset", is_flag=True, help=f"Back to {config_mod.DEFAULT_BIND_HOST} "
+                                           "(every interface).")
+def config_bind(host: str | None, reset: bool) -> None:
+    """Set the address the gateway and every backend listen on.
+
+    The default, 0.0.0.0, listens on every interface. 127.0.0.1 keeps
+    everything on this machine, behind whatever proxy fronts it. Applies to
+    what starts next; running models and the gateway keep their address until
+    restarted (`llmctl restart`). With no HOST, print the current setting.
+    """
+    if reset:
+        host = config_mod.DEFAULT_BIND_HOST
+    if host is None:
+        click.echo(config_mod.get_bind_host())
+        return
+    try:
+        socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise click.BadParameter(f"can't resolve '{host}': {e}", param_hint="HOST")
+    config_mod.set_bind_host(host)
+    click.echo(f"bind address set to {host}")
+    if config_mod.get_cluster().enabled and host in ("127.0.0.1", "localhost", "::1"):
+        click.echo("warning: this machine is in a cluster; other nodes can't reach a "
+                   "gateway on loopback.", err=True)
+    if proc.list_running():
+        click.echo("note: running processes keep their address until restarted "
+                   "(`llmctl restart`).", err=True)
 
 
 @config.command("models-dir")
@@ -747,7 +779,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         assert decider_dir is not None  # _require_backend found uvicorn under it
         cmd, launch_env = backends.build_decider_cmd(
             binary, decider_dir, model_path, port=chosen_port,
-            n_parallel=n_parallel, extra=extra_args)
+            n_parallel=n_parallel, host=config_mod.get_bind_host(), extra=extra_args)
         env = {**launch_env, **env}      # -E overrides the profile defaults
     elif backend == VLLM:
         if gpu_mem is None:
@@ -762,7 +794,8 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
             embeddings=embeddings, draft_path=draft_path, spec_type=spec_type,
             spec_n_max=spec_n_max, tool_parser=tool_parser,
             reasoning_parser=reasoning_parser,
-            trust_remote_code=trust_remote_code, extra=extra_args)
+            trust_remote_code=trust_remote_code, host=config_mod.get_bind_host(),
+            extra=extra_args)
     else:
         # Known llama.cpp footgun: quantizing the *target* KV cache zeroes MTP /
         # speculative acceptance, so the drafter runs but never gets accepted —
@@ -790,7 +823,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                                draft_path=draft_path, spec_type=spec_type,
                                spec_n_max=spec_n_max, n_parallel=n_parallel,
                                cache_ram=cache_ram, kv_unified=kv_unified,
-                               extra=extra_args)
+                               host=config_mod.get_bind_host(), extra=extra_args)
         # Report the llmctl name as the model id (as vLLM's --served-model-name
         # does) instead of the GGUF path, so it matches the gateway's /v1/models.
         if not any(a in ("--alias", "-a") for a in extra_args):
@@ -1110,7 +1143,7 @@ def restore(names: tuple[str, ...]) -> None:
     for backend in sorted(wanted):
         if backends.find(backend) is None:
             click.echo(f"warning: {backends.missing_hint(backend)}", err=True)
-    results = proc.restore(list(names) or None)
+    results = proc.restore(list(names) or None, host=config_mod.get_bind_host())
     if not results:
         click.echo("Nothing to restore (autostart manifest is empty).")
         return
@@ -1205,8 +1238,10 @@ def _restart_one(ctx: click.Context, identifier: str,
 
     if not spec.run_args:
         # Recorded without `run` args (a decision endpoint, the gateway, or a
-        # legacy entry): relaunch the resolved server command as-is.
-        rec = proc.start(name=spec.name, cmd=spec.cmd, port=spec.port,
+        # legacy entry): relaunch the resolved server command, on the current
+        # bind address.
+        cmd = backends.with_bind_host(spec.cmd, spec.backend, config_mod.get_bind_host())
+        rec = proc.start(name=spec.name, cmd=cmd, port=spec.port,
                          model_path=spec.model_path, backend=spec.backend,
                          env=spec.env, group=spec.group)
         click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}")
@@ -1311,6 +1346,7 @@ def decide_start(identifier: str | None, port: int | None, profile: str | None, 
                        if "--parallel" in cmd[:-1] and cmd[cmd.index("--parallel") + 1].isdigit()
                        else 1)
     cmd = [binary, "serve", "--backend", f"http://127.0.0.1:{target.port}",
+           "--host", config_mod.get_bind_host(),
            "--port", str(chosen_port), "--profile", profile,
            "--concurrency", str(concurrency), "--cache", cache,
            *[tok for chunk in extra for tok in shlex.split(chunk)]]
@@ -1371,11 +1407,17 @@ def _gateway_record() -> proc.RunningProcess | None:
 
 
 def _gateway_url(port: int) -> str:
-    return f"http://{socket.gethostname()}:{port}/v1"
+    host = config_mod.get_bind_host()
+    if host in ("0.0.0.0", "::"):
+        host = socket.gethostname()
+    elif ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{port}/v1"
 
 
 def _start_gateway(port: int) -> proc.RunningProcess:
-    cmd = [sys.executable, "-m", "llm_runner", "gateway", "serve", "--port", str(port)]
+    cmd = [sys.executable, "-m", "llm_runner", "gateway", "serve", "--port", str(port),
+           "--host", config_mod.get_bind_host()]
     return proc.start(name="gateway", cmd=cmd, port=port, model_path="", backend=GATEWAY)
 
 

@@ -9,7 +9,8 @@ Settings: ``models_dir`` (where GGUF / HF checkpoints live), ``vllm_bin``
 (path to the ``vllm`` CLI when it isn't on PATH) and ``decider_dir`` (the
 Mapika/decider clone whose venv serves decider checkpoints) and
 ``gateway_port`` (the all-models port started with the first model, or
-``"off"``), plus the cluster settings: ``node_name``, ``node_priority``,
+``"off"``), ``bind_host`` (the address the gateway and every backend listen
+on, default ``0.0.0.0``), plus the cluster settings: ``node_name``, ``node_priority``,
 ``node_advertise``, ``registry_url``, ``cluster_token`` and
 ``registry_serve`` (see ``cluster.py``). Environment variables still
 take precedence over persisted config (see ``registry._resolve_models_dir``
@@ -121,6 +122,19 @@ def set_gateway_port(port: int | None) -> None:
     cfg = load()
     cfg["gateway_port"] = "off" if port is None else int(port)
     save(cfg)
+
+
+DEFAULT_BIND_HOST = "0.0.0.0"
+
+
+def get_bind_host() -> str:
+    """The address the gateway and the backends listen on."""
+    return load().get("bind_host") or DEFAULT_BIND_HOST
+
+
+def set_bind_host(host: str | None) -> None:
+    """Persist the listen address (None restores the default)."""
+    update(bind_host=None if host in (None, DEFAULT_BIND_HOST) else host)
 
 
 # ----------------------------------------------------------------- cluster --

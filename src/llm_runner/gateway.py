@@ -673,24 +673,32 @@ def make_handler(gw: Gateway):
             elif length is not None:
                 self.send_header("Content-Length", length)
             self.end_headers()
+            sent, side = 0, "client"
             try:
                 if data is not None:
                     self.wfile.write(data)
                     return
                 while True:
+                    side = "upstream"
                     chunk = resp.read1(65536)
+                    side = "client"
                     if not chunk:
                         break
                     if chunked:
                         self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
                     else:
                         self.wfile.write(chunk)
+                    sent += len(chunk)
                 if chunked:
                     self.wfile.write(b"0\r\n\r\n")
-            except (BrokenPipeError, ConnectionResetError):
-                self.close_connection = True   # client left; closing upstream stops it
-            except (OSError, http.client.HTTPException):
-                self.close_connection = True   # upstream died mid-reply
+            except (OSError, http.client.HTTPException) as e:
+                # Either way the connection is done: a client that left gets
+                # nothing more, and one whose upstream broke sees the stream
+                # cut short. Closing upstream (in _try) stops generation.
+                who = "client left" if side == "client" else "upstream broke"
+                print(f"relay: {who}: {self.command} {self.path} for "
+                      f"{self.address_string()} after {sent} bytes ({e!r})", flush=True)
+                self.close_connection = True
 
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _handle
 
