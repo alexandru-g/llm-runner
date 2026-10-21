@@ -45,6 +45,23 @@ GATEWAY = "gateway"
 BACKENDS = (LLAMA, VLLM, DECIDER)
 
 
+# Set for every process llmctl starts. vLLM sends usage stats home unless told
+# not to; huggingface_hub (in vLLM and decider) reports telemetry the same way.
+NO_TELEMETRY_ENV = {
+    "VLLM_NO_USAGE_STATS": "1",
+    "VLLM_DO_NOT_TRACK": "1",
+    "DO_NOT_TRACK": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+}
+# Added in offline mode: load models from disk only, never ask the hub.
+OFFLINE_ENV = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+
+
+def launch_env(offline: bool) -> dict[str, str]:
+    """The environment llmctl sets for every backend (``-E`` still wins)."""
+    return {**NO_TELEMETRY_ENV, **(OFFLINE_ENV if offline else {})}
+
+
 def with_bind_host(cmd: list[str], backend: str, host: str) -> list[str]:
     """``cmd`` set to listen on ``host``. A recorded command keeps the address
     it was launched with, so replaying one (restore, restart) rewrites it to

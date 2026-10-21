@@ -107,8 +107,11 @@ class LocalModels:
     """The live models on this machine, from the state file (reloaded when it
     changes)."""
 
-    def __init__(self, state_file: Path = proc.STATE_FILE):
+    def __init__(self, state_file: Path = proc.STATE_FILE,
+                 autostart_file: Path | None = None):
         self.state_file = state_file
+        # Next to the state file, as proc.AUTOSTART_FILE is.
+        self.autostart_file = autostart_file or state_file.with_name("autostart.json")
         self._mtime: float | None = None
         self._records: list[Model] = []
         self._health: dict[int, tuple[float, str]] = {}
@@ -181,6 +184,22 @@ class LocalModels:
             state = "down"
         self._health[m.port] = (now, state)
         return state
+
+    def readiness(self) -> tuple[bool, dict[str, str]]:
+        """Whether every model this machine should serve is ready, and each
+        one's status. "Should serve" is the autostart manifest: `llmctl stop`
+        takes a model out, a crash doesn't, so a dead backend reads
+        ``missing``. With an empty manifest, the running models count. No
+        model at all is not ready."""
+        models = {m.name: m for m in self.models()}
+        try:
+            wanted = [s["name"] for s in json.loads(self.autostart_file.read_text())
+                      if s.get("backend") != GATEWAY]
+        except (OSError, ValueError, KeyError, TypeError):
+            wanted = []
+        states = {n: self.status(models[n]) if n in models else "missing"
+                  for n in wanted or models}
+        return bool(states) and all(s == "ready" for s in states.values()), states
 
     def describe(self, m: Model, models: list[Model] | None = None) -> dict:
         info: dict = {"backend": m.backend, "api": m.api, "port": m.port,
@@ -486,9 +505,14 @@ def make_handler(gw: Gateway):
                 return self._forward(cands, lambda c: local_path if c.local
                                      else f"/m/{c.id}{local_path}", lambda c: body)
 
-            if path in ("/health", "/"):
+            if path in ("/health", "/healthz", "/"):
                 return self._json(200, {"status": "ok", "node": gw.node,
                                         "models": len(gw.local.models())})
+            if path == "/readyz":
+                ready, models = gw.local.readiness()
+                return self._json(200 if ready else 503,
+                                  {"status": "ready" if ready else "not_ready",
+                                   "models": models})
             if path == "/v1/models" and self.command in ("GET", "HEAD"):
                 return self._json(200, {"object": "list", "data": gw.model_list(hop)})
             if path.startswith("/v1/models/") and self.command in ("GET", "HEAD"):

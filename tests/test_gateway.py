@@ -161,6 +161,32 @@ def test_streaming_passes_chunks_through(env):
     conn.close()
 
 
+def test_healthz_and_readyz(env):
+    assert _call(env["port"], "GET", "/healthz")[0] == 200
+    # No autostart manifest: the running models are what must be ready.
+    status, out = _call(env["port"], "GET", "/readyz")
+    assert status == 200 and out["status"] == "ready"
+    assert set(out["models"]) == {"gemma-4-26b-q4", "glm-ocr", "quyet.decide"}
+    # A manifest model that isn't running (crashed) makes the node not ready.
+    manifest = [{"name": "gemma-4-26b-q4", "backend": "llama"},
+                {"name": "crashed", "backend": "vllm"},
+                {"name": "gateway", "backend": "gateway"}]
+    (env["state"].parent / "autostart.json").write_text(json.dumps(manifest))
+    status, out = _call(env["port"], "GET", "/readyz")
+    assert status == 503 and out["status"] == "not_ready"
+    assert out["models"] == {"gemma-4-26b-q4": "ready", "crashed": "missing"}
+
+
+def test_readyz_with_nothing_running(tmp_path):
+    (tmp_path / "running.json").write_text("[]")
+    httpd = gw.make_server(0, "127.0.0.1", gw.Gateway(gw.LocalModels(tmp_path / "running.json")))
+    threading.Thread(target=httpd.serve_forever, args=(0.05,), daemon=True).start()
+    try:
+        assert _call(httpd.server_address[1], "GET", "/readyz")[0] == 503
+    finally:
+        httpd.shutdown()
+
+
 class _BrokenStream(_Upstream):
     def do_POST(self):
         self.rfile.read(int(self.headers["Content-Length"]))

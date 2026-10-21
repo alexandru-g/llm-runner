@@ -840,6 +840,19 @@ It stops with the last `llmctl stop`, is restored at boot with the models,
 and shows in `llmctl ps`. `llmctl gateway` prints its URL and routes;
 `llmctl gateway start|stop` control it by hand, `llmctl config gateway PORT`
 moves it and `llmctl config gateway --off` keeps it from starting.
+`GET /healthz` answers while the gateway is up; `GET /readyz` answers 200 only
+when every model in the autostart manifest is running and ready (503 with each
+model's status otherwise), for a proxy or Compose health check.
+
+The gateway and every model listen on `0.0.0.0` by default.
+`llmctl config bind 127.0.0.1` keeps them on loopback, reachable only through
+a proxy on the same host; `llmctl restart` moves what is running.
+
+Every backend starts with telemetry off (`VLLM_NO_USAGE_STATS`,
+`DO_NOT_TRACK`, `HF_HUB_DISABLE_TELEMETRY`). On an air-gapped host,
+`llmctl config offline on` (or `LLM_RUNNER_OFFLINE=1`) makes `download` and
+`update` refuse and starts backends with `HF_HUB_OFFLINE=1` and
+`TRANSFORMERS_OFFLINE=1`.
 llama-server instances now get `--alias <name>`, so their responses report
 the same model id the gateway lists.
 

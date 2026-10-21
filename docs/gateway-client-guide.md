@@ -142,7 +142,8 @@ generated. Closing the connection cancels the generation on the model server.
 | `POST /v1/systemone` (alias `/v1/decisions`) | The body's `model`, among decision endpoints only. |
 | `GET /v1/spec` | The `X-Model` header, among decision endpoints. |
 | `ANY /m/<name>/<path>` | `<name>`: an exact id, a group, or either with `@node`. `<path>` is passed through as is, for llama-server's `/completion`, `/tokenize`, `/detokenize`, `/props`, `/slots`, `/health`, or a decision endpoint's `/v1/spec`. |
-| `GET /health` | The gateway itself: `{"status": "ok", "node": ..., "models": <local count>}`. |
+| `GET /health`, `GET /healthz` | The gateway itself: `{"status": "ok", "node": ..., "models": <local count>}`. |
+| `GET /readyz` | 200 when every model this machine should serve (its autostart manifest) is ready, 503 otherwise: `{"status": "ready" \| "not_ready", "models": {<id>: "ready" \| "loading" \| "down" \| "missing"}}`. |
 | `GET /cluster/v1/status` | This machine's view of the cluster: its nodes, the registry state, warnings. |
 
 A request without a JSON body (for example a multipart upload) takes its

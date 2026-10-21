@@ -19,7 +19,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from llm_runner.backends import with_bind_host
+from llm_runner import config as config_mod
+from llm_runner.backends import launch_env, with_bind_host
 
 
 def _resolve_state_dir() -> Path:
@@ -254,13 +255,15 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
           backend: str = "llama",
           env: dict[str, str] | None = None, group: str | None = None) -> RunningProcess:
     """Launch ``cmd`` detached. ``env`` is layered over the current environment
-    (e.g. VLLM_* tuning knobs) and remembered so restore/restart reproduce it."""
+    (e.g. VLLM_* tuning knobs) and remembered so restore/restart reproduce it.
+    Telemetry is always off, and offline mode keeps backends off the hub
+    (``backends.launch_env``); those are applied fresh, not remembered."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"{name}-{port}-{int(time.time())}.log"
     fh = open(log_file, "ab", buffering=0)
     proc = subprocess.Popen(
         cmd,
-        env={**os.environ, **(env or {})} if env else None,
+        env={**os.environ, **launch_env(config_mod.is_offline()), **(env or {})},
         stdout=fh,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,

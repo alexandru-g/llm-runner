@@ -414,6 +414,35 @@ def config_bind(host: str | None, reset: bool) -> None:
                    "(`llmctl restart`).", err=True)
 
 
+@config.command("offline")
+@click.argument("state", required=False, type=click.Choice(["on", "off"]))
+def config_offline(state: str | None) -> None:
+    """Never reach Hugging Face: on an air-gapped host, or to be sure.
+
+    On: `download` and `update` refuse, and every backend starts with
+    HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1, so it loads from disk or
+    fails rather than trying the network. LLM_RUNNER_OFFLINE=1 (or 0)
+    overrides the setting. With no STATE, print whether it is on.
+    """
+    if state is None:
+        on = config_mod.is_offline()
+        why = " (from LLM_RUNNER_OFFLINE)" if os.environ.get("LLM_RUNNER_OFFLINE") else ""
+        click.echo(("on" if on else "off") + why)
+        return
+    config_mod.set_offline(state == "on")
+    click.echo(f"offline mode {state}")
+    if proc.list_running():
+        click.echo("note: running models keep their environment until restarted "
+                   "(`llmctl restart`).", err=True)
+
+
+def _require_online(what: str) -> None:
+    if config_mod.is_offline():
+        raise click.UsageError(
+            f"Offline mode is on, so `{what}` won't reach Hugging Face. Copy the model "
+            f"into {MODELS_DIR} instead, or `llmctl config offline off`.")
+
+
 @config.command("models-dir")
 @click.argument("path", required=False,
                 type=click.Path(file_okay=False, path_type=Path))
@@ -2199,6 +2228,7 @@ def download(repo_id: str, filename: str | None, no_mmproj: bool, no_draft: bool
 
     Records the source repo so `llmctl update` can re-check it later.
     """
+    _require_online("download")
     _run_download(repo_id, filename, no_mmproj, no_draft, subdir, hf=hf)
 
 
@@ -2254,6 +2284,7 @@ def update(target: str | None, filename: str | None, no_mmproj: bool,
     Re-validates against the remote and re-downloads only what changed — handy
     when a repo fixes a quant or adds an `mtp-` drafter after you first pulled.
     """
+    _require_online("update")
     repo_id, target_dir, known_file = _resolve_update_target(target)
     if filename is None:
         filename = known_file  # may be None for a repo-id target → show picker

@@ -53,12 +53,12 @@ Toolkit. Needed by A0 M0.2 and M0.3.
 
 Models are downloaded once, but at PS6 there is nothing to download from.
 
+- **Done 2026-10-22:** `llmctl config offline on` (or
+  `LLM_RUNNER_OFFLINE=1`) makes `download` and `update` refuse, and starts
+  every backend with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`.
 - `llmctl install <bundle-or-oci-ref>`: place a model from a local OCI
   registry or a bundle directory into `MODELS_DIR`, verifying sha256 per file
   against the bundle manifest. Refuse files that do not match.
-- An offline mode (config or `LLM_RUNNER_OFFLINE=1`) that makes `download`
-  and `update` refuse with a clear message, and sets `HF_HUB_OFFLINE=1` and
-  `TRANSFORMERS_OFFLINE=1` for every backend.
 - Provenance: keep the bundle id, model revision, licence and checksums in
   the `.llmctl-source.json` sidecar. `list` shows them.
 
@@ -66,8 +66,10 @@ Needed by A0 M0.3.
 
 ### 3. Telemetry off
 
-- Always set `VLLM_NO_USAGE_STATS=1` and `DO_NOT_TRACK=1` for vLLM, and the
-  equivalent for any other backend that phones home.
+- **Done 2026-10-22:** every process llmctl starts gets
+  `VLLM_NO_USAGE_STATS=1`, `VLLM_DO_NOT_TRACK=1`, `DO_NOT_TRACK=1` and
+  `HF_HUB_DISABLE_TELEMETRY=1`. llama-server has no telemetry. `-E` can
+  still override them.
 - A test that starts each backend with networking disabled and fails if
   startup needs the network.
 
@@ -132,8 +134,10 @@ most 15 minutes).
   down.
 - Re-export or document the backends' own metrics (vLLM and llama-server
   both expose `/metrics`).
-- `/healthz` (process alive) and `/readyz` (at least one ready instance per
-  configured model) on the gateway, for Compose and the M0 edge.
+- **Done 2026-10-22:** `/healthz` (process alive) and `/readyz` on the
+  gateway, for Compose and the M0 edge. `/readyz` answers 200 only when
+  every model in the autostart manifest is running and ready. A crashed
+  backend stays in the manifest, so it turns readiness off.
 
 Needed by A0 M0.4 (dashboards in Perses over VictoriaMetrics or
 Prometheus).
