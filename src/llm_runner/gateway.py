@@ -44,6 +44,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from llm_runner import __version__
+from llm_runner import auth
 from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner.backends import DECIDE, DECIDER, GATEWAY, VLLM, is_decision_model
@@ -57,6 +58,8 @@ DEFAULT_PORT = 9000
 RETRY_BODY_MAX = 1 << 20     # an error reply this small is read to decide on failover
 MAX_BODY = 256 * 1024 * 1024
 HEALTH_TTL = 2.0
+# Answered without an API key: health checks come from proxies and Compose.
+OPEN_PATHS = ("/", "/health", "/healthz", "/readyz")
 # Not forwarded either way: they describe one connection, not the message.
 _HOP = {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "te",
         "trailer", "upgrade", "host", "content-length"}
@@ -244,19 +247,34 @@ def _is_loopback(ip: str) -> bool:
         return False
 
 
+def _answers_as(url: str, node: str, timeout: float = 1.0) -> bool:
+    """The gateway at ``url`` is up and is ``node`` (not some other machine
+    that has the same LAN address on another network)."""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=timeout) as r:
+            return json.loads(r.read()).get("node") == node
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 class Gateway:
     """State shared by the request threads: local models, and in a cluster
     the node's view of the others (plus the registry table on the registry)."""
 
     def __init__(self, local: LocalModels | None = None,
-                 cluster: config_mod.Cluster | None = None, port: int = DEFAULT_PORT):
+                 cluster: config_mod.Cluster | None = None, port: int = DEFAULT_PORT,
+                 access=None):
         self.local = local or LocalModels()
+        # Who needs an API key: a callable returning the current auth.Policy.
+        self.access = access or auth.ConfigPolicy()
         self.cluster = cluster if cluster and cluster.enabled else None
         self.node = cluster.node_name if cluster else socket.gethostname()
         self.priority = cluster.node_priority if cluster else 0
         self.spill = cluster.spill if cluster else True
         self.port = port
         self.view = ClusterView()
+        # Node URL -> whether this machine reached it at the last probe.
+        self._direct: dict[str, bool] = {}
         self.table = RegistryTable(__version__) if self.cluster and self.cluster.registry_serve \
             else None
         self._last_log: tuple | None = None
@@ -358,6 +376,30 @@ class Gateway:
             self.view.fail(reply.get("error", {}).get("message", f"HTTP {status}"))
         self._log_state()
 
+    def probe_nodes(self) -> None:
+        """Check that each node answers at the address the registry gave. A
+        laptop away from home can't reach LAN addresses: its calls for those
+        nodes then go through the registry instead (``relay_url``)."""
+        if self.cluster is None or self.own_registry() or not self.cluster.registry_url:
+            return
+        direct = {n["url"]: _answers_as(n["url"], n["node"]) for n in self.view.nodes()}
+        for n in self.view.nodes():
+            if direct[n["url"]] != self._direct.get(n["url"], True):
+                print(f"cluster: {n['node']} at {n['url']} " +
+                      ("answers again; calling it directly" if direct[n["url"]] else
+                       f"does not answer; its calls go through the registry "
+                       f"({self.cluster.registry_url})"), flush=True)
+        self._direct = direct
+
+    def relay_url(self, c: Instance) -> str | None:
+        """The registry's URL when ``c``'s node didn't answer the last probe,
+        else None (call it directly)."""
+        if c.local or self.cluster is None or not self.cluster.registry_url:
+            return None
+        if self._direct.get(c.url, True) or c.url == self.cluster.registry_url:
+            return None
+        return self.cluster.registry_url
+
     def _log_state(self) -> None:
         nodes = sorted(n["node"] for n in self.view.nodes())
         state = (self.view.error, tuple(self.view.warnings), tuple(nodes))
@@ -382,6 +424,7 @@ class Gateway:
             if time.monotonic() - last_sent >= HEARTBEAT_EVERY or mtime != last_mtime:
                 last_sent, last_mtime = time.monotonic(), mtime
                 self.heartbeat_once()
+                self.probe_nodes()
             stop.wait(1.0)
 
     def goodbye(self) -> None:
@@ -455,6 +498,20 @@ def make_handler(gw: Gateway):
                 return None
             return self.rfile.read(n) if n else b""
 
+        def _key_ok(self) -> bool:
+            """An API key, when this caller needs one (see auth.py)."""
+            policy = gw.access()
+            if policy.mode == auth.OFF or not policy.needs_key(self.client_address[0],
+                                                              self.headers):
+                return True
+            if policy.key_name(self.headers):
+                return True
+            sent = bool(self.headers.get("Authorization") or self.headers.get("X-Api-Key"))
+            self._error(401, "invalid_api_key",
+                        "Wrong API key." if sent else
+                        "This gateway needs an API key: Authorization: Bearer <key>.")
+            return False
+
         def _authorized(self) -> bool:
             if token_ok(gw.token, self.headers.get(TOKEN_HEADER)):
                 return True
@@ -483,12 +540,14 @@ def make_handler(gw: Gateway):
 
             if path.startswith("/registry/v1/"):
                 return self._registry(path, body)
-            if path == "/cluster/v1/status":
-                return self._json(200, gw.status())
             # A request from another gateway: authenticated, and never sent on.
             hop = HOP_HEADER in self.headers
             if hop and not self._authorized():
                 return
+            if not hop and path not in OPEN_PATHS and not self._key_ok():
+                return
+            if path == "/cluster/v1/status":
+                return self._json(200, gw.status())
 
             if path.startswith("/m/"):
                 name, _, rest = path[3:].partition("/")
@@ -634,18 +693,46 @@ def make_handler(gw: Gateway):
                  spill: bool = False) -> str:
             """"done" (a reply was relayed), "failed" (try the next instance) or
             "busy" (a remote instance with every slot taken; only with spill)."""
+            tls, relay = False, None
             if c.local:
                 host, port, extra = "127.0.0.1", c.info["port"], {}
+            elif relay := gw.relay_url(c):
+                # Through the registry's gateway as an ordinary client call (it
+                # routes it on): with this machine's key, not the cluster token.
+                u = urlsplit(relay)
+                tls = u.scheme == "https"
+                host, port = u.hostname, u.port or (443 if tls else 80)
+                path = u.path.rstrip("/") + path
+                key = config_mod.get_upstream_key()
+                extra = {"Authorization": f"Bearer {key}"} if key else {}
+                # This machine chose the node (and fails over itself): pin it,
+                # or the registry would choose again.
+                pinned = f"{c.id}@{c.node}"
+                if path.startswith(f"{u.path.rstrip('/')}/m/{c.id}/"):
+                    path = path.replace(f"/m/{c.id}/", f"/m/{pinned}/", 1)
+                elif self.headers.get("X-Model") == c.id:
+                    extra["X-Model"] = pinned
+                elif body:
+                    try:
+                        payload = json.loads(body)
+                    except ValueError:
+                        payload = None
+                    if isinstance(payload, dict) and payload.get("model") == c.id:
+                        body = json.dumps({**payload, "model": pinned}).encode()
             else:
                 u = urlsplit(c.url)
                 host, port = u.hostname, u.port or 80
                 extra = {HOP_HEADER: gw.node, TOKEN_HEADER: gw.token or ""}
                 if spill:
                     extra[SPILL_HEADER] = "1"
-            conn = http.client.HTTPConnection(host, port, timeout=10)
+            conn = (http.client.HTTPSConnection if tls else http.client.HTTPConnection)(
+                host, port, timeout=10)
             try:
+                replaced = {k.lower() for k in extra}
+                if "authorization" in replaced:
+                    replaced.add("x-api-key")
                 headers = {k: v for k, v in self.headers.items()
-                           if k.lower() not in _HOP
+                           if k.lower() not in _HOP and k.lower() not in replaced
                            and k not in (HOP_HEADER, TOKEN_HEADER, SPILL_HEADER)}
                 headers.update(extra)
                 if body or self.command in ("POST", "PUT", "PATCH"):
@@ -656,7 +743,8 @@ def make_handler(gw: Gateway):
                     conn.request(self.command, path, body=body or None, headers=headers)
                     resp = conn.getresponse()
                 except OSError as e:
-                    where = f"port {port}" if c.local else f"node {c.node} ({c.url})"
+                    where = f"port {port}" if c.local else \
+                        f"node {c.node} (via {relay})" if relay else f"node {c.node} ({c.url})"
                     if not last:
                         print(f"failover: {c.id} on {c.node} unreachable ({e})", flush=True)
                         return "failed"

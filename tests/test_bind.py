@@ -74,3 +74,16 @@ def test_gateway_url_follows_the_host(cfg):
     assert "127.0.0.1" not in cli._gateway_url(9000)
     config_mod.set_bind_host("127.0.0.1")
     assert cli._gateway_url(9000) == "http://127.0.0.1:9000/v1"
+
+
+@pytest.mark.parametrize("typed, url", [
+    ("192.168.8.213", "http://192.168.8.213:9000"),
+    ("lab:9001", "http://lab:9001"),
+    ("[fd00::1]", "http://[fd00::1]:9000"),
+    ("http://lab:9000/", "http://lab:9000"),
+    ("https://llmctl.example.net", "https://llmctl.example.net"),
+    ("https://llmctl.example.net/", "https://llmctl.example.net"),
+    ("https://example.net/llmctl", "https://example.net/llmctl"),
+])
+def test_registry_urls(typed, url):
+    assert cli._normalize_url(typed) == url

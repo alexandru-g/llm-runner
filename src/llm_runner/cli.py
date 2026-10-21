@@ -1572,6 +1572,141 @@ def gateway_serve(port: int, host: str) -> None:
     gw_mod.serve(port, host)
 
 
+def _networks(values: tuple[str, ...], flag: str) -> list[str]:
+    from llm_runner import auth
+    try:
+        return [str(auth.parse_network(v)) for v in values]
+    except ValueError as e:
+        raise click.BadOptionUsage(flag, f"{flag}: {e}") from None
+
+
+@gateway.command("auth")
+@click.argument("state", required=False, type=click.Choice(["on", "off"]))
+@click.option("--local", "local", multiple=True, metavar="CIDR",
+              help="A network whose callers need no key (repeat; replaces the list).")
+@click.option("--local-default", is_flag=True, help="Back to the default local networks.")
+@click.option("--proxy", "proxies", multiple=True, metavar="ADDR",
+              help="A reverse proxy's address or network (repeat; replaces the list): "
+                   "its requests are judged by the address it forwards, and count as "
+                   "outside without one.")
+@click.option("--no-proxy", is_flag=True, help="Forget the --proxy list.")
+def gateway_auth(state: str | None, local: tuple[str, ...], local_default: bool,
+                 proxies: tuple[str, ...], no_proxy: bool) -> None:
+    """Require an API key from callers outside the local networks.
+
+    \b
+      llmctl gateway key add laptop        # prints the key, once
+      llmctl gateway auth on
+
+    With auth on, a call from outside sends `Authorization: Bearer <key>` (what
+    OpenAI clients send for their api_key) or `X-Api-Key: <key>`; without
+    one it gets 401. Callers on a local network (default: loopback, the
+    private ranges, Tailscale's 100.64.0.0/10, IPv6 ULA and link-local) need
+    none. A request that a proxy on a local network forwards is judged by
+    the client address in its X-Forwarded-For, so a reverse proxy in front
+    of the gateway (nginx, Caddy, Traefik) does not make the internet local.
+    Health checks (/health, /healthz, /readyz), cluster hops and the
+    registry (which check the cluster token) need no key. Changes apply at
+    once, no restart. With no arguments, print the settings.
+    """
+    from llm_runner import auth
+    values: dict = {}
+    if state is not None:
+        values["gateway_auth"] = auth.ON if state == "on" else None
+    if local:
+        values["gateway_local_networks"] = _networks(local, "--local")
+    if local_default:
+        values["gateway_local_networks"] = None
+    if proxies:
+        values["gateway_proxies"] = _networks(proxies, "--proxy")
+    if no_proxy:
+        values["gateway_proxies"] = None
+    if values:
+        config_mod.update(**values)
+    policy = auth.policy_from(config_mod.load())
+    click.echo(f"Auth:     {policy.mode}" + ("  (every caller is let in)"
+                                             if policy.mode == auth.OFF else
+                                             "  (outside callers need a key)"))
+    click.echo("Local:    " + ", ".join(map(str, policy.local)) + "  (+ loopback)")
+    click.echo("Proxies:  " + (", ".join(map(str, policy.proxies)) or
+                               "(none listed; any local peer's X-Forwarded-For is used)"))
+    click.echo("Keys:     " + (", ".join(sorted(policy.keys)) or "(none)"))
+    if policy.mode == auth.ON and not policy.keys:
+        click.echo("warning: no keys yet, so every outside call is refused "
+                   "(`llmctl gateway key add NAME`).", err=True)
+
+
+@gateway.group("key", invoke_without_command=True)
+@click.pass_context
+def gateway_key(ctx: click.Context) -> None:
+    """API keys for callers from outside (see `llmctl gateway auth`)."""
+    if ctx.invoked_subcommand is None:
+        keys = config_mod.load().get("gateway_keys") or {}
+        click.echo("\n".join(sorted(keys)) or "No keys (`llmctl gateway key add NAME`).")
+        if config_mod.get_upstream_key():
+            click.echo("This gateway's own key for the registry: set (`key set --clear`).")
+
+
+@gateway_key.command("add")
+@click.argument("name")
+def gateway_key_add(name: str) -> None:
+    """Make a key called NAME and print it. Only its hash is kept, so copy it now."""
+    from llm_runner import auth
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+        raise click.UsageError("A key name is letters, digits, '.', '_' and '-'.")
+    keys = dict(config_mod.load().get("gateway_keys") or {})
+    if name in keys:
+        raise click.UsageError(f"There is already a key called {name} "
+                               f"(`llmctl gateway key rm {name}` first).")
+    key = auth.new_key()
+    keys[name] = auth.hash_key(key)
+    config_mod.update(gateway_keys=keys)
+    click.echo(key)
+    click.echo(f"Key {name} added; it is not shown again.", err=True)
+    if config_mod.load().get("gateway_auth") != auth.ON:
+        click.echo("note: auth is off, so no one needs it yet (`llmctl gateway auth on`).",
+                   err=True)
+
+
+@gateway_key.command("set")
+@click.argument("key", required=False)
+@click.option("--clear", is_flag=True, help="Forget the key.")
+def gateway_key_set(key: str | None, clear: bool) -> None:
+    """Give this gateway a key for the registry's gateway (from its `key add`).
+
+    A node that can't reach another node at its LAN address (a laptop away
+    from home) sends that node's calls through the registry's gateway, e.g.
+    https://llmctl.example.net, as an ordinary client call. This is the key
+    it sends, so clients of this machine's gateway need none. With no KEY,
+    it is asked for (and not echoed).
+    """
+    if clear:
+        config_mod.update(gateway_upstream_key=None)
+        click.echo("Key cleared.")
+        return
+    if key is None:
+        key = click.prompt("Key", hide_input=True).strip()
+    if not key:
+        raise click.UsageError("The key is empty.")
+    config_mod.update(gateway_upstream_key=key)
+    click.echo("Key set; relayed calls carry it from now on.")
+    c = config_mod.get_cluster()
+    if not c.registry_url:
+        click.echo("note: this machine reports to no registry, so it has nothing to relay "
+                   "through yet (`llmctl registry set URL`).", err=True)
+
+
+@gateway_key.command("rm")
+@click.argument("name")
+def gateway_key_rm(name: str) -> None:
+    """Revoke the key called NAME (at once, no restart)."""
+    keys = dict(config_mod.load().get("gateway_keys") or {})
+    if keys.pop(name, None) is None:
+        raise click.UsageError(f"No key called {name}.")
+    config_mod.update(gateway_keys=keys or None)
+    click.echo(f"Key {name} revoked.")
+
+
 @cli.group(invoke_without_command=True)
 @click.pass_context
 def node(ctx: click.Context) -> None:
@@ -1631,12 +1766,17 @@ def _require_gateway_on() -> None:
 
 
 def _normalize_url(url: str) -> str:
-    if "://" not in url:
-        url = "http://" + url
-    parts = urllib.parse.urlsplit(url)
+    """A gateway URL from what was typed. A bare host (``lab``, ``lab:9001``)
+    is a gateway on the LAN: http, port 9000 unless given. A full URL means
+    what it says, so ``https://llmctl.example.net`` is port 443, behind a
+    proxy."""
+    url = url.strip().rstrip("/")
+    if "://" in url:
+        return url
+    parts = urllib.parse.urlsplit("http://" + url)
     if parts.port is None:
-        url = f"{parts.scheme}://{parts.hostname}:{config_mod.DEFAULT_GATEWAY_PORT}"
-    return url.rstrip("/")
+        return f"http://{parts.netloc}:{config_mod.DEFAULT_GATEWAY_PORT}{parts.path}"
+    return "http://" + url
 
 
 @cli.group("registry", invoke_without_command=True)
@@ -1690,7 +1830,8 @@ def registry_serve(token: str | None, off: bool) -> None:
 @click.option("--token", default=None, help="The cluster token (`llmctl registry token` on "
                                             "the registry).")
 def registry_set(url: str, token: str | None) -> None:
-    """Report to the registry at URL (host, host:port or http://host:port)."""
+    """Report to the registry at URL: a host (port 9000), host:port, or a full
+    URL such as https://llmctl.example.net for a registry behind a proxy."""
     _require_gateway_on()
     url = _normalize_url(url)
     token = token or config_mod.get_cluster().token

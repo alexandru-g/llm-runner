@@ -429,3 +429,70 @@ def test_unexpected_errors_answer_500(cluster, monkeypatch):
     monkeypatch.setattr(gw, "pick", boom)
     status, out = _call(cluster["orin"], "POST", "/v1/chat/completions", {"model": "glm-ocr"})
     assert status == 500 and out["error"]["code"] == "gateway_error" and "kaboom" in out["error"]["message"]
+
+
+def test_a_node_it_cannot_reach_is_called_through_the_registry(cluster, monkeypatch, capsys):
+    url = f"http://127.0.0.1:{cluster['lab'].port}"
+    laptop, laptop_srv = _node(cluster["tmp"], "laptop", 5, [], registry_url=url)
+    try:
+        laptop.heartbeat_once()
+        # Away from home: the LAN addresses of rtx and orin don't answer.
+        monkeypatch.setattr(gw, "_answers_as", lambda u, node, timeout=1.0: node == "lab")
+        laptop.probe_nodes()
+        assert "orin at" in capsys.readouterr().out
+        status, out = _call(laptop, "POST", "/v1/chat/completions", {"model": "glm-ocr"})
+        assert status == 200 and out["who"] == "orin-ocr"
+        assert _call(laptop, "GET", "/m/quyet@orin/props")[1]["who"] == "orin"
+        # Back home: direct again.
+        monkeypatch.setattr(gw, "_answers_as", lambda u, node, timeout=1.0: True)
+        laptop.probe_nodes()
+        assert all(laptop._direct.values())
+    finally:
+        laptop_srv.shutdown()
+
+
+class _Recorder(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    seen: list = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        type(self).seen.append((self.path, dict(self.headers)))
+        body = b'{"who": "registry"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_relayed_calls_carry_the_key_not_the_token(tmp_path):
+    from llm_runner import config as config_mod
+    rec = _serve(_Recorder)
+    registry = f"http://127.0.0.1:{rec.server_address[1]}/llmctl"
+    (tmp_path / "laptop.json").write_text("[]")
+    laptop = gw.Gateway(gw.LocalModels(tmp_path / "laptop.json"),
+                        Cluster("laptop", 5, None, registry, TOKEN, False))
+    srv = _serve(gw.make_server(0, "127.0.0.1", laptop))
+    laptop.view.update({"nodes": [{"node": "orin", "url": "http://127.0.0.1:1", "priority": 1,
+                                   "models": [{"id": "glm-ocr", "llmctl": {"status": "ready"}}]}]})
+    laptop.probe_nodes()                                  # port 1: refused
+    try:
+        config_mod.update(gateway_upstream_key="llmctl-k")
+        status, out = _call(laptop, "POST", "/v1/chat/completions", {"model": "glm-ocr"},
+                            headers={"Authorization": "Bearer unused"})
+        assert status == 200 and out == {"who": "registry"}
+        path, headers = _Recorder.seen[-1]
+        assert path == "/llmctl/v1/chat/completions"
+        assert headers["Authorization"] == "Bearer llmctl-k"   # the client's is replaced
+        assert "X-Llmctl-Hop" not in headers and "X-Llmctl-Token" not in headers
+        # No key set: the client's own goes through.
+        config_mod.update(gateway_upstream_key=None)
+        _call(laptop, "POST", "/v1/chat/completions", {"model": "glm-ocr"},
+              headers={"Authorization": "Bearer mine"})
+        assert _Recorder.seen[-1][1]["Authorization"] == "Bearer mine"
+    finally:
+        rec.shutdown(); srv.shutdown()

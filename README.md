@@ -848,6 +848,18 @@ The gateway and every model listen on `0.0.0.0` by default.
 `llmctl config bind 127.0.0.1` keeps them on loopback, reachable only through
 a proxy on the same host; `llmctl restart` moves what is running.
 
+`llmctl gateway auth on` asks callers from outside the local networks for an
+API key (`Authorization: Bearer <key>`, which OpenAI clients send for their
+`api_key`, or `X-Api-Key`); LAN, Tailscale and loopback callers need none.
+`llmctl gateway key add NAME` prints a new key once and keeps only its hash;
+`key rm NAME` revokes it. Both apply at once. Behind a reverse proxy, a
+request from a proxy on a local network is judged by the client address in
+its `X-Forwarded-For`, so publishing the gateway through nginx doesn't make
+the internet local; `--proxy ADDR` names the proxy, so that a request from
+it without a forwarded address counts as outside. `--local CIDR` replaces
+the local networks (`--local 127.0.0.0/8` wants keys from the LAN too).
+Health checks, cluster hops and the registry need no key.
+
 Every backend starts with telemetry off (`VLLM_NO_USAGE_STATS`,
 `DO_NOT_TRACK`, `HF_HUB_DISABLE_TELEMETRY`). On an air-gapped host,
 `llmctl config offline on` (or `LLM_RUNNER_OFFLINE=1`) makes `download` and
@@ -924,6 +936,18 @@ any$  llmctl ps --all                           # every model, and where calls g
   `registry serve --off` stops hosting it. `node set --advertise URL` sets
   the address others use for this machine when the one the registry sees
   is wrong (NAT, Tailscale).
+- `registry set` takes a host (`lab`, port 9000), `host:port`, or a full URL
+  for a registry behind a reverse proxy: `https://llmctl.example.net` means
+  port 443. Behind a proxy the registry sees the proxy's address, not the
+  node's, so a node that runs models also needs `node set --advertise`.
+- **Away from home.** After each heartbeat a node checks that every other
+  node answers, as itself, at the address the registry gave. One that
+  doesn't (a laptop on another network can't reach LAN addresses) gets its
+  calls through the registry's gateway instead, pinned to the node chosen,
+  as an ordinary client call. If that gateway wants an API key
+  (`gateway auth on`), give the node one with `llmctl gateway key set`
+  (prompts for it), and the clients of its own gateway need none:
+  `http://localhost:9000/v1` works at home and away.
 - Each gateway port (9000) must be reachable from the other machines, e.g.
   `sudo ufw allow from 192.168.8.0/24 to any port 9000 proto tcp`.
 

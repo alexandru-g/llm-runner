@@ -16,7 +16,9 @@ model on every machine in the cluster.
   name is its llmctl instance name, such as
   `"gemma-4-26b-a4b-it-ud-q4_k_m"`, or its group name, such as
   `"gemma-4-26b-a4b-it"`.
-- **No API key** is needed.
+- **No API key** is needed on the LAN. From outside it (for example
+  through `https://llmctl.peppark.net/v1`), send the key you were given as
+  the client's `api_key`; it goes out as `Authorization: Bearer <key>`.
 
 The gateway chooses the machine and forwards the request. The response is the
 model server's own response, streamed through unchanged.
@@ -177,6 +179,7 @@ The gateway's own errors use the OpenAI shape,
 | 400 | `vision_unavailable` | Images sent, but no copy of that model reads them. |
 | 400 | `invalid_json`, `invalid_model` | Malformed body, or `model` isn't a string. |
 | 404 | `model_not_found` | No such model running, or not on the pinned node. The message lists what is running. |
+| 401 | `invalid_api_key` | A call from outside the local networks without a valid key. |
 | 413 | `body_too_large` | Body over 256 MiB. |
 | 502 | `upstream_unavailable` | No copy answered. |
 | 503 | `no_models` | Nothing of that kind is running in the cluster. |

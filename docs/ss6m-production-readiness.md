@@ -93,8 +93,12 @@ cluster token are out of play.
 - If the proxy runs in a Docker bridge network it cannot reach the host's
   `127.0.0.1`. Then either run it with `network_mode: host`, or bind llmctl
   to the bridge address (for example `172.17.0.1`) instead.
-- Still open: any process on the AI server can call the gateway. Acceptable
-  on a dedicated host; if not, the gateway needs an API key check.
+- **Done 2026-10-22:** `llmctl gateway auth on` with `gateway key add`.
+  Callers outside the local networks need `Authorization: Bearer <key>`;
+  keys are stored hashed and revoked at once. For SS6M, where the edge proxy
+  is the only outside caller, `--local 127.0.0.0/8` plus a key for the edge
+  makes even LAN callers authenticate. The key name is the caller identity
+  that item 5's audit events need.
 
 Security baseline from the SS6M architecture: TLS 1.3 in transit, RBAC with
 least privilege, full audit logging. Needed by A0 M0.5.
