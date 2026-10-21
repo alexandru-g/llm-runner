@@ -125,3 +125,11 @@ def test_cli_keys_and_settings():
     assert "gateway_keys" not in config_mod.load()
     assert runner.invoke(cli.cli, ["gateway", "auth", "off", "--no-proxy"]).exit_code == 0
     assert auth.ConfigPolicy()().mode == auth.OFF
+
+
+def test_config_show_hides_secrets():
+    config_mod.update(cluster_token="tok-secret", gateway_upstream_key="llmctl-secret",
+                      gateway_keys={"laptop": auth.hash_key("k")})
+    out = CliRunner().invoke(cli.cli, ["config", "show"]).output
+    assert "tok-secret" not in out and "llmctl-secret" not in out
+    assert auth.hash_key("k") not in out and "gateway_keys = laptop" in out

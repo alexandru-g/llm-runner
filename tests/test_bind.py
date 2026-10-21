@@ -87,3 +87,11 @@ def test_gateway_url_follows_the_host(cfg):
 ])
 def test_registry_urls(typed, url):
     assert cli._normalize_url(typed) == url
+
+
+def test_gateway_restart_only_restarts_a_running_one(monkeypatch):
+    monkeypatch.setattr(cli, "_gateway_record", lambda: None)
+    started = []
+    monkeypatch.setattr(cli, "_start_gateway", lambda port: started.append(port))
+    out = CliRunner().invoke(cli.cli, ["gateway", "restart"])
+    assert out.exit_code == 0 and "nothing to restart" in out.output and not started

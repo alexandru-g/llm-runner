@@ -75,6 +75,15 @@ else
     llmctl --help | head -n 5 || true
 fi
 
+# A running gateway keeps the code it started with, so restart it on the new
+# one (deploy.sh runs this script on the remote). Models are separate servers
+# and keep running; a gateway that isn't running stays stopped.
+if [[ -x "$BIN_DIR/llmctl" ]]; then
+    say "Restarting the gateway on the new code (if it is running)"
+    "$BIN_DIR/llmctl" gateway restart >&2 \
+        || warn "Gateway restart failed; run 'llmctl gateway restart' and check 'llmctl logs gateway'."
+fi
+
 cat <<EOF
 
 Done. Next steps:

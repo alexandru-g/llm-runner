@@ -280,6 +280,11 @@ def config_show() -> None:
     if stored:
         click.echo("\nStored settings:")
         for key, val in stored.items():
+            if key in ("cluster_token", "gateway_upstream_key"):
+                val = "(set; `llmctl registry token` prints the token)" \
+                    if key == "cluster_token" else "(set)"
+            elif key == "gateway_keys" and isinstance(val, dict):
+                val = ", ".join(sorted(val))
             click.echo(f"  {key} = {val}")
     else:
         click.echo("\n(no settings stored)")
@@ -1468,19 +1473,25 @@ def _restart_gateway() -> None:
     that is now wanted, stop one that no longer is."""
     gw = _gateway_record()
     wanted = bool(_models_running()) or config_mod.get_cluster().enabled
-    if gw:
+    if gw and not wanted:
         proc.stop(str(gw.pid))
-        if not wanted:
-            click.echo(f"Stopped gateway  pid={gw.pid}  port={gw.port}")
-            return
-        for _ in range(20):
-            if not _port_in_use(gw.port):
-                break
-            time.sleep(0.25)
-        rec = _start_gateway(gw.port)
-        click.echo(f"Restarted gateway  pid={rec.pid}  port={rec.port}")
+        click.echo(f"Stopped gateway  pid={gw.pid}  port={gw.port}")
+    elif gw:
+        _bounce_gateway(gw)
     elif wanted:
         _ensure_gateway()
+
+
+def _bounce_gateway(gw: proc.RunningProcess) -> proc.RunningProcess:
+    """Stop ``gw`` and start it again on its port, on the installed llmctl."""
+    proc.stop(str(gw.pid))
+    for _ in range(20):
+        if not _port_in_use(gw.port):
+            break
+        time.sleep(0.25)
+    rec = _start_gateway(gw.port)
+    click.echo(f"Restarted gateway  pid={rec.pid}  port={rec.port}")
+    return rec
 
 
 def _wait_cluster(timeout: float = 12.0) -> dict | None:
@@ -1548,6 +1559,25 @@ def gateway_start(port: int | None) -> None:
         raise click.UsageError(f"Port {port} is already in use.")
     rec = _start_gateway(port)
     click.echo(f"Gateway: {_gateway_url(rec.port)}  pid={rec.pid}")
+
+
+@gateway.command("restart")
+def gateway_restart() -> None:
+    """Restart a running gateway on its port, so it runs the installed llmctl
+    (install.sh does this). Does nothing when no gateway is running."""
+    gw = _gateway_record()
+    if gw is None:
+        click.echo("Gateway not running; nothing to restart.")
+        return
+    rec = _bounce_gateway(gw)
+    for _ in range(40):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{rec.port}/healthz", timeout=1):
+                return
+        except (OSError, ValueError):
+            time.sleep(0.25)
+    raise click.ClickException(f"The gateway did not come back on port {rec.port}; "
+                               f"see `llmctl logs gateway`.")
 
 
 @gateway.command("stop")

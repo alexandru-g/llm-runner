@@ -40,7 +40,9 @@ llmctl --help
 `install.sh` also installs `systemone-proxy` (the decision endpoint behind
 `llmctl decide`, from `packages/systemone-proxy`).
 
-To upgrade after pulling changes: re-run `./install.sh`. To uninstall:
+To upgrade after pulling changes: re-run `./install.sh`. It restarts a running
+gateway on the new code (`llmctl gateway restart`); models keep running, and
+decision endpoints keep their old code until `llmctl restart`. To uninstall:
 `uv tool uninstall llm-runner systemone-proxy` (or `pipx uninstall …`).
 
 **Hacking on the code instead?** Use `uv sync` to create a local `.venv/` and
@@ -840,33 +842,42 @@ It stops with the last `llmctl stop`, is restored at boot with the models,
 and shows in `llmctl ps`. `llmctl gateway` prints its URL and routes;
 `llmctl gateway start|stop` control it by hand, `llmctl config gateway PORT`
 moves it and `llmctl config gateway --off` keeps it from starting.
-`GET /healthz` answers while the gateway is up; `GET /readyz` answers 200 only
-when every model in the autostart manifest is running and ready (503 with each
-model's status otherwise), for a proxy or Compose health check.
+llama-server instances get `--alias <name>`, so their responses report the
+same model id the gateway lists.
+
+For a proxy or Compose health check, `GET /healthz` answers while the gateway
+is up, and `GET /readyz` answers 200 only when every model in the autostart
+manifest is running and ready (503 with each model's status otherwise). A
+crashed model stays in the manifest, so it turns readiness off.
+
+### Who can reach the gateway: bind address and API keys
 
 The gateway and every model listen on `0.0.0.0` by default.
 `llmctl config bind 127.0.0.1` keeps them on loopback, reachable only through
 a proxy on the same host; `llmctl restart` moves what is running.
 
-`llmctl gateway auth on` asks callers from outside the local networks for an
-API key (`Authorization: Bearer <key>`, which OpenAI clients send for their
-`api_key`, or `X-Api-Key`); LAN, Tailscale and loopback callers need none.
-`llmctl gateway key add NAME` prints a new key once and keeps only its hash;
-`key rm NAME` revokes it. Both apply at once. Behind a reverse proxy, a
-request from a proxy on a local network is judged by the client address in
-its `X-Forwarded-For`, so publishing the gateway through nginx doesn't make
-the internet local; `--proxy ADDR` names the proxy, so that a request from
-it without a forwarded address counts as outside. `--local CIDR` replaces
-the local networks (`--local 127.0.0.0/8` wants keys from the LAN too).
-Health checks, cluster hops and the registry need no key.
+To publish the gateway (for example through a reverse proxy at
+`https://llmctl.example.net`), ask callers from outside for an API key:
 
-Every backend starts with telemetry off (`VLLM_NO_USAGE_STATS`,
-`DO_NOT_TRACK`, `HF_HUB_DISABLE_TELEMETRY`). On an air-gapped host,
-`llmctl config offline on` (or `LLM_RUNNER_OFFLINE=1`) makes `download` and
-`update` refuse and starts backends with `HF_HUB_OFFLINE=1` and
-`TRANSFORMERS_OFFLINE=1`.
-llama-server instances now get `--alias <name>`, so their responses report
-the same model id the gateway lists.
+```bash
+llmctl gateway key add laptop        # prints the key once; only its hash is kept
+llmctl gateway auth on               # outside callers now need a key
+llmctl gateway key                   # the key names
+llmctl gateway key rm laptop         # revoke (applies at once, no restart)
+```
+
+- A caller sends `Authorization: Bearer <key>` (what OpenAI clients send for
+  their `api_key`) or `X-Api-Key: <key>`; without one it gets
+  `401 invalid_api_key`.
+- **Local callers need none:** loopback, the private ranges, Tailscale's
+  100.64.0.0/10 and IPv6 ULA and link-local. `--local CIDR` replaces that
+  list; `--local 127.0.0.0/8` wants keys from the LAN too.
+- **Behind a reverse proxy**, a request from a proxy on a local network is
+  judged by the client address in its `X-Forwarded-For`, so the proxy doesn't
+  make the internet local. `--proxy ADDR` names the proxy, so that a request
+  from it without a forwarded address counts as outside.
+- Health checks, cluster hops and the registry (which check the cluster
+  token) need no key. `llmctl gateway auth` prints the settings.
 
 ### Several machines as one: the registry
 
@@ -925,8 +936,9 @@ any$  llmctl ps --all                           # every model, and where calls g
 - **Token.** Heartbeats and gateway-to-gateway calls carry the cluster token
   (`llmctl registry token` prints it). Without it the registry refuses a node
   and a gateway refuses a forwarded call, so no one can register a fake
-  model. Clients calling a gateway still need no key. The token travels in
-  plain HTTP: fine on a LAN or Tailscale, not across the internet.
+  model. Clients need no key unless the gateway asks for one (`gateway auth
+  on`). The token travels in plain HTTP: fine on a LAN or Tailscale, not
+  across the internet.
 - **Versions.** Each heartbeat carries the llmctl version; differing ones
   show as a warning in `llmctl registry` and `llmctl ps --all`, and a node on
   an incompatible cluster protocol is refused with a message saying so.
@@ -977,9 +989,27 @@ Settings are written to `$XDG_CONFIG_HOME/llm-runner/config.json` (default
 `$LLM_RUNNER_CONFIG_DIR`. The `$LLM_RUNNER_MODELS_DIR` env var, if set, still
 takes precedence over the persisted value.
 
-The other persisted setting is `vllm_bin` (`llmctl config vllm-bin <path>`,
-`--clear` to forget); `$LLM_RUNNER_VLLM_BIN` overrides it. See the vllm
-install section for the full lookup order.
+Other persisted settings:
+
+| Command | Setting |
+|---|---|
+| `llmctl config vllm-bin <path>` (`--clear`) | The `vllm` CLI; `$LLM_RUNNER_VLLM_BIN` overrides it (see the vllm install section). |
+| `llmctl config gateway PORT` (`--off`) | The gateway port, default 9000. |
+| `llmctl config bind HOST` (`--reset`) | The address the gateway and models listen on, default `0.0.0.0`. |
+| `llmctl config offline on\|off` | Offline mode (below); `$LLM_RUNNER_OFFLINE` overrides it. |
+| `llmctl gateway auth`, `gateway key` | API keys (see the gateway section). |
+| `llmctl node set`, `registry set` | Cluster membership (see the registry section). |
+
+`llmctl config show` prints them all, with secrets masked.
+
+### Offline hosts and telemetry
+
+Every backend starts with telemetry off (`VLLM_NO_USAGE_STATS`,
+`VLLM_DO_NOT_TRACK`, `DO_NOT_TRACK`, `HF_HUB_DISABLE_TELEMETRY`); `-E` can
+still override them. On an air-gapped host, `llmctl config offline on` (or
+`LLM_RUNNER_OFFLINE=1`) makes `download` and `update` refuse, and starts
+backends with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, so they load
+from disk or fail instead of trying the network.
 
 ### State and logs
 
