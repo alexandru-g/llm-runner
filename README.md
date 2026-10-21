@@ -951,7 +951,10 @@ any$  llmctl ps --all                           # every model, and where calls g
 - `registry set` takes a host (`lab`, port 9000), `host:port`, or a full URL
   for a registry behind a reverse proxy: `https://llmctl.example.net` means
   port 443. Behind a proxy the registry sees the proxy's address, not the
-  node's, so a node that runs models also needs `node set --advertise`.
+  node's, so for a heartbeat that came through one (see `gateway auth
+  --proxy`) it uses the address the node reports on its default route
+  instead; a laptop's follows it from network to network. Set `node set
+  --advertise` when that address isn't the one others can reach.
 - **Away from home.** After each heartbeat a node checks that every other
   node answers, as itself, at the address the registry gave. One that
   doesn't (a laptop on another network can't reach LAN addresses) gets its

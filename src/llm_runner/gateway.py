@@ -32,6 +32,7 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import json
+import secrets
 import signal
 import socket
 import threading
@@ -272,6 +273,9 @@ class Gateway:
         self.priority = cluster.node_priority if cluster else 0
         self.spill = cluster.spill if cluster else True
         self.port = port
+        # Lets the registry tell this machine changing networks from another
+        # machine using its name.
+        self.instance = secrets.token_hex(8)
         self.view = ClusterView()
         # Node URL -> whether this machine reached it at the last probe.
         self._direct: dict[str, bool] = {}
@@ -344,6 +348,8 @@ class Gateway:
         return {"protocol": PROTOCOL, "version": __version__, "node": self.node,
                 "priority": self.priority, "port": self.port,
                 "advertise": self.cluster.node_advertise if self.cluster else None,
+                # For a registry behind a reverse proxy, which sees the proxy's address.
+                "lan": f"http://{lan_ip()}:{self.port}", "instance": self.instance,
                 "models": self.local_described()}
 
     def _post_registry(self, path: str, payload: dict, timeout: float = 4) -> tuple[int, dict]:
@@ -645,7 +651,8 @@ def make_handler(gw: Gateway):
                 peer = self.client_address[0]
                 if _is_loopback(peer):
                     peer = lan_ip()      # a node on this machine: others can't use 127.0.0.1
-                status, reply = gw.table.heartbeat(payload, peer)
+                status, reply = gw.table.heartbeat(
+                    payload, peer, proxied=gw.access().via_proxy(peer, self.headers))
                 gw.sync_from_table()
                 return self._json(status, reply)
             if path == "/registry/v1/goodbye" and self.command == "POST":

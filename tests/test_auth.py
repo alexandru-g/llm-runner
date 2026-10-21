@@ -54,6 +54,16 @@ def test_a_listed_proxy_without_a_forwarded_address_counts_as_outside():
     assert not p.needs_key("172.20.0.45", {"X-Forwarded-For": "10.0.0.7"})
 
 
+def test_via_proxy():
+    assert ON.via_proxy("172.20.0.45", {"X-Forwarded-For": "192.168.8.247"})
+    assert ON.via_proxy("172.20.0.45", {"X-Real-IP": "192.168.8.247"})
+    assert not ON.via_proxy("192.168.8.247", {})
+    # An outside peer's headers prove nothing; a listed proxy is one without them.
+    assert not ON.via_proxy("203.0.113.5", {"X-Forwarded-For": "192.168.1.5"})
+    p = auth.Policy(proxies=(auth.parse_network("172.20.0.45"),))
+    assert p.via_proxy("172.20.0.45", {}) and not p.via_proxy("172.20.0.38", {})
+
+
 def test_narrowing_local_to_loopback_wants_keys_from_the_lan():
     p = auth.Policy(mode=auth.ON, local=(auth.parse_network("127.0.0.0/8"),))
     assert p.needs_key("192.168.8.50", {})

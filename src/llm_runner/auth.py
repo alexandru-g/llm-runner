@@ -83,6 +83,17 @@ class Policy:
             return _ip(forwarded)
         return ip
 
+    def via_proxy(self, peer: str, headers) -> bool:
+        """The request came through a reverse proxy (the same test as
+        ``caller``), so the peer address is the proxy's."""
+        ip = _ip(peer)
+        if ip is None:
+            return False
+        if any(ip in n for n in self.proxies):
+            return True
+        forwarded = headers.get("X-Forwarded-For") or headers.get("X-Real-IP")
+        return bool(forwarded) and self.is_local(ip)
+
     def is_local(self, ip) -> bool:
         return ip is not None and (ip.is_loopback or any(
             ip.version == n.version and ip in n for n in self.local))

@@ -220,6 +220,7 @@ class NodeRecord:
     version: str
     models: list[dict]
     last_seen: float = field(default_factory=time.monotonic)
+    instance: str | None = None     # the node's gateway process; see heartbeat()
 
     def public(self, now: float) -> dict:
         return {"node": self.name, "url": self.url, "priority": self.priority,
@@ -240,7 +241,10 @@ class RegistryTable:
         for name in [n for n, r in self._nodes.items() if now - r.last_seen > NODE_TIMEOUT]:
             del self._nodes[name]
 
-    def heartbeat(self, payload: dict, peer_ip: str) -> tuple[int, dict]:
+    def heartbeat(self, payload: dict, peer_ip: str,
+                  proxied: bool = False) -> tuple[int, dict]:
+        """``proxied``: the heartbeat came through a reverse proxy, so
+        ``peer_ip`` is the proxy's and the node's own ``lan`` address is used."""
         if payload.get("protocol") != PROTOCOL:
             return 409, {"error": {"code": "protocol_mismatch", "message":
                          f"registry speaks cluster protocol {PROTOCOL} (llmctl {self.version}), "
@@ -253,17 +257,23 @@ class RegistryTable:
         except (KeyError, TypeError, ValueError):
             return 400, {"error": {"code": "invalid_heartbeat",
                                    "message": "node, port, priority and models are required"}}
-        url = payload.get("advertise") or f"http://{peer_ip}:{port}"
+        url = payload.get("advertise") or (proxied and payload.get("lan")) \
+            or f"http://{peer_ip}:{port}"
+        instance = str(payload["instance"]) if payload.get("instance") else None
         now = time.monotonic()
         with self._lock:
             self._expire(now)
             old = self._nodes.get(name)
-            if old is not None and old.url != url:
+            # A new address from the same gateway process is that machine
+            # moving networks (a laptop), not another one under its name.
+            moved = instance is not None and old is not None and old.instance == instance
+            if old is not None and old.url != url and not moved:
                 return 409, {"error": {"code": "node_name_taken", "message":
                              f"node name \"{name}\" is in use by {old.url}; "
                              "give this machine another name (`llmctl node set --name`)."}}
             node_version = str(payload.get("version", "?"))
-            self._nodes[name] = NodeRecord(name, url, priority, node_version, models, now)
+            self._nodes[name] = NodeRecord(name, url, priority, node_version, models, now,
+                                           instance)
             others = [r.public(now) for r in self._nodes.values() if r.name != name]
             versions = {r.name: r.version for r in self._nodes.values()}
         warnings = []

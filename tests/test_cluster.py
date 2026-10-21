@@ -158,6 +158,28 @@ def test_registry_table(monkeypatch):
     assert t.snapshot() == []
 
 
+def test_registry_behind_proxy():
+    t = RegistryTable("0.9.0")
+    lan = "http://192.168.8.247:9000"
+    # Through a reverse proxy the peer is the proxy: the node's own address is used.
+    status, reply = t.heartbeat(_hb("laptop", lan=lan, instance="a"), "172.20.0.45", proxied=True)
+    assert status == 200 and reply["node_url"] == lan
+    # --advertise still wins; a direct heartbeat still uses the peer address.
+    assert t.heartbeat(_hb("x", lan=lan, advertise="http://x.ts:9000"), "172.20.0.45",
+                       proxied=True)[1]["node_url"] == "http://x.ts:9000"
+    assert t.heartbeat(_hb("y", lan=lan), "100.64.0.7")[1]["node_url"] == \
+        "http://100.64.0.7:9000"
+    # The same gateway on another network moves; another machine under its name doesn't.
+    hotspot = "http://10.16.133.39:9000"
+    status, reply = t.heartbeat(_hb("laptop", lan=hotspot, instance="a"), "172.20.0.45",
+                                proxied=True)
+    assert status == 200 and reply["node_url"] == hotspot
+    status, reply = t.heartbeat(_hb("laptop", lan=lan, instance="b"), "172.20.0.45",
+                                proxied=True)
+    assert status == 409 and reply["error"]["code"] == "node_name_taken"
+    assert t.heartbeat(_hb("laptop", lan=lan), "172.20.0.45", proxied=True)[0] == 409
+
+
 # ------------------------------------------------------- three live gateways --
 
 class _Fake(BaseHTTPRequestHandler):
