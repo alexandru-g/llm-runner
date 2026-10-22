@@ -16,6 +16,7 @@ from llm_runner.cluster import OPENAI, SYSTEMONE, Instance, Unroutable, pick
 
 class _Upstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True   # so latency tests measure only the gateway
 
     def log_message(self, *a):
         pass
@@ -233,6 +234,20 @@ def test_keep_alive_serves_several_requests(env):
                      headers={"Content-Type": "application/json"})
         assert json.loads(conn.getresponse().read())["who"] == name
     conn.close()
+
+
+def test_keep_alive_replies_are_not_held_by_nagle(env):
+    # With Nagle on, each reply's body waits ~40 ms for the client's delayed ACK.
+    conn = http.client.HTTPConnection("127.0.0.1", env["port"], timeout=5)
+    times = []
+    for _ in range(6):
+        t0 = time.perf_counter()
+        conn.request("POST", "/v1/completions", body=json.dumps({"model": "glm"}),
+                     headers={"Content-Type": "application/json"})
+        conn.getresponse().read()
+        times.append(time.perf_counter() - t0)
+    conn.close()
+    assert sorted(times[1:])[2] < 0.02, times
 
 
 def test_dead_and_unreachable_models(env):

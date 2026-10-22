@@ -18,6 +18,9 @@ def make_handler(service: DecisionService, spec: dict):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "systemone-proxy"
+        # Headers and body are separate small writes; with Nagle on, the body
+        # waits for the client's delayed ACK (~40 ms) on every keep-alive reply.
+        disable_nagle_algorithm = True
 
         def _send(self, status: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode()

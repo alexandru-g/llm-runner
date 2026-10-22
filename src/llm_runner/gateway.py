@@ -465,6 +465,10 @@ def make_handler(gw: Gateway):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "llmctl-gateway"
+        # Headers and body go out as separate small writes; with Nagle on, the
+        # body waits for the client's delayed ACK (~40 ms on Linux) on every
+        # keep-alive reply, and every SSE chunk after the first is held back too.
+        disable_nagle_algorithm = True
 
         def log_message(self, fmt, *args):  # one line per request, to the log file
             print(f"{self.address_string()} {fmt % args}", flush=True)
