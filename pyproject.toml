@@ -1,7 +1,7 @@
 [project]
 name = "llm-runner"
 version = "0.12.0"
-description = "Background runner for local model servers (llama-server / vllm)."
+description = "Run local model servers (llama-server, vLLM, SGLang) on hosts or in containers, behind one OpenAI-compatible gateway."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -13,6 +13,7 @@ dependencies = [
     "click>=8.1",
     "huggingface_hub>=0.24",
     "questionary>=2.0",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]

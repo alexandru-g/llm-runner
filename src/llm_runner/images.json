@@ -1,0 +1,22 @@
+{
+  "schema": "llmctl-images/1",
+  "comment": "Container images this llmctl version was tested with, pinned by the multi-arch index digest. `llmctl config runtime <backend> docker` uses these unless --image is given.",
+  "images": {
+    "vllm": {
+      "image": "vllm/vllm-openai@sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1",
+      "tag": "v0.29.0",
+      "engine_version": "0.29.0",
+      "entrypoint": ["vllm"],
+      "platforms": ["linux/amd64", "linux/arm64"],
+      "license": "Apache-2.0"
+    },
+    "llama": {
+      "image": "ghcr.io/ggml-org/llama.cpp@sha256:490d8cd8000203a3ab8fdfce14ef931e2aa85affd4dd4447bcc75f299f00fd9a",
+      "tag": "server-cuda-b11804",
+      "engine_version": "b11804",
+      "entrypoint": ["/app/llama-server"],
+      "platforms": ["linux/amd64", "linux/arm64"],
+      "license": "MIT"
+    }
+  }
+}

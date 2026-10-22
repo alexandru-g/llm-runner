@@ -30,8 +30,15 @@ block. "A0 M0.x" points to the SS6M milestone that needs the item.
 
 ### 1. Container backends
 
-Today llama-server, vLLM and decider run as host processes, from the Arch
-package, a conda env or a source build. Production needs each backend to run
+**Done in 1.0.0:** `llmctl config runtime <backend> docker` and `run
+--runtime docker` for vLLM, SGLang and llama.cpp; images pinned by digest
+(`llmctl images`); CDI or `--gpus`; models read-only; the port published on
+the bind address; image and digest in `ps`, `/v1/models` and the logs. Egress
+is blocked on the host (a `DOCKER-USER` rule), since Docker can't publish a
+port from a container with no network. Still open: a Jetson image for orin.
+
+Before 1.0, llama-server, vLLM and decider ran as host processes, from the
+Arch package, a uv venv or a source build. Production needs each backend to run
 as a container started from an image pinned by digest:
 `llama.cpp@sha256:…`, `vllm/vllm-openai@sha256:…`, and a Jetson llama.cpp
 image for orin.
@@ -56,11 +63,15 @@ Models are downloaded once, but at PS6 there is nothing to download from.
 - **Done 2026-10-22:** `llmctl config offline on` (or
   `LLM_RUNNER_OFFLINE=1`) makes `download` and `update` refuse, and starts
   every backend with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`.
-- `llmctl install <bundle-or-oci-ref>`: place a model from a local OCI
-  registry or a bundle directory into `MODELS_DIR`, verifying sha256 per file
-  against the bundle manifest. Refuse files that do not match.
-- Provenance: keep the bundle id, model revision, licence and checksums in
-  the `.llmctl-source.json` sidecar. `list` shows them.
+- **Done in 1.0.0:** `llmctl install <bundle-or-oci-ref>` places a model
+  from a bundle directory or a local OCI registry into `MODELS_DIR`,
+  verifying sha256 per file against `llmctl-manifest.json`, and refuses the
+  whole install on any mismatch. Versions install side by side.
+- **Done in 1.0.0:** provenance (model revision, licence, per-file and
+  manifest checksums) in the `.llmctl-source.json` sidecar; `list` shows
+  revision and licence; `verify` re-hashes.
+- **Done in 1.0.0:** warm compile caches shipped in bundles (`cache export`,
+  seeded when the image digest matches).
 
 Needed by A0 M0.3.
 
@@ -117,6 +128,12 @@ Needed by the SS6M audit requirement and A1 M1.3 (100% audit coverage).
 
 ### 6. Declarative configuration
 
+**Partly done in 1.0.0:** `llmctl apply <file.yaml…>` covers the models:
+idempotent, with `--dry-run`, `--prune`, merged fragments and errors that
+name the file and line. Still open: the gateway and registry settings in the
+same file, and booting from the file (a unit that runs `apply`) instead of
+the autostart manifest.
+
 The interactive menus, profiles and `launch.json` state suit a desk. A
 server wants one file per host that says what runs:
 
@@ -168,7 +185,9 @@ A0 M0.4 runs chaos tests the router must pass:
   closed it (the gateway speaks HTTP/1.1 keep-alive), cluster membership
   changing during the run (ws's gateway started and stopped in parallel),
   or the LAN. The SS6M harness now records the phase and time of each
-  failure; reproduce with the new logging before M0.2 decides.
+  failure; reproduce with the new logging before M0.2 decides. Since 1.0.0
+  the gateway's listen backlog is 128 (it was 5), which removes one more
+  candidate: a burst of 16 new connections overflowing it.
 
 ### 9. Reproducible builds and supply chain
 
@@ -185,9 +204,10 @@ A0 M0.4 runs chaos tests the router must pass:
 - **GPU placement.** Pin an instance to a GPU index (`CUDA_VISIBLE_DEVICES`
   or CDI device) and report VRAM per instance. On two L40S the LLM gets GPU 1
   alone, and small models share GPU 2 under measured budgets.
-- **Version and protocol stability.** A documented compatibility promise for
-  the gateway API (`/v1/models` fields under `llmctl`, error codes) and the
-  cluster protocol, so SS6M clients can pin against it.
+- **Version and protocol stability.** **Done in 1.0.0:**
+  [compatibility.md](compatibility.md) documents what 1.x keeps stable: the
+  gateway API, `/v1/models` fields, exit codes, JSON outputs, the manifest
+  and serving-file formats, and the cluster protocol.
 - **Request limits.** Maximum body size, maximum tokens per request,
   per-client rate limits and queue limits, with OpenAI-style errors.
 - **Structured logs.** JSON lines with request ids, matching the audit event

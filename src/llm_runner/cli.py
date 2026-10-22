@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -22,6 +23,8 @@ import click
 
 from llm_runner import __version__
 from llm_runner import backends
+from llm_runner import bundle
+from llm_runner import containers
 from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner import registry
@@ -186,6 +189,45 @@ def _run_option_args(ctx: click.Context) -> list[str]:
     return args
 
 
+def _resolve_runtime(backend: str, kind: str | None, image: str | None,
+                     allow_tag: bool, gpu: str | None) -> dict:
+    """The runtime for one launch: the flags, else ``config runtime``."""
+    try:
+        gpus = containers.parse_gpus(gpu)
+    except ValueError as e:
+        raise click.BadOptionUsage("--gpu", str(e)) from None
+    configured = containers.runtime_from_config(backend, config_mod.load())
+    if image and kind == containers.HOST:
+        raise click.UsageError("--image needs --runtime docker.")
+    kind = kind or (containers.DOCKER if image else configured["kind"])
+    runtime: dict = {"kind": kind, "gpus": gpus}
+    if kind != containers.DOCKER:
+        return runtime
+    if backend not in containers.CONTAINER_BACKENDS:
+        raise click.UsageError(f"{backend} has no container runtime; use --runtime host.")
+    if containers.docker_bin() is None:
+        raise click.UsageError("--runtime docker needs the docker CLI on PATH.")
+    ref = image or (configured.get("image") if configured["kind"] == containers.DOCKER
+                    else None) or containers.default_image(backend)
+    if not ref:
+        raise click.UsageError(f"No image for {backend}: pass --image repo@sha256:… or "
+                               f"`llmctl config runtime {backend} docker --image …`.")
+    if not containers.is_pinned(ref) and not allow_tag:
+        raise click.UsageError(f"{ref} is not pinned by digest. Use repo@sha256:…, or "
+                               "--allow-tag for development.")
+    try:
+        digest = containers.resolve_digest(ref)
+    except containers.ContainerError as e:
+        raise click.UsageError(str(e)) from None
+    runtime.update(image=ref, digest=digest)
+    if configured.get("network"):
+        runtime["network"] = configured["network"]
+    expected = containers.expected_images().get(backend) or {}
+    if expected.get("image") == ref and expected.get("engine_version"):
+        runtime["engine_version"] = expected["engine_version"]
+    return runtime
+
+
 def _require_backend(backend: str) -> str:
     """Return the server binary for ``backend`` or fail with an install hint."""
     binary = backends.find(backend)
@@ -332,8 +374,84 @@ def config_show() -> None:
                    + (f"  (nvcc takes GCC ≤ {limit})" if limit else ""))
         click.echo(f"  CC={tc['CC']}  CXX={tc['CXX']}" if "CC" in tc else
                    "  (no system GCC nvcc accepts — the inherited compilers apply)")
+    click.echo("\nRuntimes (`llmctl config runtime`):")
+    for backend in containers.CONTAINER_BACKENDS:
+        rt = containers.runtime_from_config(backend, stored)
+        line = rt["kind"] + (f"  {rt.get('image')}" if rt["kind"] == containers.DOCKER else "")
+        click.echo(f"  {backend:<6} {line}")
+    click.echo(f"  GPUs via {'CDI' if containers.has_cdi() else '--gpus'}")
     gw_port = config_mod.get_gateway_port()
     click.echo(f"\nGateway: {'off' if gw_port is None else f'port {gw_port}'}")
+
+
+@config.command("runtime")
+@click.argument("backend", required=False,
+                type=click.Choice(list(containers.CONTAINER_BACKENDS)))
+@click.argument("kind", required=False, type=click.Choice(list(containers.RUNTIMES)))
+@click.option("--image", default=None, metavar="REF",
+              help="Image for docker, pinned by digest (repo@sha256:…). Default: the "
+                   "one this llmctl was tested with (`llmctl images`).")
+@click.option("--network", default=None,
+              help="Docker network the containers join (default: bridge).")
+@click.option("--allow-tag", is_flag=True, default=False,
+              help="Accept an image by tag (development only).")
+def config_runtime(backend: str | None, kind: str | None, image: str | None,
+                   network: str | None, allow_tag: bool) -> None:
+    """Run BACKEND's servers as host processes or Docker containers.
+
+    \b
+      llmctl config runtime                       # show
+      llmctl config runtime vllm docker           # the tested image
+      llmctl config runtime vllm docker --image vllm/vllm-openai@sha256:…
+      llmctl config runtime vllm host
+
+    Applies to new starts; `run --runtime` overrides it per launch. Running
+    servers keep the runtime they started with."""
+    cfg = config_mod.load()
+    if backend is None:
+        for b in containers.CONTAINER_BACKENDS:
+            rt = containers.runtime_from_config(b, cfg)
+            click.echo(f"{b:<6} {rt['kind']}"
+                       + (f"  {rt.get('image')}" if rt["kind"] == containers.DOCKER else "")
+                       + (f"  network={rt['network']}" if rt.get("network") else ""))
+        return
+    if kind is None:
+        raise click.UsageError("Give the runtime: host or docker.")
+    entry: dict = {"kind": kind}
+    if kind == containers.DOCKER:
+        ref = image or containers.default_image(backend)
+        if not ref:
+            raise click.UsageError(f"No tested image for {backend}; pass --image.")
+        if not containers.is_pinned(ref) and not allow_tag:
+            raise click.UsageError(f"{ref} is not pinned by digest (repo@sha256:…); "
+                                   "--allow-tag accepts it for development.")
+        entry["image"] = ref
+        if network:
+            entry["network"] = network
+        if containers.inspect_image(ref) is None:
+            click.echo(f"note: {ref} is not on this host yet; `docker pull` or "
+                       "`docker load` it before starting a model.", err=True)
+    elif image or network:
+        raise click.UsageError("--image and --network only apply to docker.")
+    runtimes = dict(cfg.get("runtime") or {})
+    runtimes[backend] = entry
+    config_mod.update(runtime=runtimes)
+    click.echo(f"{backend}: {kind}" + (f"  {entry['image']}" if "image" in entry else ""))
+
+
+@cli.command("images")
+@click.option("--json", "as_json", is_flag=True, help="Print images.json as shipped.")
+def images_cmd(as_json: bool) -> None:
+    """The container images this llmctl version was tested with."""
+    imgs = containers.expected_images()
+    if as_json:
+        click.echo(json.dumps({"schema": "llmctl-images/1", "llmctl": __version__,
+                               "images": imgs}, indent=2))
+        return
+    for backend, e in imgs.items():
+        present = containers.inspect_image(e["image"]) is not None
+        click.echo(f"{backend:<6} {e['image']}\n       {e.get('tag', '')}  "
+                   f"{'present' if present else 'not on this host'}")
 
 
 def _engine_bin_command(engine: str) -> None:
@@ -527,16 +645,23 @@ def list_cmd() -> None:
         click.echo("\n(no models found — use `llmctl download <repo>` to fetch one)")
         return
     key_w = max(20, max(len(k) for k in specs))
+    sources = {key: _read_source(s.model_path if s.model_path.is_dir() else s.model_path.parent)
+               for key, s in specs.items()}
     click.echo("")
-    click.echo(f"{'KEY':<{key_w}}  {'BACKEND':<7}  {'SIZE':>8}  {'VISION':<6}  {'DRAFT':<6}  {'DECISION':<8}  PATH")
-    click.echo("-" * (key_w + 67))
+    click.echo(f"{'KEY':<{key_w}}  {'BACKEND':<7}  {'SIZE':>8}  {'VISION':<6}  {'DRAFT':<6}  "
+               f"{'DECISION':<8}  {'REVISION':<12}  {'LICENSE':<12}  PATH")
+    click.echo("-" * (key_w + 95))
     for key, spec in specs.items():
         size = _fmt_size(spec.size).strip()
         vision = "yes" if spec.has_vision else ""
         draft = "yes" if spec.has_draft else ""
         decision = "yes" if spec.decision else ""
+        src = sources[key]
+        rev = (src.get("revision") or "")[:12]
+        lic = (src.get("license") or "")[:12]
         rel = spec.model_path.relative_to(MODELS_DIR) if spec.model_path.is_relative_to(MODELS_DIR) else spec.model_path
-        click.echo(f"{key:<{key_w}}  {spec.backend:<7}  {size:>8}  {vision:<6}  {draft:<6}  {decision:<8}  {rel}")
+        click.echo(f"{key:<{key_w}}  {spec.backend:<7}  {size:>8}  {vision:<6}  {draft:<6}  "
+                   f"{decision:<8}  {rev:<12}  {lic:<12}  {rel}")
 
 
 def _profile_flags(values: dict) -> str:
@@ -641,6 +766,24 @@ def profile_rm(name: str) -> None:
               help="Environment variable for the server process; repeatable. "
                    "Remembered for restart/restore. e.g. "
                    "-E VLLM_USE_FLASHINFER_SAMPLER=0.")
+@click.option("--runtime", "runtime_kind", type=click.Choice(["host", "docker"]),
+              default=None,
+              help="Run the server as a host process or in a Docker container. "
+                   "Default: `llmctl config runtime <backend>` (host unless set).")
+@click.option("--image", default=None, metavar="REF",
+              help="Container image (implies --runtime docker), pinned by digest: "
+                   "repo@sha256:…. Default: the configured image, else the one this "
+                   "llmctl was tested with (`llmctl config runtime`).")
+@click.option("--allow-tag", is_flag=True, default=False,
+              help="Accept an image by tag instead of digest (development only).")
+@click.option("--gpu", "gpu", default=None, metavar="all|N[,N…]",
+              help="GPUs the server may use (default all). Containers get them "
+                   "through CDI or --gpus; host processes through "
+                   "CUDA_VISIBLE_DEVICES.")
+@click.option("--kv-cache-mem", "kv_cache_mem", default=None, metavar="SIZE",
+              help="vllm only: fixed KV cache size per GPU (--kv-cache-memory-bytes), "
+                   "e.g. 6G, instead of sizing it from free memory. Hybrid models "
+                   "(Qwen3.5/3.6) need it for reliable warm restarts.")
 @click.option("--reasoning", is_flag=True, default=False,
               help="Enable reasoning. Disabled by default (--reasoning-budget 0). "
                    "llama only; for vllm/sglang see --reasoning-parser.")
@@ -734,6 +877,8 @@ def profile_rm(name: str) -> None:
 def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         ctx_size: int | None, ft_path: Path | None, ft_name: str | None,
         group_name: str | None, wait: bool, menu: bool | None, profile: str | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
+        runtime_kind: str | None, image: str | None, allow_tag: bool, gpu: str | None,
+        kv_cache_mem: str | None,
         reasoning: bool,
         kv_quant: str, gpu_mem: float | None, tool_parser: str | None,
         reasoning_parser: str | None, trust_remote_code: bool,
@@ -801,8 +946,16 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     elif backend == DECIDER and not backends.is_decider_model_dir(model_path):
         raise click.UsageError(
             f"'{model_path.name}' is not a decider checkpoint (no decider_config.json).")
-    binary = _require_backend(backend)
+    runtime = _resolve_runtime(backend, runtime_kind, image, allow_tag, gpu)
+    # A container brings its own engine; the host needn't have one.
+    binary = backend if runtime["kind"] == containers.DOCKER else _require_backend(backend)
     _warn_foreign_flags(ctx, backend)
+    if kv_cache_mem is not None:
+        if backend != VLLM:
+            raise click.UsageError("--kv-cache-mem is vllm-only (--kv-cache-memory-bytes).")
+        if not re.fullmatch(r"\d+(\.\d+)?[kKmMgGtT]?", kv_cache_mem):
+            raise click.BadOptionUsage("--kv-cache-mem",
+                                       f"--kv-cache-mem takes a size like 6G, not '{kv_cache_mem}'")
     if backend in HF_ENGINES and kv_quant == "q4_0":
         raise click.UsageError(f"{backend} has no 4-bit KV cache here; use "
                                "--kv-quant q8_0 (→ fp8) or f16.")
@@ -871,6 +1024,14 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
             reasoning_parser=reasoning_parser,
             trust_remote_code=trust_remote_code, host=config_mod.get_bind_host(),
             extra=extra_args)
+        if kv_cache_mem is not None:
+            cmd += ["--kv-cache-memory-bytes", kv_cache_mem]
+        if backend == VLLM and kv_cache_mem is None and "--kv-cache-memory-bytes" not in \
+                " ".join(extra_args) and backends.hf_is_hybrid(model_path):
+            click.echo("warning: hybrid model without a fixed KV size; a warm restart can "
+                       "run out of memory in chunk_gated_delta_rule. Pass --kv-cache-mem "
+                       "(e.g. the size the first start logged as 'Available KV cache "
+                       "memory').", err=True)
     else:
         # Known llama.cpp footgun: quantizing the *target* KV cache zeroes MTP /
         # speculative acceptance, so the drafter runs but never gets accepted —
@@ -926,9 +1087,15 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         group = ""
     rec = proc.start(name=name, cmd=cmd, port=chosen_port,
                      model_path=str(model_path), run_args=run_args,
-                     backend=backend, env=env, group=group)
+                     backend=backend, env=env, group=group, runtime=runtime)
     click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  backend={backend}"
                + (f"  group={group}" if group else ""))
+    rt = rec.runtime or {}
+    if rt.get("kind") == containers.DOCKER:
+        click.echo(f"Runtime: docker {rt['image']}  (digest {rt.get('digest')}, "
+                   f"container {rt.get('container')})")
+    if rt.get("cache_dir"):
+        click.echo(f"Cache:   {rt['cache_dir']}  (shipped cache rule: {rt.get('cache_rule')})")
     _ensure_gateway()
     if env:
         click.echo("Env:     " + " ".join(f"{k}={v}" for k, v in env.items()))
@@ -967,14 +1134,25 @@ def ps_cmd(show_all: bool) -> None:
     if not procs:
         click.echo("(no models running)")
         return
-    click.echo(f"{'PID':<8} {'PORT':<6} {'BACKEND':<8} {'STARTED':<20} NAME")
-    click.echo("-" * 78)
+    click.echo(f"{'PID':<8} {'PORT':<6} {'BACKEND':<8} {'STARTED':<20} {'NAME':<28} RUNTIME")
+    click.echo("-" * 100)
     for p in procs:
         started = dt.datetime.fromtimestamp(p.started_at).strftime("%Y-%m-%d %H:%M:%S")
-        click.echo(f"{p.pid:<8} {p.port:<6} {p.backend:<8} {started:<20} {p.name}")
+        click.echo(f"{p.pid:<8} {p.port:<6} {p.backend:<8} {started:<20} {p.name:<28} "
+                   f"{_runtime_label(p.runtime)}")
     gw = _gateway_record()
     if gw:
         click.echo(f"\nAll models: {_gateway_url(gw.port)}  (GET /v1/models lists them)")
+
+
+def _runtime_label(rt: dict | None) -> str:
+    """``host``, or ``docker vllm-openai@sha256:1a2b3c4d5e6f`` (short digest)."""
+    if not rt or rt.get("kind") != containers.DOCKER:
+        gpus = (rt or {}).get("gpus")
+        return "host" + (f" gpu={gpus}" if gpus and gpus != "all" else "")
+    repo = rt.get("image", "").split("@")[0].rsplit("/", 1)[-1].split(":")[0]
+    digest = (rt.get("digest") or "").removeprefix("sha256:")[:12]
+    return f"docker {repo}@sha256:{digest}"
 
 
 def _ps_cluster() -> None:
@@ -1203,11 +1381,17 @@ def restore(names: tuple[str, ...]) -> None:
     """
     # Only demand the binaries the manifest actually needs. A vllm/sglang
     # entry records an absolute binary path, so it doesn't depend on PATH.
-    wanted = {s.backend for s in proc.autostart_list()
-              if not names or s.name in names}
+    specs = [s for s in proc.autostart_list() if not names or s.name in names]
+    in_docker = [s for s in specs if (s.runtime or {}).get("kind") == containers.DOCKER]
+    wanted = {s.backend for s in specs if s not in in_docker}
     for backend in sorted(wanted):
         if backends.find(backend) is None:
             click.echo(f"warning: {backends.missing_hint(backend)}", err=True)
+    # At boot this user unit can't order itself after the system's docker
+    # service, so give the daemon a minute to come up.
+    if in_docker and not containers.wait_for_docker(60):
+        click.echo("warning: the docker daemon isn't answering; container models will "
+                   "fail to start.", err=True)
     results = proc.restore(list(names) or None, host=config_mod.get_bind_host())
     if not results:
         click.echo("Nothing to restore (autostart manifest is empty).")
@@ -2437,10 +2621,14 @@ def _resolve_update_target(target: str | None) -> tuple[str, Path, str | None]:
     """
     specs = discover_models()
     updatable: dict[str, tuple[str, Path, str | None]] = {}
+    installed: set[str] = set()
     for key, spec in specs.items():
         # GGUF: the folder holding the file. vllm: the checkpoint dir itself,
         # which is re-snapshotted whole (no single file to name).
         folder = spec.model_path if spec.backend == VLLM else spec.model_path.parent
+        if _read_source(folder).get("source") == "install":
+            installed.add(key)
+            continue
         repo = _read_source(folder).get("repo_id")
         if repo:
             known = None if spec.backend == VLLM else spec.model_path.name
@@ -2455,6 +2643,10 @@ def _resolve_update_target(target: str | None) -> tuple[str, Path, str | None]:
         return updatable[key]
     if target in updatable:
         return updatable[target]
+    if target in installed:
+        raise click.UsageError(
+            f"'{target}' was installed from a bundle; there's no repo to re-check. "
+            "Install the new version side by side (`llmctl install <bundle> --name …`).")
     if target in specs:
         raise click.UsageError(
             f"No source repo recorded for '{target}' (downloaded before provenance "
@@ -2491,10 +2683,390 @@ def update(target: str | None, filename: str | None, no_mmproj: bool,
                   revalidate=True, target_dir=target_dir, hf=hf)
 
 
+# ------------------------------------------------------------- apply --
+
+def _model_key(model: str, specs: dict) -> str | None:
+    """A serving file's ``model``: a model key, or a folder under MODELS_DIR."""
+    if model in specs:
+        return model
+    hits = [k for k, s in specs.items()
+            if (s.model_path if s.model_path.is_dir() else s.model_path.parent).name == model]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _same_runtime(recorded: dict | None, desired: dict) -> bool:
+    host = {"kind": containers.HOST, "gpus": "all"}
+    return (proc.chosen_runtime(recorded) or host) == (proc.chosen_runtime(desired) or host)
+
+
+def _plan_apply(entries: list, prune: bool) -> tuple[list, list[str]]:
+    """What `apply` would do: one Action per entry (plus stops with --prune)."""
+    from llm_runner import apply as apply_mod
+    specs = discover_models()
+    problems: list[str] = []
+    running = {p.name: p for p in proc.list_running() if p.backend in backends.BACKENDS}
+    autostart = {s.name: s for s in proc.autostart_list()}
+    wanted = {e.name for e in entries}
+    actions: list = []
+    stopping = set(running) - wanted if prune else set()
+    for e in entries:
+        key = _model_key(e.model, specs)
+        if key is None:
+            problems.append(f"{e.where}: models.{e.name}.model {e.model!r} is not a model "
+                            f"key or folder under {MODELS_DIR}")
+            continue
+        argv = e.run_argv(key)
+        try:
+            ctx = run.make_context("run", list(argv))
+            backend = ctx.params["backend"]
+            if backend == "auto":
+                backend = specs[key].backend
+            desired_rt = _resolve_runtime(backend, ctx.params["runtime_kind"],
+                                          ctx.params["image"], ctx.params["allow_tag"],
+                                          ctx.params["gpu"])
+        except click.ClickException as err:
+            problems.append(f"{e.where}: models.{e.name}: {err.format_message()}")
+            continue
+        desired = [key, *_run_option_args(ctx)]
+        rec, spec = running.get(e.name), autostart.get(e.name)
+        if rec is None:
+            action, why = "start", "not running"
+        elif spec is None:
+            action, why = "restart", "running without a launch record"
+        elif spec.port != e.port or rec.port != e.port:
+            action, why = "restart", f"port {rec.port} -> {e.port}"
+        elif spec.run_args != desired:
+            action, why = "restart", apply_mod.diff_args(spec.run_args, desired)
+        elif not _same_runtime(rec.runtime, desired_rt):
+            action, why = "restart", "runtime or image changed"
+        else:
+            action, why = "unchanged", ""
+        if action != "unchanged":
+            other = next((p for p in running.values() if p.port == e.port
+                          and p.name != e.name and p.name not in stopping), None)
+            if other is not None:
+                problems.append(f"{e.where}: port {e.port} is in use by running model "
+                                f"{other.name!r} (stop it, or apply with --prune)")
+                continue
+        actions.append(apply_mod.Action(e.name, action, e.port, why, argv))
+    for name in sorted(stopping):
+        actions.append(apply_mod.Action(name, "stop", running[name].port,
+                                        "not in the serving files (--prune)"))
+    return actions, problems
+
+
+@cli.command("apply")
+@click.argument("files", nargs=-1, required=True,
+                type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Show what would start, restart and stop; change nothing.")
+@click.option("--prune", is_flag=True, default=False,
+              help="Also stop running models that no file lists.")
+@click.option("--wait/--no-wait", "wait", default=True, show_default=True,
+              help="Wait for each started model to answer /health before the next.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Print one JSON result on stdout; progress goes to stderr.")
+def apply_cmd(files: tuple[Path, ...], dry_run: bool, prune: bool, wait: bool,
+              as_json: bool) -> None:
+    """Make the running models match serving FILES (YAML).
+
+    Each entry under `models:` is started as `llmctl run` would start it. An
+    entry already running with the same arguments is left alone; a changed one
+    is restarted; a missing one is started. Nothing else is stopped unless
+    --prune. Several files merge (a bundle's fragment plus a host file). See
+    the README for the keys.
+
+    \b
+    Exit codes: 0 done (or nothing to do), 3 invalid files, 1 a start failed.
+    """
+    from llm_runner import apply as apply_mod
+    try:
+        entries = apply_mod.load(list(files))
+        actions, problems = _plan_apply(entries, prune)
+        if problems:
+            raise apply_mod.ApplyError(problems)
+    except apply_mod.ApplyError as e:
+        if as_json:
+            click.echo(json.dumps({"ok": False, "error": "invalid", "problems": e.problems},
+                                  indent=2))
+        else:
+            for p in e.problems:
+                click.echo(f"error: {p}", err=True)
+        sys.exit(e.exit_code)
+
+    say = (lambda m: click.echo(m, err=True)) if as_json else click.echo
+    for a in actions:
+        say(f"{a.action:<10} {a.name:<28} port {a.port}" + (f"  ({a.reason})" if a.reason else ""))
+    failed = False
+    if not dry_run:
+        out = sys.stderr if as_json else sys.stdout
+        for a in [a for a in actions if a.action in ("stop", "restart")]:
+            proc.stop(a.name)
+        for a in [a for a in actions if a.action in ("start", "restart")]:
+            say(f"\n==> llmctl run {shlex.join(a.argv)}")
+            try:
+                with contextlib.redirect_stdout(out):
+                    run.main(args=[*a.argv, "--wait" if wait else "--no-wait"],
+                             prog_name="llmctl run", standalone_mode=False)
+            except SystemExit as ex:
+                if ex.code:
+                    a.action, a.reason, failed = "error", "did not become healthy", True
+            except click.ClickException as ex:
+                a.action, a.reason, failed = "error", ex.format_message(), True
+            except Exception as ex:          # one bad entry never stops the rest
+                a.action, a.reason, failed = "error", str(ex), True
+            if a.action == "error":
+                say(f"error: {a.name}: {a.reason}")
+    if as_json:
+        click.echo(json.dumps({"ok": not failed, "dry_run": dry_run,
+                               "actions": [a.to_json() for a in actions]}, indent=2))
+    elif not dry_run:
+        changed = sum(a.action in ("start", "restart", "stop") for a in actions)
+        click.echo(f"\n{changed} change(s), {sum(a.action == 'unchanged' for a in actions)} "
+                   "unchanged" + (", with errors" if failed else "") + ".")
+    if failed:
+        sys.exit(1)
+
+
+# ------------------------------------------------------------ bundles --
+
+def _bundle_fail(e: bundle.BundleError, as_json: bool) -> None:
+    """Report a bundle error and exit with its documented code."""
+    if as_json:
+        click.echo(json.dumps(e.to_json(), indent=2))
+    else:
+        click.echo(f"error: {e}", err=True)
+        for m in e.details.get("mismatches", []):
+            what = ("missing" if m.get("missing") else
+                    f"size {m['actual_size']} != {m['expected_size']}" if "actual_size" in m
+                    else f"sha256 {m.get('actual')} != {m['expected']}")
+            click.echo(f"  {m['path']}: {what}", err=True)
+    sys.exit(e.exit_code)
+
+
+def _progress(as_json: bool):
+    """Progress on stderr: big files by name, the rest every few seconds."""
+    last = [0.0]
+
+    def show(i: int, n: int, f) -> None:
+        big = getattr(f, "size", 0) >= 256 << 20
+        if big or time.time() - last[0] >= 5 or i == n - 1:
+            last[0] = time.time()
+            click.echo(f"  [{i + 1}/{n}] {getattr(f, 'path', f)}", err=True)
+    return show if sys.stderr.isatty() or as_json else None
+
+
+def _expected_cache_rule(caches: list[dict]) -> str:
+    """The rule a vllm start with today's config would match, for the report."""
+    rt = containers.runtime_from_config(VLLM, config_mod.load())
+    docker = rt["kind"] == containers.DOCKER
+    digest = containers.pinned_digest(rt.get("image") or "") if docker else None
+    ver = None if docker else containers.engine_version(VLLM)
+    _, rule = containers.match_cache(caches, kind="vllm", digest=digest, engine_ver=ver,
+                                     arch=containers.gpu_arch(0))
+    return rule
+
+
+@cli.command("install")
+@click.argument("source")
+@click.option("--name", default=None,
+              help="Folder under MODELS_DIR (default: the manifest's name). Install "
+                   "versions side by side, e.g. --name qwen3.5-9b-2026.10.1.")
+@click.option("--replace", is_flag=True, default=False,
+              help="Replace an existing folder of that name (refused while it's served).")
+@click.option("--plain-http", is_flag=True, default=False,
+              help="oci:// only: talk HTTP to the registry (a local zot without TLS).")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Print one JSON result on stdout; messages go to stderr.")
+def install_cmd(source: str, name: str | None, replace: bool, plain_http: bool,
+                as_json: bool) -> None:
+    """Install a model bundle into MODELS_DIR, verifying every file.
+
+    SOURCE is a bundle directory (holding llmctl-manifest.json) or
+    oci://registry/repo@sha256:… (pulled with the `oras` CLI). Every listed
+    file's size and sha256 must match the manifest, or nothing is installed.
+    Works offline.
+
+    \b
+    Exit codes: 0 installed, 3 bad manifest, 4 checksum mismatch,
+    5 name conflict, 6 source unreachable, 1 anything else.
+    """
+    served = {p.model_path for p in proc.list_running()}
+    tmp: Path | None = None
+    try:
+        if source.startswith("oci://"):
+            MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = Path(tempfile.mkdtemp(prefix=".pull-", dir=MODELS_DIR))
+            if not as_json:
+                click.echo(f"Pulling {source} ...", err=True)
+            src_dir = bundle.pull_oci(source.removeprefix("oci://"), tmp,
+                                      plain_http=plain_http)
+            move = True
+        else:
+            src_dir = Path(source).expanduser()
+            if not src_dir.is_dir():
+                raise bundle.BadManifest(f"{source} is not a directory or an oci:// ref")
+            move = False
+        result = bundle.install(src_dir, MODELS_DIR, name=name, replace=replace,
+                                served=served, move=move, progress=_progress(as_json))
+    except bundle.BundleError as e:
+        _bundle_fail(e, as_json)
+        return
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+    result["cache"] = ({"shipped": True, "seeded": False,
+                        "expected_rule": _expected_cache_rule(result["caches"]),
+                        "note": "seeded into the model's writable cache on its first start"}
+                       if result["caches"] else {"shipped": False, "seeded": False})
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    m = result["model"]
+    click.echo(f"Installed {result['name']}: {m['id']} @ {m['revision']} ({m['license']})")
+    click.echo(f"  {result['files_verified']} files verified, "
+               f"{_fmt_size(result['bytes']).strip()}, manifest sha256 "
+               f"{result['manifest_sha256']}")
+    click.echo(f"  {result['path']}")
+    if result["caches"]:
+        click.echo(f"  ships a compile cache (with today's config: "
+                   f"{result['cache']['expected_rule']} match)")
+
+
+def _model_folder(target: str) -> Path:
+    p = Path(target).expanduser()
+    if p.is_dir():
+        return p.resolve()
+    specs = discover_models()
+    if target in specs:
+        mp = specs[target].model_path
+        return mp if mp.is_dir() else mp.parent
+    if (MODELS_DIR / target).is_dir():
+        return MODELS_DIR / target
+    raise click.BadArgumentUsage(f"'{target}' is not a model key or folder.")
+
+
+@cli.command("verify")
+@click.argument("model")
+@click.option("--json", "as_json", is_flag=True, default=False)
+def verify_cmd(model: str, as_json: bool) -> None:
+    """Re-hash an installed model against the checksums recorded at install.
+
+    Exit codes: 0 all match, 3 not installed from a bundle, 4 mismatch."""
+    folder = _model_folder(model)
+    try:
+        result = bundle.verify(folder)
+    except bundle.BundleError as e:
+        _bundle_fail(e, as_json)
+        return
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        click.echo(f"OK: {result['files_verified']} files in {folder} match "
+                   f"(manifest sha256 {result['manifest_sha256']}).")
+
+
+@cli.command("manifest")
+@click.argument("folder", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--id", "model_id", default=None,
+              help="Upstream model id (default: the repo recorded at download).")
+@click.option("--revision", default=None,
+              help="Upstream revision, e.g. the commit (default: recorded, else 'unknown').")
+@click.option("--license", "license_", required=True, help="SPDX id, or 'other'.")
+@click.option("--license-file", default=None, help="The licence file in FOLDER, if any.")
+@click.option("--name", default=None, help="Default install name (default: FOLDER's name).")
+@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
+              help="Where to write it (default: FOLDER/llmctl-manifest.json).")
+def manifest_cmd(folder: Path, model_id: str | None, revision: str | None,
+                 license_: str, license_file: str | None, name: str | None,
+                 output: Path | None) -> None:
+    """Write an llmctl-manifest.json for FOLDER, making it a bundle.
+
+    Hashes every file (llmctl's own files and hidden top-level entries
+    excepted). Cache subtrees written by `llmctl cache export` are listed
+    under `caches`."""
+    src = _read_source(folder)
+    model_id = model_id or src.get("repo_id")
+    if not model_id:
+        raise click.UsageError("No recorded source repo; pass --id.")
+    fmt = "hf" if backends.is_hf_model_dir(folder) else "gguf"
+    try:
+        data = bundle.build_manifest(
+            folder, name=name or folder.name, model_id=model_id,
+            revision=revision or src.get("revision") or "unknown", license=license_,
+            fmt=fmt, license_file=license_file, progress=_progress(False))
+    except bundle.BundleError as e:
+        _bundle_fail(e, False)
+        return
+    out = output or folder / bundle.MANIFEST_FILE
+    out.write_text(json.dumps(data, indent=2) + "\n")
+    click.echo(f"Wrote {out}: {len(data['files'])} files"
+               + (f", {len(data['caches'])} cache(s)" if data.get("caches") else ""))
+
+
+@cli.group("cache")
+def cache_group() -> None:
+    """Per-model compile caches (vLLM torch.compile, Triton, FlashInfer)."""
+
+
+@cache_group.command("export")
+@click.argument("name")
+@click.argument("bundle_dir", type=click.Path(file_okay=False, path_type=Path))
+@click.option("--path", "path_in_bundle", default="cache/vllm", show_default=True,
+              help="Where in BUNDLE_DIR the cache goes (its manifest `caches.path`).")
+@click.option("--from", "from_dir", type=click.Path(exists=True, file_okay=False,
+                                                     path_type=Path), default=None,
+              help="The cache dir to export, when NAME has several.")
+@click.option("--json", "as_json", is_flag=True, default=False)
+def cache_export(name: str, bundle_dir: Path, path_in_bundle: str,
+                 from_dir: Path | None, as_json: bool) -> None:
+    """Copy model NAME's warm compile cache into BUNDLE_DIR.
+
+    Start NAME once (in the image the bundle targets) so it compiles, then
+    export. `llmctl manifest` lists the exported subtree under `caches`.
+
+    \b
+    Exit codes: 0 exported, 3 bad --path, 1 no cache / not empty."""
+    try:
+        path_in_bundle = bundle.safe_relpath(path_in_bundle, "--path")
+    except bundle.BundleError as e:
+        _bundle_fail(e, as_json)
+        return
+    if from_dir is None:
+        running = proc.find(name)
+        cache = (running.runtime or {}).get("cache_dir") if running else None
+        if cache:
+            from_dir = Path(cache)
+        else:
+            dirs = containers.find_cache_dirs(proc.STATE_DIR, name)
+            if len(dirs) != 1:
+                msg = (f"no compile cache for '{name}'" if not dirs else
+                       f"'{name}' has {len(dirs)} caches; pick one with --from: "
+                       + ", ".join(map(str, dirs)))
+                _bundle_fail(bundle.BundleError(msg), as_json)
+                return
+            from_dir = dirs[0]
+    out = bundle_dir / path_in_bundle
+    try:
+        entry = containers.export_cache(from_dir, out, path_in_bundle=path_in_bundle)
+    except containers.ContainerError as e:
+        _bundle_fail(bundle.BundleError(str(e)), as_json)
+        return
+    files = sum(1 for p in out.rglob("*") if p.is_file())
+    size = sum(p.stat().st_size for p in out.rglob("*") if p.is_file())
+    result = {"ok": True, "name": name, "from": str(from_dir), "path": str(out),
+              "files": files, "bytes": size, "cache": entry}
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+    else:
+        click.echo(f"Exported {files} files ({_fmt_size(size).strip()}) from {from_dir}\n"
+                   f"  to {out}\n  manifest entry: {json.dumps(entry)}")
+
+
 # Non-model leftovers a download leaves in a model folder: the provenance
 # sidecar and huggingface_hub's local_dir cache. A folder holding nothing else
 # once its models are gone is removed too.
-_FOLDER_LEFTOVERS = {_SOURCE_FILE, ".cache"}
+_FOLDER_LEFTOVERS = {_SOURCE_FILE, bundle.INSTALLED_MANIFEST, ".cache"}
 
 
 def _removal_plan(spec: ModelSpec) -> list[Path]:

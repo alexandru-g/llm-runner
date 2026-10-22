@@ -143,6 +143,8 @@ def discover_models(models_dir: Path | None = None) -> dict[str, ModelSpec]:
     candidates: list[Path] = [
         p for p in sorted(base.rglob("*.gguf"))
         if "mmproj" not in p.name.lower() and not _looks_like_draft(p.stem)
+        # Not in an install that's still being verified (.install-*), etc.
+        and not any(part.startswith(".") for part in p.relative_to(base).parts[:-1])
     ]
     hf_dirs = _find_hf_dirs(base)
 

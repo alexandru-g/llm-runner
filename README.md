@@ -46,6 +46,20 @@ gateway on the new code (`llmctl gateway restart`); models keep running, and
 decision endpoints keep their old code until `llmctl restart`. To uninstall:
 `uv tool uninstall llm-runner systemone-proxy` (or `pipx uninstall …`).
 
+**Offline host?** Each release ships a wheelhouse: the `llmctl` wheel plus
+every dependency, per platform. Copy it over and install without an index:
+
+```bash
+sha256sum -c --ignore-missing sha256sums.txt
+tar xf llm-runner-1.0.0-wheelhouse-py312-x86_64.tar.gz
+cd llm-runner-1.0.0-wheelhouse-py312-x86_64 && ./install.sh --offline .
+```
+
+That runs `uv tool install --offline --no-index --find-links .` (or pip with
+`--no-index` when uv is missing), with the dependency versions pinned in
+`uv.lock`. Wheelhouses exist for Python 3.11 and 3.12 on x86_64 and aarch64.
+systemone-proxy isn't in them; its wheel is a separate release asset.
+
 **Hacking on the code instead?** Use `uv sync` to create a local `.venv/` and
 invoke via `uv run llmctl ...` from inside the repo — that picks up edits
 without reinstalling.
@@ -624,7 +638,8 @@ For a 17 GB Q4 weight file on a 24 GB card, `--kv-quant q8_0 -c 16384`
 llmctl ps
 ```
 
-Prints PID, port, start time, and name. Dead entries are pruned automatically.
+Prints PID, port, start time, name and runtime (`host`, or `docker` with the
+image's short digest). Dead entries are pruned automatically.
 When the gateway is up, its all-models URL is printed underneath.
 
 ### Stop a running model
@@ -801,6 +816,7 @@ llmctl run qwen3-8b --tool-parser hermes    # OpenAI tool calling (--enable-auto
 llmctl run qwen3-8b --reasoning-parser qwen3   # split thinking into reasoning_content
 llmctl run qwen3-8b --kv-quant q8_0         # → --kv-cache-dtype fp8 (no 4-bit KV in vllm)
 llmctl run qwen3-8b --n-parallel 16         # → --max-num-seqs
+llmctl run qwen3-8b --kv-cache-mem 6G       # → --kv-cache-memory-bytes (vllm only)
 llmctl run qwen3-8b -X '--max-num-batched-tokens 8192'   # anything else, verbatim
 llmctl run qwen3-8b -E VLLM_USE_FLASHINFER_SAMPLER=0     # env var for the server process
 llmctl run qwen3-8b --backend sglang --wait               # the same model on SGLang
@@ -839,6 +855,13 @@ cache (max_mamba_cache_size=34, 5 state slots per request)`. So with
 (at least +4) — 60 for N = 10, which took p95 TTFT at 10 users from 3.6 s to
 0.33 s for qwen3.5-9b on a 4090. Setting `--max-mamba-cache-size` or
 `--mamba-full-memory-ratio` in `-X` turns this off.
+
+`--kv-cache-mem SIZE` gives vLLM a fixed KV cache (`--kv-cache-memory-bytes`)
+instead of sizing it from the memory free at start. Hybrid models (Qwen3.5,
+Qwen3.6) need it: a warm restart frees less memory than a cold one expects
+and can run out in `chunk_gated_delta_rule`. llmctl warns when a hybrid
+model starts on vLLM without it. Take the size from a good start's log line
+`Available KV cache memory: 4.73 GiB`.
 
 `--gpu-mem` is how vllm and sglang share the card. vllm reserves that
 fraction of **total** GPU memory up front (all of it, as KV cache — even for
@@ -1029,6 +1052,179 @@ any$  llmctl ps --all                           # every model, and where calls g
 - Each gateway port (9000) must be reachable from the other machines, e.g.
   `sudo ufw allow from 192.168.8.0/24 to any port 9000 proto tcp`.
 
+## Production: containers, bundles and serving files
+
+For a server that runs from pinned images, installs models from offline
+bundles and is described by a file. Everything here works without network
+access. The compatibility promise for these interfaces is in
+[docs/compatibility.md](docs/compatibility.md).
+
+### Run a backend in a container
+
+```bash
+llmctl images                               # the images this llmctl was tested with
+docker pull vllm/vllm-openai@sha256:c291…   # or `docker load` from a bundle
+llmctl config runtime vllm docker           # every vllm start from now on
+llmctl config runtime llama docker --image ghcr.io/ggml-org/llama.cpp@sha256:…
+llmctl run qwen3-8b --runtime docker --gpu 1     # or per launch
+llmctl config runtime vllm host             # back to host processes
+```
+
+vLLM, SGLang and llama.cpp can run in Docker; host processes stay the
+default. What a container start does:
+
+- The image must be pinned by digest (`repo@sha256:…`); `--allow-tag` accepts
+  a tag for development. llmctl never pulls: a missing image is an error.
+- GPUs come through CDI (`--device nvidia.com/gpu=N`) when the host has CDI
+  specs (`nvidia-ctk cdi generate`), else `--gpus`. `--gpu 0,1` picks them;
+  on the host runtime it sets `CUDA_VISIBLE_DEVICES`.
+- The model's folder is mounted read-only at `/model`, `MODELS_DIR` at
+  `/models`. Files outside `MODELS_DIR` aren't visible in the container.
+- The port is published on the bind address only (`llmctl config bind`); the
+  engine listens on `0.0.0.0` inside. The container joins the `bridge`
+  network unless `config runtime … --network NAME` says otherwise. Docker
+  can't publish a port from a container with no network, so block egress on
+  the host: a `DOCKER-USER` iptables rule that drops new outbound
+  connections from the Docker bridge.
+- It runs as your user, with the offline and telemetry variables set and
+  no host compiler: the image brings its own.
+- `docker run` stays attached, so `ps`, `logs`, `stop`, `--wait`, `restart`
+  and `restore` work as for host processes. `stop` also runs `docker stop`.
+
+The image and its digest are reported in `ps`, in `/v1/models` (the
+`llmctl` object's `runtime`, `image` and `image_digest`, per node too), in the
+first lines of the model's log, and in the gateway's log when it starts
+routing to the model.
+
+### Install a model bundle
+
+A bundle is a directory with an `llmctl-manifest.json` and the files it
+lists:
+
+```json
+{
+  "schema": "llmctl-manifest/1",
+  "name": "qwen3.5-9b",
+  "model": {"id": "Qwen/Qwen3.5-9B", "revision": "4f1c…", "format": "hf",
+            "license": "apache-2.0", "license_file": "LICENSE"},
+  "files": [{"path": "config.json", "size": 1534, "sha256": "9b1e…"}, …],
+  "caches": [{"kind": "vllm", "path": "cache/vllm", "engine": "vllm",
+              "engine_version": "0.29.0", "image": "vllm/vllm-openai@sha256:…",
+              "gpu_arch": "sm_89"}]
+}
+```
+
+```bash
+llmctl manifest /fast/ml/models/qwen3.5-9b --license apache-2.0 --revision 4f1c…
+llmctl install /media/usb/qwen3.5-9b --name qwen3.5-9b-2026.10.1
+llmctl install oci://zot.local:5000/models/qwen3.5-9b@sha256:… --plain-http
+llmctl verify qwen3.5-9b-2026.10.1
+```
+
+`install` copies only the listed files, hashing each one, into a temporary
+folder under `MODELS_DIR`, and renames it into place only when every size
+and sha256 matches. Anything else (a changed byte, a missing file, a
+symlink) refuses the whole install and leaves nothing behind. An existing
+folder is never touched: install versions side by side under `--name`, or
+pass `--replace` (refused while that folder is served). `oci://` refs must
+be pinned by digest and are pulled with the `oras` CLI.
+
+The installed folder keeps the manifest (`.llmctl-manifest.json`) and a
+provenance sidecar (`.llmctl-source.json`: model id, revision, licence, each
+file's sha256 and the manifest's own sha256). `llmctl list` shows the
+revision and licence; `llmctl verify` re-hashes against the sidecar; `llmctl
+update` refuses an installed model. llmctl doesn't check signatures: sign
+the manifest bytes, and the per-file hashes cover the rest.
+
+Manifest rules: paths are relative POSIX paths without `..`; `size` is in
+bytes and `sha256` is lowercase hex; files under a `caches` path are listed
+in `files` like any other; unknown top-level keys are ignored.
+
+With `--json`, `install`, `verify` and `cache export` print one JSON object
+on stdout (messages go to stderr) and exit with:
+
+| Code | Meaning |
+|---|---|
+| 0 | done |
+| 1 | anything else |
+| 2 | usage error |
+| 3 | bad manifest (unreadable, unknown schema, unsafe path, missing key) |
+| 4 | checksum or size mismatch, or a listed file missing |
+| 5 | name conflict (the folder exists, or `--replace` while it's served) |
+| 6 | source unreachable (`oras` missing, or the pull failed) |
+
+### Ship a warm compile cache
+
+vLLM compiles the model with `torch.compile` and Triton on its first start
+(17 s for Qwen3-0.6B on a 4090, minutes for big models), and a cold start
+leaves less memory for the KV cache. Containers keep these caches per model
+under `<state>/cache/<name>/<folder>-<digest>/`, mounted at `/cache`, so the
+second start is warm. To ship a warm cache in a bundle:
+
+```bash
+llmctl run qwen3.5-9b --runtime docker --wait      # compiles once
+llmctl cache export qwen3.5-9b /bundles/qwen3.5-9b --json
+llmctl manifest /bundles/qwen3.5-9b --license apache-2.0 …   # lists cache/vllm
+```
+
+On the target, the first start of the installed model seeds its cache from
+the bundle when the shipped cache's image digest and GPU architecture match
+the launch (rule `digest`), and logs `cache: seeded … cache rule: digest`.
+The host runtime may also use a cache built with the same vLLM version
+(rule `engine_version`, logged as a dev fallback, since it doesn't pin torch
+or CUDA). Otherwise the start compiles (`cache rule: none`). Because the
+model is mounted at `/model`, a cache built under one folder name hits
+under another; for Qwen3-0.6B the warm start took torch.compile from 17.4 s
+to 0.2 s and left 0.5 GiB more for the KV cache.
+
+### Serving files: `llmctl apply`
+
+A YAML file says what runs on a host:
+
+```yaml
+version: 1
+models:
+  qwen35-9b:                          # the name clients call
+    model: qwen3.5-9b-2026.10.1       # a model key or folder under MODELS_DIR
+    group: qwen3.5-9b                 # a route name that stays across versions
+    backend: vllm                     # default: from the model's format
+    runtime: docker                   # default: `config runtime`
+    port: 8101                        # required; ports are pinned
+    gpu: 0
+    ctx: 32768
+    n_parallel: 8
+    kv_cache_mem: 6G
+    args: ["--max-num-batched-tokens", "8192"]
+    env: {VLLM_LOGGING_LEVEL: INFO}
+```
+
+```bash
+llmctl apply host.yaml bundles/*.yaml --dry-run   # what would change
+llmctl apply host.yaml bundles/*.yaml             # make it so
+llmctl apply host.yaml --prune                    # and stop what isn't listed
+```
+
+Each entry is started as `llmctl run <model> --name <key> --port <port> …`
+would start it, so it's recorded, restarted and restored like any other.
+An entry running with the same arguments and runtime is left alone; a
+changed one is restarted; a missing one is started. Stops happen before
+starts, and each start waits for `/health` (`--no-wait` doesn't). Files
+merge: a bundle can ship a one-model fragment next to the host file. The
+same model name or port in two places is an error, and every error names
+the file and line. `--json` prints the actions; exit 3 means invalid files,
+1 that a start failed.
+
+Rolling back is applying the previous version's file: `model` changes, the
+name and group don't, and the old version's cache is already warm. On the
+4090 that took 38 s for Qwen3-0.6B in a container.
+
+Keys: `model`, `port`, `args`, `env`, and the `run` options `backend`,
+`group` (`null` for none), `runtime`, `image`, `allow_tag`, `gpu`, `ctx`,
+`n_parallel`, `gpu_mem`, `kv_cache_mem`, `kv_quant`, `tool_parser`,
+`reasoning_parser`, `trust_remote_code`, `reasoning`, `embeddings`,
+`no_vision`, `draft`, `no_draft`, `spec_type`, `spec_n_max`,
+`n_gpu_layers`, `kv_unified`, `ctx_checkpoints`, `cache_ram`.
+
 ## Configuration
 
 ### `MODELS_DIR` resolution order
@@ -1092,6 +1288,7 @@ Contents:
 - `autostart.json` — manifest of models to bring back via `llmctl restore`
   (survives reboots; updated on `run`/`stop`).
 - `logs/` — per-instance log files, named `<key>-<port>-<timestamp>.log`.
+- `cache/` — per-model compile caches for container (and bundle) starts.
 
 Wipe state if it ever desyncs from reality:
 

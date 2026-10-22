@@ -339,3 +339,11 @@ def test_images_route_to_a_vllm_vision_model(tmp_path):
     finally:
         for s in (up, httpd):
             s.shutdown()
+
+
+def test_listen_backlog_takes_a_burst(tmp_path):
+    httpd = gw.make_server(0, "127.0.0.1", gw.Gateway(gw.LocalModels(tmp_path / "running.json")))
+    try:
+        assert httpd.request_queue_size >= 128
+    finally:
+        httpd.server_close()

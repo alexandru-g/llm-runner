@@ -10,19 +10,41 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
+# --offline DIR: install from a release wheelhouse (wheels for llm-runner and
+# every dependency), with no package index. Used on air-gapped hosts.
+OFFLINE_DIR=""
+if [[ "${1:-}" == "--offline" ]]; then
+    [[ -n "${2:-}" && -d "$2" ]] || { echo "usage: $0 [--offline WHEELHOUSE_DIR]" >&2; exit 2; }
+    OFFLINE_DIR="$(cd "$2" && pwd)"
+fi
+
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
 
+# What to install: this checkout, or (offline) the wheel in the wheelhouse.
+src_args() {  # $1 = package name, $2 = source dir
+    if [[ -n "$OFFLINE_DIR" ]]; then
+        echo "--offline --no-index --find-links $OFFLINE_DIR $1"
+    else
+        echo "--from $2 $1"
+    fi
+}
+
 install_with_uv() {
-    say "Installing via 'uv tool install' from $REPO_DIR"
-    uv tool install --force --reinstall --from "$REPO_DIR" llm-runner
+    say "Installing via 'uv tool install' from ${OFFLINE_DIR:-$REPO_DIR}"
+    # shellcheck disable=SC2046
+    uv tool install --force --reinstall $(src_args llm-runner "$REPO_DIR")
     BIN_DIR="$(uv tool dir --bin 2>/dev/null || echo "$HOME/.local/bin")"
     echo "$BIN_DIR"
 }
 
 install_with_pipx() {
-    say "Installing via 'pipx install' from $REPO_DIR"
-    pipx install --force "$REPO_DIR"
+    say "Installing via 'pipx install' from ${OFFLINE_DIR:-$REPO_DIR}"
+    if [[ -n "$OFFLINE_DIR" ]]; then
+        pipx install --force --pip-args="--no-index --find-links $OFFLINE_DIR" llm-runner
+    else
+        pipx install --force "$REPO_DIR"
+    fi
     echo "$HOME/.local/bin"
 }
 
@@ -30,8 +52,12 @@ install_with_venv() {
     local venv="$HOME/.local/share/llm-runner/venv"
     say "Installing via python venv at $venv"
     python3 -m venv "$venv"
-    "$venv/bin/pip" install --quiet --upgrade pip
-    "$venv/bin/pip" install --quiet "$REPO_DIR"
+    if [[ -n "$OFFLINE_DIR" ]]; then
+        "$venv/bin/pip" install --quiet --no-index --find-links "$OFFLINE_DIR" llm-runner
+    else
+        "$venv/bin/pip" install --quiet --upgrade pip
+        "$venv/bin/pip" install --quiet "$REPO_DIR"
+    fi
     mkdir -p "$HOME/.local/bin"
     ln -sf "$venv/bin/llmctl" "$HOME/.local/bin/llmctl"
     echo "$HOME/.local/bin"
@@ -51,7 +77,15 @@ say "Installed. Binary should be at: $BIN_DIR/llmctl"
 # systemone-proxy: the decision endpoint `llmctl decide` starts. Its own
 # package (packages/systemone-proxy), installed the same way.
 PROXY_DIR="$REPO_DIR/packages/systemone-proxy"
-if command -v uv >/dev/null 2>&1; then
+if [[ -n "$OFFLINE_DIR" ]] && ! ls "$OFFLINE_DIR"/systemone_proxy-*.whl >/dev/null 2>&1; then
+    say "No systemone-proxy wheel in the wheelhouse; skipping it"
+elif [[ -n "$OFFLINE_DIR" ]] && command -v uv >/dev/null 2>&1; then
+    say "Installing systemone-proxy from the wheelhouse"
+    # shellcheck disable=SC2046
+    uv tool install --force --reinstall $(src_args systemone-proxy "$PROXY_DIR") >&2
+elif [[ -n "$OFFLINE_DIR" ]]; then
+    warn "Offline systemone-proxy install needs uv; skipping it"
+elif command -v uv >/dev/null 2>&1; then
     say "Installing systemone-proxy via 'uv tool install'"
     uv tool install --force --reinstall --from "$PROXY_DIR" systemone-proxy >&2
 elif command -v pipx >/dev/null 2>&1; then

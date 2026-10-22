@@ -58,6 +58,10 @@ class RunningProcess:
     # Second name the gateway routes by (e.g. every quant of one model); "" =
     # none, None = not recorded (launched before groups: the default applies).
     group: str | None = None
+    # How it runs: None = a host process (also every record written before
+    # containers). Else {"kind": "host"|"docker", "image", "digest", "gpus",
+    # "network", "container", "cache_dir", "cache_rule"} (see containers.py).
+    runtime: dict | None = None
 
 
 @dataclass
@@ -77,6 +81,9 @@ class LaunchSpec:
     backend: str = "llama"
     env: dict[str, str] = field(default_factory=dict)
     group: str | None = None
+    # The runtime as chosen (kind, image, digest, gpus, network); the
+    # container name and cache dir are worked out again at each start.
+    runtime: dict | None = None
 
     def run_cmd(self) -> list[str]:
         """The ``llmctl run …`` argv that reproduces this launch, port pinned."""
@@ -143,7 +150,8 @@ def autostart_list() -> list[LaunchSpec]:
 def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
                   run_args: list[str] | None = None,
                   backend: str = "llama",
-                  env: dict[str, str] | None = None, group: str | None = None) -> None:
+                  env: dict[str, str] | None = None, group: str | None = None,
+                  runtime: dict | None = None) -> None:
     """Upsert a launch spec into the autostart manifest (keyed by name).
 
     Ports are pinned, so a port can only be restored to one model: entries
@@ -153,8 +161,19 @@ def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
     specs = [s for s in _load_autostart() if s.name != name and s.port != port]
     specs.append(LaunchSpec(name=name, cmd=list(cmd), port=port,
                             model_path=model_path, run_args=list(run_args or []),
-                            backend=backend, env=dict(env or {}), group=group))
+                            backend=backend, env=dict(env or {}), group=group,
+                            runtime=chosen_runtime(runtime)))
     _save_autostart(specs)
+
+
+# The runtime fields that describe the choice, not one start of it.
+_RUNTIME_CHOICE = ("kind", "image", "digest", "gpus", "network", "engine_version")
+
+
+def chosen_runtime(runtime: dict | None) -> dict | None:
+    if not runtime:
+        return None
+    return {k: runtime[k] for k in _RUNTIME_CHOICE if runtime.get(k) is not None}
 
 
 def autostart_find(name: str) -> LaunchSpec | None:
@@ -178,7 +197,8 @@ def autostart_sync() -> tuple[list[LaunchSpec], list[LaunchSpec]]:
         LaunchSpec(name=p.name, cmd=list(p.cmd), port=p.port,
                    model_path=p.model_path,
                    run_args=old[p.name].run_args if p.name in old else [],
-                   backend=p.backend, env=dict(p.env), group=p.group)
+                   backend=p.backend, env=dict(p.env), group=p.group,
+                   runtime=chosen_runtime(p.runtime))
         for p in list_running()
     ]
     live = {s.name for s in kept}
@@ -227,7 +247,8 @@ def restore(names: list[str] | None = None,
             cmd = spec.cmd if host is None else with_bind_host(spec.cmd, spec.backend, host)
             rec = start(name=spec.name, cmd=cmd, port=spec.port,
                         model_path=spec.model_path, run_args=spec.run_args,
-                        backend=spec.backend, env=spec.env, group=spec.group)
+                        backend=spec.backend, env=spec.env, group=spec.group,
+                        runtime=spec.runtime)
             results.append((spec, f"started pid={rec.pid} port={rec.port}"))
         except Exception as e:  # never let one bad spec abort the rest
             results.append((spec, f"error: {e}"))
@@ -260,18 +281,65 @@ def find(identifier: str) -> RunningProcess | None:
 def start(*, name: str, cmd: list[str], port: int, model_path: str,
           run_args: list[str] | None = None,
           backend: str = "llama",
-          env: dict[str, str] | None = None, group: str | None = None) -> RunningProcess:
+          env: dict[str, str] | None = None, group: str | None = None,
+          runtime: dict | None = None) -> RunningProcess:
     """Launch ``cmd`` detached. ``env`` is layered over the current environment
     (e.g. VLLM_* tuning knobs) and remembered so restore/restart reproduce it.
     Telemetry is always off, offline mode keeps backends off the hub, and
     vllm/sglang get a CUDA toolchain their JIT can use (``backends.launch_env``);
-    those are applied fresh, not remembered."""
+    those are applied fresh, not remembered.
+
+    ``runtime`` ``{"kind": "docker", "image": …}`` runs ``cmd`` in a container
+    (``containers.docker_argv``); ``cmd`` stays the host form either way."""
+    from llm_runner import containers
+    from llm_runner.registry import MODELS_DIR
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"{name}-{port}-{int(time.time())}.log"
+    runtime = dict(runtime) if runtime else None
+    kind = (runtime or {}).get("kind", containers.HOST)
+    header: list[str] = []
+    if runtime is not None:
+        cache_dir, rule, line = containers.prepare_cache(
+            state_dir=STATE_DIR, name=name, model_path=model_path, backend=backend,
+            runtime=runtime)
+        runtime["cache_dir"] = str(cache_dir) if cache_dir else None
+        runtime["cache_rule"] = rule
+        if line:
+            header.append(line)
+    else:
+        cache_dir = None
+    offline = config_mod.is_offline()
+    if kind == containers.DOCKER:
+        runtime["container"] = containers.container_name(name, port)
+        containers.stop_container(runtime["container"], timeout=0)   # a leftover
+        argv = containers.docker_argv(
+            name=name, cmd=cmd, port=port, backend=backend, model_path=model_path,
+            env=containers.container_env(offline, backend, env or {},
+                                         with_cache=cache_dir is not None),
+            runtime=runtime, models_dir=MODELS_DIR, cache_dir=cache_dir)
+        popen_env = dict(os.environ)
+        header.insert(0, f"llmctl: runtime=docker image={runtime['image']} "
+                         f"digest={runtime.get('digest')} container={runtime['container']}")
+    else:
+        argv = cmd
+        extra: dict[str, str] = {}
+        gpus = (runtime or {}).get("gpus")
+        if gpus and gpus != "all":
+            extra["CUDA_VISIBLE_DEVICES"] = gpus
+        if cache_dir is not None:
+            extra["VLLM_CACHE_ROOT"] = str(cache_dir / "vllm")
+        popen_env = {**os.environ, **launch_env(offline, backend), **extra, **(env or {})}
+        if runtime is not None:
+            header.insert(0, "llmctl: runtime=host")
     fh = open(log_file, "ab", buffering=0)
+    for line in header:
+        fh.write((line + "\n").encode())
+    if kind == containers.DOCKER:
+        fh.write(("llmctl: " + " ".join(argv) + "\n").encode())
     proc = subprocess.Popen(
-        cmd,
-        env={**os.environ, **launch_env(config_mod.is_offline(), backend), **(env or {})},
+        argv,
+        env=popen_env,
         stdout=fh,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
@@ -289,13 +357,15 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
         backend=backend,
         env=dict(env or {}),
         group=group,
+        runtime=runtime,
     )
     procs = reconcile()
     procs.append(rec)
     _save(procs)
     # Remember this launch so `restore` can bring it back after a reboot.
     autostart_add(name=name, cmd=cmd, port=port, model_path=model_path,
-                  run_args=run_args, backend=backend, env=env, group=group)
+                  run_args=run_args, backend=backend, env=env, group=group,
+                  runtime=runtime)
     return rec
 
 
@@ -303,6 +373,12 @@ def stop(identifier: str, *, timeout: float = 10.0) -> RunningProcess | None:
     target = find(identifier)
     if target is None:
         return None
+    container = (target.runtime or {}).get("container")
+    if container:
+        # SIGTERM to `docker run` reaches the engine too, but a SIGKILL'd
+        # client would leave the container running and holding the GPU.
+        from llm_runner import containers
+        containers.stop_container(container, timeout=int(timeout))
     _signal_group(target.pid, signal.SIGTERM)
     deadline = time.time() + timeout
     while time.time() < deadline and _alive(target.pid):

@@ -77,6 +77,8 @@ class Model:
     model_path: str
     cmd: tuple[str, ...]
     group: str = ""
+    # (kind, image, digest); kind "host" for every record without a runtime.
+    runtime: tuple[str, str | None, str | None] = ("host", None, None)
 
     @property
     def api(self) -> str:
@@ -149,6 +151,11 @@ def _hf_vision(m: Model) -> bool:
     return _vision_cache[m.model_path]
 
 
+def _runtime_of(rec: dict) -> tuple[str, str | None, str | None]:
+    rt = rec.get("runtime") or {}
+    return (rt.get("kind") or "host", rt.get("image"), rt.get("digest"))
+
+
 def _group_of(rec: dict) -> str:
     from llm_runner.registry import group_of
     return group_of(rec["name"], rec.get("backend", "llama"), rec.get("model_path", ""),
@@ -168,6 +175,7 @@ class LocalModels:
         self._records: list[Model] = []
         self._health: dict[int, tuple[float, str]] = {}
         self._lock = threading.Lock()
+        self._seen: set[tuple[str, int]] = set()
 
     def models(self) -> list[Model]:
         with self._lock:
@@ -185,11 +193,24 @@ class LocalModels:
                 self._records = [
                     Model(r["name"], r["pid"], r["port"], r.get("backend", "llama"),
                           r.get("started_at", 0.0), r.get("model_path", ""),
-                          tuple(r.get("cmd", ())), _group_of(r))
+                          tuple(r.get("cmd", ())), _group_of(r), _runtime_of(r))
                     for r in raw if r.get("backend") != GATEWAY]
+                self._log_new(self._records)
             records = list(self._records)
         # A model that died without `llmctl stop` is still in the file.
         return [m for m in records if proc._alive(m.pid)]
+
+    def _log_new(self, records: list[Model]) -> None:
+        """One log line per model the gateway starts routing to, with what
+        runs it, so a benchmark log records the exact image."""
+        now = {(m.name, m.pid) for m in records}
+        for m in records:
+            if (m.name, m.pid) not in self._seen:
+                kind, image, digest = m.runtime
+                where = f"docker image={image} digest={digest}" if kind == "docker" else kind
+                print(f"model {m.name}: backend={m.backend} port={m.port} runtime={where}",
+                      flush=True)
+        self._seen = now
 
     def busy(self, name: str) -> bool:
         """Every slot of this local model is working, so a new request would
@@ -256,7 +277,9 @@ class LocalModels:
     def describe(self, m: Model, models: list[Model] | None = None) -> dict:
         info: dict = {"backend": m.backend, "api": m.api, "port": m.port,
                       "path_prefix": f"/m/{m.name}", "status": self.status(m),
-                      "group": m.group or None, "model_path": m.model_path}
+                      "group": m.group or None, "model_path": m.model_path,
+                      "runtime": m.runtime[0], "image": m.runtime[1],
+                      "image_digest": m.runtime[2]}
         if m.backend == DECIDE:
             # It reads images when the llama-server behind it has an mmproj.
             upstream = urlsplit(_flag(m.cmd, "--backend") or "").port
@@ -369,7 +392,11 @@ class Gateway:
                            "nodes": [{"node": c.node, "priority": c.priority, "local": c.local,
                                       "status": c.status, "port": c.info.get("port"),
                                       "context": c.info.get("context"),
-                                      "vision": c.info.get("vision")} for c in cands]}}
+                                      "vision": c.info.get("vision"),
+                                      "runtime": c.info.get("runtime") or "host",
+                                      "image": c.info.get("image"),
+                                      "image_digest": c.info.get("image_digest")}
+                                     for c in cands]}}
 
     def model_list(self, local_only: bool = False) -> list[dict]:
         insts = self.instances(local_only)
@@ -879,9 +906,16 @@ def make_handler(gw: Gateway):
     return Handler
 
 
+class _Server(ThreadingHTTPServer):
+    # socketserver's default listen backlog is 5. A burst of new connections
+    # (a load test opening 16 streams at once) overflowed it, and the kernel
+    # dropped the extra SYNs, so clients saw stalls and retries.
+    request_queue_size = 128
+
+
 def make_server(port: int, host: str = "0.0.0.0", gw: Gateway | None = None) -> ThreadingHTTPServer:
     gw = gw or Gateway(port=port)
-    httpd = ThreadingHTTPServer((host, port), make_handler(gw))
+    httpd = _Server((host, port), make_handler(gw))
     httpd.daemon_threads = True
     gw.port = httpd.server_address[1]
     return httpd
