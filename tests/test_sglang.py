@@ -1,5 +1,6 @@
 """The sglang backend, engine discovery and the CUDA toolchain vllm/sglang
 launches are pinned to."""
+import json
 import os
 from pathlib import Path
 
@@ -72,6 +73,72 @@ def test_sglang_ngram_and_no_speculation():
     assert _arg(cmd, "--speculative-num-draft-tokens") == "8"
     assert "--speculative-num-steps" not in cmd
     assert "--speculative-algorithm" not in _sglang()      # draft-mtp needs a drafter
+
+
+def _ckpt(tmp_path, cfg):
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    return tmp_path
+
+
+# Qwen3.5 is a VLM wrapper: the hybrid layout sits under text_config.
+_QWEN35 = {"model_type": "qwen3_5", "vision_config": {},
+           "text_config": {"layer_types": ["linear_attention"] * 3 + ["full_attention"]}}
+
+
+@pytest.mark.parametrize("cfg, hybrid", [
+    (_QWEN35, True),
+    ({"layer_types": ["linear_attention", "full_attention"]}, True),
+    ({"layer_types": ["mamba", "attention"]}, True),
+    ({"hybrid_override_pattern": "M-M-M*-"}, True),
+    ({"layer_types": ["full_attention", "sliding_attention"]}, False),
+    ({"text_config": None}, False),
+    ({}, False),
+])
+def test_hf_is_hybrid(tmp_path, cfg, hybrid):
+    assert backends.hf_is_hybrid(_ckpt(tmp_path, cfg)) is hybrid
+
+
+def test_hf_is_hybrid_tolerates_a_bad_config(tmp_path):
+    assert not backends.hf_is_hybrid(tmp_path)
+    (tmp_path / "config.json").write_text("{nope")
+    assert not backends.hf_is_hybrid(tmp_path)
+
+
+def _sglang_at(path, **kw):
+    return backends.build_sglang_cmd("sglang", path, name="m", port=8081,
+                                     ctx_size=4096, **kw)
+
+
+def test_sglang_sizes_the_mamba_pool_for_n_parallel(tmp_path):
+    cmd = _sglang_at(_ckpt(tmp_path, _QWEN35), n_parallel=10)
+    assert _arg(cmd, "--max-running-requests") == "10"
+    # 10 × 5 slots + 20%: what lifted the cap from 6 to 10 on a 4090.
+    assert _arg(cmd, "--max-mamba-cache-size") == "60"
+    assert backends.sglang_mamba_cache_size(1) == 9            # at least +4
+    assert "--max-mamba-cache-size" not in _sglang_at(tmp_path)   # no -np: SGLang's sizing
+
+
+def test_sglang_leaves_the_mamba_pool_alone_on_attention_only_models(tmp_path):
+    cmd = _sglang_at(_ckpt(tmp_path, {"layer_types": ["full_attention"]}), n_parallel=10)
+    assert "--max-mamba-cache-size" not in cmd
+    assert "--max-mamba-cache-size" not in _sglang(n_parallel=10)  # no config.json
+
+
+@pytest.mark.parametrize("extra", [
+    ["--max-mamba-cache-size", "100"],
+    ["--max-mamba-cache-size=100"],
+    ["--mamba-full-memory-ratio", "1.5"],
+])
+def test_sglang_dash_x_sizes_the_mamba_pool(tmp_path, extra):
+    cmd = _sglang_at(_ckpt(tmp_path, _QWEN35), n_parallel=10, extra=extra)
+    assert cmd.count("--max-mamba-cache-size") == extra.count("--max-mamba-cache-size")
+    assert cmd[-len(extra):] == extra
+
+
+def test_vllm_never_gets_the_mamba_flag(tmp_path):
+    cmd = backends.build_vllm_cmd("vllm", _ckpt(tmp_path, _QWEN35), name="m", port=8081,
+                                  ctx_size=4096, n_parallel=10)
+    assert not any(a.startswith("--") and "mamba" in a for a in cmd)
 
 
 def test_sglang_replay_moves_to_the_current_host():

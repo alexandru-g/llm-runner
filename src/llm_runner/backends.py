@@ -359,6 +359,28 @@ def hf_has_vision(path: Path) -> bool:
         "ForConditionalGeneration" in a for a in cfg.get("architectures", []))
 
 
+def hf_is_hybrid(path: Path) -> bool:
+    """True for a hybrid checkpoint: some layers keep a recurrent (mamba /
+    linear-attention) state instead of a KV cache, e.g. Qwen3.5's
+    ``layer_types`` of ``linear_attention`` + ``full_attention``. VLM wrappers
+    keep that under ``text_config``; Nemotron-H spells it as a
+    ``hybrid_override_pattern`` with ``M`` for mamba layers."""
+    try:
+        cfg = json.loads((path / "config.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    for c in (cfg, cfg.get("text_config")):
+        if not isinstance(c, dict):
+            continue
+        types = c.get("layer_types")
+        if isinstance(types, list) and any(
+                isinstance(t, str) and ("linear" in t or "mamba" in t) for t in types):
+            return True
+        if "M" in str(c.get("hybrid_override_pattern", "")):
+            return True
+    return False
+
+
 def _gguf_general_tags(path: Path) -> list[str]:
     """``general.tags`` from a GGUF header, or [] if absent/unreadable. Only
     the leading ``general.*`` block is read (a few KB), never the tensors."""
@@ -568,6 +590,22 @@ _SGLANG_KV_DTYPE = {"f16": "auto", "q8_0": "fp8_e4m3"}
 # (STANDALONE); without one, mtp is the checkpoint's own MTP head (NEXTN).
 _SGLANG_SPEC_DRAFT = {"eagle": "EAGLE", "eagle3": "EAGLE3"}
 _SGLANG_SPEC_SELF = {"mtp": "NEXTN", "ngram": "NGRAM"}
+# Mamba-state slots SGLang holds per running request on a hybrid model
+# (radix cache on, no speculation). It sizes that pool from memory, not from
+# --max-running-requests, and then caps the requests to fit — 0.5.22 logs
+# "max_running_requests is capped to 6 by the mamba state cache
+# (max_mamba_cache_size=34, 5 state slots per request)". SGLang-internal
+# (kv_cache_configurator._calculate_mamba_ratio), so it may change.
+SGLANG_MAMBA_SLOTS_PER_REQUEST = 5
+# Flags that size the mamba pool themselves: if -X has one, leave it be.
+_SGLANG_MAMBA_POOL_FLAGS = ("--max-mamba-cache-size", "--mamba-full-memory-ratio")
+
+
+def sglang_mamba_cache_size(n_parallel: int) -> int:
+    """``--max-mamba-cache-size`` that admits ``n_parallel`` requests: their
+    slots plus 20% (at least 4) headroom for spec decoding or a bumped ratio."""
+    slots = n_parallel * SGLANG_MAMBA_SLOTS_PER_REQUEST
+    return slots + max(4, -(-slots // 5))
 
 
 def build_sglang_cmd(sglang_bin: str, model_path: Path, *, name: str, port: int,
@@ -597,6 +635,9 @@ def build_sglang_cmd(sglang_bin: str, model_path: Path, *, name: str, port: int,
         cmd += ["--mem-fraction-static", f"{gpu_mem:g}"]
     if n_parallel is not None:
         cmd += ["--max-running-requests", str(n_parallel)]
+        # On hybrid models that alone doesn't lift SGLang's mamba-pool cap.
+        if not _sets_any(extra, _SGLANG_MAMBA_POOL_FLAGS) and hf_is_hybrid(model_path):
+            cmd += ["--max-mamba-cache-size", str(sglang_mamba_cache_size(n_parallel))]
     dtype = _SGLANG_KV_DTYPE.get(kv_quant, "auto")
     if dtype != "auto":
         cmd += ["--kv-cache-dtype", dtype]
@@ -613,6 +654,11 @@ def build_sglang_cmd(sglang_bin: str, model_path: Path, *, name: str, port: int,
     if extra:
         cmd += extra
     return cmd
+
+
+def _sets_any(extra: list[str] | None, flags: tuple[str, ...]) -> bool:
+    """True if ``extra`` passes any of ``flags`` (``--f v`` or ``--f=v``)."""
+    return any(a == f or a.startswith(f + "=") for a in extra or () for f in flags)
 
 
 def _sglang_spec_args(draft_path: Path | None, spec_type: str, n: int) -> list[str]:

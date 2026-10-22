@@ -830,6 +830,16 @@ other side prints a warning and ignores it. SGLang always gets
 `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0` so `/health` is an instant check
 rather than a one-token generation that takes ~1 s.
 
+On hybrid models (mamba / linear-attention layers, e.g. Qwen3.5 — detected from
+`layer_types` in `config.json`) SGLang sizes the recurrent-state pool from
+memory and then caps concurrency to fit it, whatever `--max-running-requests`
+says: the log shows `max_running_requests is capped to 6 by the mamba state
+cache (max_mamba_cache_size=34, 5 state slots per request)`. So with
+`--n-parallel N` llmctl also passes `--max-mamba-cache-size` = N × 5 + 20%
+(at least +4) — 60 for N = 10, which took p95 TTFT at 10 users from 3.6 s to
+0.33 s for qwen3.5-9b on a 4090. Setting `--max-mamba-cache-size` or
+`--mamba-full-memory-ratio` in `-X` turns this off.
+
 `--gpu-mem` is how vllm and sglang share the card. vllm reserves that
 fraction of **total** GPU memory up front (all of it, as KV cache — even for
 a tiny model) and refuses to start if it isn't free. SGLang's fraction covers
