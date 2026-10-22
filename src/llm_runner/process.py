@@ -256,14 +256,15 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
           env: dict[str, str] | None = None, group: str | None = None) -> RunningProcess:
     """Launch ``cmd`` detached. ``env`` is layered over the current environment
     (e.g. VLLM_* tuning knobs) and remembered so restore/restart reproduce it.
-    Telemetry is always off, and offline mode keeps backends off the hub
-    (``backends.launch_env``); those are applied fresh, not remembered."""
+    Telemetry is always off, offline mode keeps backends off the hub, and
+    vllm/sglang get a CUDA toolchain their JIT can use (``backends.launch_env``);
+    those are applied fresh, not remembered."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"{name}-{port}-{int(time.time())}.log"
     fh = open(log_file, "ab", buffering=0)
     proc = subprocess.Popen(
         cmd,
-        env={**os.environ, **launch_env(config_mod.is_offline()), **(env or {})},
+        env={**os.environ, **launch_env(config_mod.is_offline(), backend), **(env or {})},
         stdout=fh,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,

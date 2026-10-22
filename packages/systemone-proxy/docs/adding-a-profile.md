@@ -163,10 +163,10 @@ proves you match the *vendor*:
 5. If there's no published example, or numbers disagree, run a reference:
    the vendor's checkpoint on vLLM (bf16), queried directly with the same
    prompt and `logprobs`. Don't run the vendor's shim; reproduce its request
-   to vLLM by hand. On the PC, vLLM lives in the conda env
-   `~/miniconda3/envs/vllm` (if FlashInfer fails to compile, set
-   `VLLM_USE_FLASHINFER_SAMPLER=0`). Stop the GGUF instance first, or vLLM
-   won't find enough free VRAM.
+   to vLLM by hand. Start it with `llmctl run` (vLLM is a uv tool,
+   `~/.local/bin/vllm`, and llmctl gives its FlashInfer JIT a working
+   compiler). Stop the GGUF instance first, or vLLM won't find enough free
+   VRAM.
 6. Check `debug: true` output when a number is off: it returns each row's
    raw label logprobs and prompt sizes.
 

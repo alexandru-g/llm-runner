@@ -4,15 +4,16 @@ Background runner for local model servers.
 
 CLI (`llmctl`) to download, list, start, stop, and tail models served via
 [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` (GGUF
-files) or [vLLM](https://docs.vllm.ai) (Hugging Face safetensors
-checkpoints). Works with any GGUF or HF checkpoint (Gemma, Llama, Qwen,
+files) or [vLLM](https://docs.vllm.ai) / [SGLang](https://docs.sglang.io)
+(Hugging Face safetensors checkpoints). Works with any GGUF or HF checkpoint (Gemma, Llama, Qwen,
 Mistral, etc.) and arbitrary local files/dirs via `--ft`. Embedding models
 (e.g. bge-m3) are supported too via `--embeddings`.
 
 The backend is picked from the model format: a `.gguf` runs on
 `llama-server`, a checkpoint directory (`config.json` + `*.safetensors`) runs
-on `vllm serve`. Both expose the same OpenAI-compatible `/v1` API, so clients
-don't care which one is behind a port.
+on `vllm serve` (or `sglang serve` with `--backend sglang`). All of them expose
+the same OpenAI-compatible `/v1` API, so clients don't care which one is behind
+a port.
 
 ## Install
 
@@ -157,38 +158,48 @@ llama-server --version
 equivalent of `build-essential`, `cmake`, `git`, and `libcurl4-openssl-dev`
 via your package manager, plus your accelerator's driver/toolkit.
 
-### 3. `vllm` (optional, for Hugging Face checkpoints)
+### 3. `vllm` / `sglang` (optional, for Hugging Face checkpoints)
 
-vLLM is a Python package with a CUDA-specific torch build, so give it its own
-env rather than installing it next to `llmctl`:
+Both are Python packages with a CUDA-specific torch build, so each gets its
+own venv rather than going next to `llmctl`. `uv tool install` does that and
+puts the CLI in `~/.local/bin`; `--torch-backend` picks the CUDA build of torch
+(`auto` detects it from the driver, or name one, e.g. `cu130`):
 
 ```bash
-conda create -n vllm python=3.12 -y
-conda activate vllm
-pip install vllm
+uv tool install --python 3.12 --torch-backend auto vllm
 vllm --version
 ```
 
-`llmctl` finds the binary without the env being active: it checks
-`$LLM_RUNNER_VLLM_BIN`, then the persisted `vllm_bin` setting, then `PATH`,
-then a conda/venv env named `vllm`, then any conda env. If it lives somewhere
-else:
+SGLang pins two pre-release dependencies, which uv only installs when they
+are named explicitly (check `Requires-Dist` in the release's metadata when
+upgrading; for 0.5.22 they are):
 
 ```bash
-llmctl config vllm-bin ~/some/env/bin/vllm
-llmctl config show          # lists both backends and where they resolve
+uv tool install --python 3.12 --torch-backend auto sglang==0.5.22 \
+    --with cuda-tile==1.6.0rc5 --with 'flash-attn-4>=4.0.0b18'
 ```
 
-vLLM JIT-compiles a few kernels (flashinfer sampler) on first start, which
-needs a working `nvcc` **and** a host C++ compiler it accepts. If a start dies
-with `cannot execute 'cc1plus'` or `Ninja build failed` in `llmctl logs`,
-either install the C++ half of whatever `gcc` is first on your PATH (a conda
-`gcc_linux-64` without `gxx_linux-64` is the usual culprit:
-`conda install -n base -c conda-forge gxx=<same version>`), or skip that JIT:
+`uv tool upgrade vllm` / `uv tool uninstall sglang` manage them later.
+`llmctl` finds each CLI without anything activated: it checks
+`$LLM_RUNNER_VLLM_BIN` / `$LLM_RUNNER_SGLANG_BIN`, then the persisted
+`vllm_bin` / `sglang_bin` setting, then `PATH`, then the uv tool venv, then a
+venv at `~/.venvs/<name>`. If it lives somewhere else:
 
 ```bash
-llmctl run <model> -E VLLM_USE_FLASHINFER_SAMPLER=0
+llmctl config vllm-bin ~/some/venv/bin/vllm
+llmctl config show          # lists the backends, where they resolve, and the toolchain
 ```
+
+Both JIT-compile CUDA kernels (FlashInfer, sgl-kernel) on first use, which
+needs `nvcc` **and** a host C++ compiler that nvcc accepts. llmctl sets one
+for every vllm/sglang launch: `CUDA_HOME` from the `nvcc` it finds, and
+`CC`/`CXX`/`NVCC_CCBIN` to the newest system GCC (`/usr/bin/g++`,
+`/usr/bin/g++-N`) that can compile C++ and that the CUDA headers allow.
+That keeps a compiler earlier on `PATH` (e.g. conda's `gcc` without
+`cc1plus`) out of the build. `llmctl config show` prints the pair it picked;
+`-E CXX=…` (etc.) overrides it per model. If no system GCC is old enough for
+your nvcc, install one (Arch: `gcc15`; Ubuntu: `g++-13`) and llmctl picks it
+up.
 
 ### 4. `decider` (optional, for decision servers)
 
@@ -232,7 +243,7 @@ Models are discovered dynamically under `MODELS_DIR`:
   `*mmproj*.gguf` in the same folder is auto-attached as the vision projector;
 - any directory holding a Hugging Face checkpoint (`config.json` plus
   `*.safetensors`/`*.bin` weights) is a **vllm** model, keyed by the directory
-  name.
+  name. `--backend sglang` serves the same directory on SGLang.
 
 `llmctl list` shows which backend each key resolves to.
 
@@ -394,6 +405,27 @@ reuse them. `-i` shows the menu for a named model, `--no-menu` skips it. Flags
 you type still apply and show in the menu. **Group** offers auto (the
 model's folder), none, the groups already running in the cluster, and
 "other…" to type a name (see [the registry](#several-machines-as-one-the-registry)).
+
+For a Hugging Face checkpoint, a **Backend** row comes first when SGLang is
+installed too (`llmctl config show` lists what is): Enter toggles between
+vllm (the default) and sglang. The menu title and the rows that follow switch
+to the chosen engine, and values that still fit are kept. The choice is
+remembered like the others, so the next menu opens on it, and it is recorded
+as `--backend sglang` for `restart` and autostart:
+
+```
+? Launch qwen3.5-4b on sglang  (Enter starts; * = not default)
+ » ▶ Start
+     Profile         default  ▸
+   * Backend         sglang
+     Context         default (32768)
+     KV cache        f16
+     Parallel slots  auto
+     Group           auto (none)
+   ＋ Save as profile…
+   ↺ Reset to defaults
+```
+
 Settings are a table in
 `src/llm_runner/launch.py`; adding one is one entry.
 
@@ -402,7 +434,7 @@ opens the list; pick one and press Enter on Start. The menu opens on `last`.
 
 | Profile | For | Sets |
 |---|---|---|
-| `last` | any model | what this model ran with last time (including its group) |
+| `last` | any model | what this model ran with last time (including its group and backend) |
 | `default` | any model | llmctl's defaults |
 | `fast` | chat models with a drafter | MTP on, f16 KV, one slot |
 | `long` | chat models | 128K context, q8_0 KV, drafter off, one slot |
@@ -410,9 +442,9 @@ opens the list; pick one and press Enter on Start. The menu opens on `last`.
 | `serve` | chat models | 4 slots sharing 64K, q8_0 KV, drafter off, 4 checkpoints |
 | `lean` | chat models | 8K context, no vision, q8_0 KV, drafter off, no checkpoints |
 
-"Chat models" means llama or vLLM, not decision or embedding models; those
+"Chat models" means llama, vLLM or SGLang, not decision or embedding models; those
 get only `last` and `default`. A profile resets the rows it doesn't set to
-their defaults, except the group. The profiles that quantize the KV cache turn
+their defaults, except the group and the backend. The profiles that quantize the KV cache turn
 the drafter off, because quantized KV drops MTP acceptance to ~0% (the menu
 warns if you combine them by hand). After a profile, change any row; the
 Profile row then reads `long (modified)`.
@@ -424,19 +456,19 @@ and `llmctl run MODEL --profile NAME` applies one without the menu (flags typed
 alongside it win). `restart` and autostart record the flags a profile set, not
 its name, so editing a profile never changes a running model.
 
-- Backend: from the model format (`--backend llama|vllm` to force; see
-  [vLLM specifics](#vllm-specifics)).
+- Backend: from the model format (`--backend llama|vllm|sglang` to force; see
+  [vLLM and SGLang specifics](#vllm-and-sglang-specifics)).
 - Default port: first free port from `8080`.
 - Default context size: `32768`.
 - Override either: `-p 8081 -c 65536`.
 - Reasoning is **disabled by default** on llama (`--reasoning-budget 0`). Pass
-  `--reasoning` to let the model's default reasoning behavior apply. On vllm
-  use `--reasoning-parser <name>` to get `reasoning_content` split out.
+  `--reasoning` to let the model's default reasoning behavior apply. On
+  vllm/sglang use `--reasoning-parser <name>` to get `reasoning_content` split out.
 - Serve an embedding model with `--embeddings` (see [Embedding models](#embedding-models)).
 - Process is detached (own session, survives the CLI exit). Stdout/stderr go
   to a per-instance log file under the state dir. `--wait` polls `/health`
-  and exits non-zero if the server dies first — useful for vllm, which takes
-  a minute or more to load and compile.
+  and exits non-zero if the server dies first — useful for vllm/sglang, which
+  take a minute or more to load and compile.
 - `-X '<args>'` appends anything verbatim to the server command; `-E K=V`
   sets an env var for it. Both are remembered for `restart`/`restore`.
 
@@ -446,6 +478,7 @@ Run an arbitrary GGUF or checkpoint dir outside `MODELS_DIR`:
 llmctl run --ft /path/to/finetune.gguf
 llmctl run --ft /path/to/finetune.gguf --name my-ft -p 8082 -c 16384
 llmctl run --ft /path/to/hf-checkpoint-dir --name my-ft     # → vllm
+llmctl run --ft /path/to/hf-checkpoint-dir --backend sglang
 ```
 
 ### Speculative decoding (MTP drafters)
@@ -642,11 +675,10 @@ llmctl autostart status     # unit + manifest state
 llmctl autostart uninstall  # remove the unit (manifest is kept)
 ```
 
-The installer detects an active **conda** env and bakes a `bash -lc 'source
-…/conda.sh && conda activate <env> && llmctl restore'` `ExecStart` into the
-unit, so `llama-server` and its CUDA libraries resolve at boot exactly as they
-do in your shell (without conda it bakes the current `PATH`/`LD_LIBRARY_PATH`
-instead). `LLM_RUNNER_*` overrides are passed through. Test it without
+The installer bakes the current `PATH` and `LD_LIBRARY_PATH` into the unit,
+so `llama-server` and its CUDA libraries resolve at boot as they do in your
+shell; vllm/sglang are recorded by absolute path and get their compilers from
+llmctl. `LLM_RUNNER_*` overrides are passed through. Test it without
 rebooting:
 
 ```bash
@@ -748,7 +780,10 @@ curl -s localhost:8090/v1/systemone -H 'Content-Type: application/json' -d '{
   Text-only models reject the `images` field. Without a projector, an image
   request gets `503 vision_unavailable`.
 
-### vLLM specifics
+### vLLM and SGLang specifics
+
+A checkpoint runs on vLLM unless `--backend sglang` asks for SGLang. Every
+example below works on either; `restart` and `restore` keep the backend.
 
 ```bash
 llmctl run qwen3-8b --wait                  # block until /health answers (vllm takes ~1 min)
@@ -759,36 +794,45 @@ llmctl run qwen3-8b --kv-quant q8_0         # → --kv-cache-dtype fp8 (no 4-bit
 llmctl run qwen3-8b --n-parallel 16         # → --max-num-seqs
 llmctl run qwen3-8b -X '--max-num-batched-tokens 8192'   # anything else, verbatim
 llmctl run qwen3-8b -E VLLM_USE_FLASHINFER_SAMPLER=0     # env var for the server process
+llmctl run qwen3-8b --backend sglang --wait               # the same model on SGLang
 ```
 
 How the shared `run` flags map:
 
-| `llmctl run`        | llama-server                  | vllm serve                         |
-|---------------------|-------------------------------|------------------------------------|
-| `--ctx-size N`      | `--ctx-size N`                | `--max-model-len N`                |
-| `--kv-quant q8_0`   | `--cache-type-k/v q8_0`       | `--kv-cache-dtype fp8`             |
-| `--n-parallel N`    | `--parallel N`                | `--max-num-seqs N`                 |
-| `--embeddings`      | `--embeddings --pooling ...`  | `--runner pooling`                 |
-| `--draft M`         | `--model-draft M`             | `--speculative-config {draft_model}` |
-| `--spec-type ngram` | (llama types)                 | `--speculative-config {ngram}`     |
-| `--name X`          | display name only             | also `--served-model-name X`       |
-| `-X ARGS` / `-E K=V`| appended / env                | appended / env                     |
+| `llmctl run`        | llama-server                  | vllm serve                         | sglang serve |
+|---------------------|-------------------------------|------------------------------------|--------------|
+| `--ctx-size N`      | `--ctx-size N`                | `--max-model-len N`                | `--context-length N` |
+| `--kv-quant q8_0`   | `--cache-type-k/v q8_0`       | `--kv-cache-dtype fp8`             | `--kv-cache-dtype fp8_e4m3` |
+| `--n-parallel N`    | `--parallel N`                | `--max-num-seqs N`                 | `--max-running-requests N` |
+| `--gpu-mem F`       | —                             | `--gpu-memory-utilization F`       | `--mem-fraction-static F` |
+| `--embeddings`      | `--embeddings --pooling ...`  | `--runner pooling`                 | `--is-embedding` |
+| `--draft M`         | `--model-draft M`             | `--speculative-config {draft_model}` | `--speculative-algorithm STANDALONE` (`EAGLE`/`EAGLE3` with `--spec-type eagle`/`eagle3`) |
+| `--spec-type mtp`   | —                             | `--speculative-config {mtp}`       | `--speculative-algorithm NEXTN` |
+| `--spec-type ngram` | (llama types)                 | `--speculative-config {ngram}`     | `--speculative-algorithm NGRAM` |
+| `--tool-parser P`   | —                             | `--enable-auto-tool-choice --tool-call-parser P` | `--tool-call-parser P` |
+| `--name X`          | display name only             | also `--served-model-name X`       | also `--served-model-name X` |
+| `-X ARGS` / `-E K=V`| appended / env                | appended / env                     | appended / env |
 
 `--gpu-mem`, `--tool-parser`, `--reasoning-parser` and `--trust-remote-code`
-are vllm-only; `--n-gpu-layers`, `--no-vision`, `--kv-unified`, `--cache-ram`,
+are vllm/sglang-only; `--n-gpu-layers`, `--no-vision`, `--kv-unified`, `--cache-ram`,
 `--reasoning` and the embedding batch flags are llama-only. Passing one to the
-other backend prints a warning and ignores it.
+other side prints a warning and ignores it. SGLang always gets
+`--enable-metrics` (the gateway reads its queue depth from `/metrics`), and
+`SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0` so `/health` is an instant check
+rather than a one-token generation that takes ~1 s.
 
-`--gpu-mem` is how vllm shares the card. It reserves that fraction of
-**total** GPU memory up front (all of it, as KV cache — even for a tiny
-model) and refuses to start if it isn't free. When omitted, llmctl computes
-it from the VRAM free at launch (minus ~0.75 GB headroom, capped at vllm's
-own 0.9) and prints the value it chose. So:
+`--gpu-mem` is how vllm and sglang share the card. vllm reserves that
+fraction of **total** GPU memory up front (all of it, as KV cache — even for
+a tiny model) and refuses to start if it isn't free. SGLang's fraction covers
+weights and the KV pool; its activations and CUDA graphs come out of the
+rest. When omitted, llmctl computes it from the VRAM free at launch (minus
+~0.75 GB headroom capped at 0.9 for vllm, ~3 GB capped at 0.88 for sglang)
+and prints the value it chose. So:
 
-- vllm alone → it takes ~everything. Fine.
+- vllm/sglang alone → it takes ~everything. Fine.
 - llama model already running → the default fits in what's left. Fine.
-- vllm first, llama model later → pass a deliberate `--gpu-mem 0.3` or the
-  llama model won't fit.
+- vllm/sglang first, llama model later → pass a deliberate `--gpu-mem 0.3` or
+  the llama model won't fit.
 
 `restart` recomputes the default; `restore` replays the value recorded at
 launch.
@@ -917,7 +961,7 @@ any$  llmctl ps --all                           # every model, and where calls g
   model shows its `llmctl.group`. Exact ids still mean exactly that model.
 - **Spill-over.** Priority decides who gets a call, unless that instance is
   full. When every slot of the preferred instance is busy (llama-server's
-  `/slots`; waiting requests on vLLM; a decision endpoint counts as busy as
+  `/slots`; waiting requests on vLLM and SGLang; a decision endpoint counts as busy as
   the llama-server behind it), the call goes to the next instance that has a
   free slot right now. If every instance is busy, it queues on the
   preferred one as before, so work only moves to a slower machine when that
@@ -996,7 +1040,8 @@ Other persisted settings:
 
 | Command | Setting |
 |---|---|
-| `llmctl config vllm-bin <path>` (`--clear`) | The `vllm` CLI; `$LLM_RUNNER_VLLM_BIN` overrides it (see the vllm install section). |
+| `llmctl config vllm-bin <path>` (`--clear`) | The `vllm` CLI; `$LLM_RUNNER_VLLM_BIN` overrides it (see the vllm/sglang install section). |
+| `llmctl config sglang-bin <path>` (`--clear`) | The `sglang` CLI; `$LLM_RUNNER_SGLANG_BIN` overrides it. |
 | `llmctl config gateway PORT` (`--off`) | The gateway port, default 9000. |
 | `llmctl config bind HOST` (`--reset`) | The address the gateway and models listen on, default `0.0.0.0`. |
 | `llmctl config offline on\|off` | Offline mode (below); `$LLM_RUNNER_OFFLINE` overrides it. |

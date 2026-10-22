@@ -15,9 +15,14 @@ Each setting is a row in :data:`SETTINGS` naming a ``run`` option: the menu
 writes the chosen values into the click context as if typed on the command
 line, so ``restart`` and autostart reproduce them. Adding a setting is one
 entry here; nothing in ``run`` changes.
+
+The Backend row (checkpoint dirs, when more than one engine is installed) is
+the one row the others depend on: changing it rebuilds the menu for the new
+engine, keeping every value that still fits.
 """
 from __future__ import annotations
 
+import functools
 import json
 import re
 import urllib.request
@@ -26,8 +31,9 @@ from typing import Any, Callable
 
 import click
 
+from llm_runner import backends
 from llm_runner import process as proc
-from llm_runner.backends import DECIDER, GATEWAY, LLAMA, VLLM
+from llm_runner.backends import DECIDER, GATEWAY, HF_ENGINES, LLAMA
 from llm_runner.registry import ModelSpec, default_group, looks_like_embedding_model
 
 CHOICES_FILE = proc.STATE_DIR / "launch.json"
@@ -38,11 +44,30 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 @dataclass(frozen=True)
 class Target:
     spec: ModelSpec
-    backend: str            # resolved: llama | vllm | decider
+    backend: str            # resolved: llama | vllm | sglang | decider
 
     @property
     def decision(self) -> bool:
         return self.backend != DECIDER and self.spec.decision
+
+
+def engine_for(spec: ModelSpec, backend: str) -> str:
+    """What ``run --backend BACKEND`` resolves to for ``spec``."""
+    return spec.backend if backend == "auto" else backend
+
+
+@functools.cache
+def _installed(engine: str) -> bool:
+    return backends.find(engine) is not None
+
+
+def _backend_values(t: Target) -> list[tuple[Any, str]]:
+    """``auto`` (the engine the format implies) first, then every other
+    installed engine that serves the same checkpoint."""
+    if t.spec.backend not in HF_ENGINES:
+        return []
+    return [("auto", t.spec.backend)] + [
+        (e, e) for e in HF_ENGINES if e != t.spec.backend and _installed(e)]
 
 
 @dataclass(frozen=True)
@@ -100,19 +125,21 @@ def _draft_title(t: Target) -> str:
 
 
 SETTINGS: list[Setting] = [
+    Setting("backend", "Backend", _backend_values,
+            lambda t: len(_backend_values(t)) > 1),
     Setting("no_vision", "Vision",
             lambda t: [(False, "on"), (True, "off (saves ~1 GB)")],
             lambda t: t.backend == LLAMA and t.spec.mmproj_path is not None),
     Setting("no_draft", "MTP drafter",
             lambda t: [(False, _draft_title(t)), (True, "off")],
-            lambda t: t.backend in (LLAMA, VLLM) and t.spec.has_draft),
+            lambda t: t.backend in (LLAMA, *HF_ENGINES) and t.spec.has_draft),
     Setting("reasoning", "Reasoning",
             lambda t: [(False, "off"), (True, "on")],
             lambda t: t.backend == LLAMA),
     Setting("ctx_size", "Context", _ctx_values,
-            lambda t: t.backend in (LLAMA, VLLM)),
+            lambda t: t.backend in (LLAMA, *HF_ENGINES)),
     Setting("kv_quant", "KV cache", _kv_values,
-            lambda t: t.backend in (LLAMA, VLLM)),
+            lambda t: t.backend in (LLAMA, *HF_ENGINES)),
     Setting("ctx_checkpoints", "Checkpoints", _checkpoint_values,
             lambda t: t.backend == LLAMA),
     Setting("cache_ram", "Prompt cache",
@@ -138,7 +165,7 @@ class Profile:
 
 
 def _chat(t: Target) -> bool:
-    return t.backend in (LLAMA, VLLM)
+    return t.backend in (LLAMA, *HF_ENGINES)
 
 
 # Quantized KV zeroes MTP acceptance in llama.cpp, so the profiles that
@@ -163,8 +190,9 @@ PROFILES: list[Profile] = [
              "ctx_checkpoints": 0, "n_parallel": 1}, _chat),
 ]
 RESERVED = {"last", "default"} | {p.name for p in PROFILES}
-# Who the model is, not how it runs: profiles neither set nor reset these.
-KEEP = {"group_name"}
+# Who the model is and what serves it, not how it runs: profiles neither set
+# nor reset these (``last`` restores them).
+KEEP = {"group_name", "backend"}
 
 
 def _load(path) -> dict:
@@ -236,7 +264,7 @@ class _Menu:
 
     @property
     def tunable(self) -> bool:
-        """Whether profiles apply: chat models on llama or vLLM."""
+        """Whether profiles apply: chat models on llama, vLLM or SGLang."""
         emb = self.ctx.params.get("embeddings")
         if emb is None:
             path = self.target.spec.model_path
@@ -322,6 +350,20 @@ def apply_profile(ctx: click.Context, target: Target, name: str) -> None:
     m.commit(current)
 
 
+def _retarget(m: _Menu, current: dict) -> tuple[_Menu, dict]:
+    """The menu for the engine ``current["backend"]`` picks. On a change, every
+    row keeps its value where the new engine offers it (or it was typed) and
+    falls back to the default where it doesn't."""
+    backend = engine_for(m.target.spec, current.get("backend", "auto"))
+    if backend == m.target.backend:
+        return m, current
+    new = _Menu(m.ctx, Target(m.target.spec, backend))
+    return new, {s.param: current[s.param]
+                 if s.param in current and (new._valid(s, current[s.param]) or new.typed(s.param))
+                 else new.defaults[s.param]
+                 for s in new.settings}
+
+
 def _ask(question):
     answer = question.ask()
     if answer is None:
@@ -338,18 +380,21 @@ def configure(ctx: click.Context, target: Target, profile: str | None = None) ->
     m = _Menu(ctx, target)
     if not m.settings:
         return False
-    settings, defaults = m.settings, m.defaults
 
-    start = {s.param: ctx.params[s.param] for s in settings}
+    start = {s.param: ctx.params[s.param] for s in m.settings}
+    if start.get("backend") == target.spec.backend:
+        start["backend"] = "auto"          # `--backend vllm` on a checkpoint is auto
     chosen = m.find(profile) if profile else m.profiles()[0]
     current = m.resolve(chosen, start)
-    for s in settings:
+    for s in m.settings:
         if m.typed(s.param):
-            current[s.param] = ctx.params[s.param]       # typed: wins
+            current[s.param] = start[s.param]            # typed: wins
 
-    width = max([len("Profile")] + [len(s.label) for s in settings])
     cursor: Any = "start"
     while True:
+        m, current = _retarget(m, current)
+        settings, defaults, target = m.settings, m.defaults, m.target
+        width = max([len("Profile")] + [len(s.label) for s in settings])
         profiles = m.profiles()
         matching = [p.name for p in profiles if m.resolve(p, current) == current]
         if chosen.name not in matching and matching:

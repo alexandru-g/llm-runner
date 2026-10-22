@@ -152,3 +152,102 @@ def test_multi_is_llama_only(state):
     multi = m.resolve(m.find("multi"), m.defaults)
     assert multi["cache_ram"] == 8192 and multi["n_parallel"] == 1
     assert m.resolve(m.find("lean"), multi)["cache_ram"] == 0
+
+
+# ---------------------------------------------------------- backend row --
+
+def _ckpt(tmp_path, name="qwen3-8b"):
+    folder = tmp_path / "models" / name
+    folder.mkdir(parents=True, exist_ok=True)
+    return ModelSpec(name, folder, None, 0, backend="vllm")
+
+
+@pytest.fixture
+def engines(monkeypatch):
+    """vllm and sglang both installed (each test can take one away)."""
+    installed = {"vllm": True, "sglang": True}
+    monkeypatch.setattr(launch, "_installed", lambda e: installed[e])
+    return installed
+
+
+def _rows(ctx, target):
+    return [s.param for s in launch._Menu(ctx, target).settings]
+
+
+def test_backend_row_only_for_checkpoints_with_a_choice(state, engines):
+    ckpt = launch.Target(_ckpt(state), "vllm")
+    assert _rows(_ctx(), ckpt)[0] == "backend"
+    assert launch._backend_values(ckpt) == [("auto", "vllm"), ("sglang", "sglang")]
+    assert "backend" not in _rows(_ctx(), launch.Target(_spec(state), "llama"))
+    engines["sglang"] = False
+    assert "backend" not in _rows(_ctx(), ckpt)
+
+
+def test_switching_backend_rebuilds_the_menu(state, engines):
+    m = launch._Menu(_ctx(), launch.Target(_ckpt(state), "vllm"))
+    current = {**m.defaults, "kv_quant": "q8_0", "ctx_size": 65536, "backend": "sglang"}
+    m2, cur = launch._retarget(m, current)
+    assert m2.target.backend == "sglang" and cur == current      # every value still fits
+    m3, cur = launch._retarget(m2, {**cur, "backend": "auto"})
+    assert m3.target.backend == "vllm" and cur["kv_quant"] == "q8_0"
+    assert launch._retarget(m3, cur)[0] is m3                    # no change, no rebuild
+
+
+def test_profiles_keep_the_backend_and_last_restores_it(state, engines):
+    spec = _ckpt(state)
+    launch._save_choices(spec.key, {"backend": "sglang", "ctx_size": 8192})
+    m = launch._Menu(_ctx(), launch.Target(spec, "vllm"))
+    sg = {**m.defaults, "backend": "sglang"}
+    assert m.resolve(m.find("long"), sg)["backend"] == "sglang"
+    assert m.resolve(m.find("default"), sg)["backend"] == "sglang"
+    assert m.resolve(m.find("last"), m.defaults)["backend"] == "sglang"
+    launch.save_profile("big", "sglang", {"ctx_size": 65536})
+    assert "big" not in _names(_ctx(), launch.Target(spec, "vllm"))
+    assert "big" in _names(_ctx(), launch.Target(spec, "sglang"))
+
+
+class _Scripted:
+    """Stands in for questionary.select: answers each prompt in turn and
+    records the prompts and the row titles shown."""
+
+    def __init__(self, answers):
+        self.answers, self.prompts = list(answers), []
+
+    def select(self, message, choices, **kw):
+        self.prompts.append((message, [getattr(c, "title", None) for c in choices]))
+        answer = self.answers.pop(0)
+        return type("Q", (), {"ask": lambda _: answer})()
+
+
+def _drive(monkeypatch, ctx, target, answers):
+    import questionary
+    script = _Scripted(answers)
+    monkeypatch.setattr(questionary, "select", script.select)
+    assert launch.configure(ctx, target)
+    return script
+
+
+def test_menu_picks_sglang_and_records_it(state, engines, monkeypatch):
+    from llm_runner import cli
+    spec = _ckpt(state)
+    ctx = _ctx()
+    script = _drive(monkeypatch, ctx, launch.Target(spec, "vllm"), ["backend", "start"])
+    (first, rows), (second, _) = script.prompts
+    assert "on vllm" in first and any("Backend" in r and "vllm" in r for r in rows if r)
+    assert "on sglang" in second                       # the menu rebuilt for sglang
+    assert ctx.params["backend"] == "sglang"
+    args = cli._run_option_args(ctx)
+    assert args[args.index("--backend") + 1] == "sglang"
+    assert launch._load_choices()[spec.key] == {"backend": "sglang"}
+    # Next time the menu opens on `last`, i.e. on sglang.
+    ctx = _ctx()
+    script = _drive(monkeypatch, ctx, launch.Target(spec, "vllm"), ["start"])
+    assert "on sglang" in script.prompts[0][0] and ctx.params["backend"] == "sglang"
+
+
+def test_typed_backend_beats_last(state, engines, monkeypatch):
+    spec = _ckpt(state)
+    launch._save_choices(spec.key, {"backend": "sglang"})
+    ctx = _ctx("--backend", "vllm")
+    script = _drive(monkeypatch, ctx, launch.Target(spec, "vllm"), ["start"])
+    assert "on vllm" in script.prompts[0][0] and ctx.params["backend"] == "auto"

@@ -1,4 +1,4 @@
-"""CLI for managing background model servers (llama-server / vllm)."""
+"""CLI for managing background model servers (llama-server / vllm / sglang)."""
 from __future__ import annotations
 
 import contextlib
@@ -25,7 +25,7 @@ from llm_runner import backends
 from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner import registry
-from llm_runner.backends import DECIDER, GATEWAY, LLAMA, VLLM
+from llm_runner.backends import DECIDER, GATEWAY, HF_ENGINES, LLAMA, SGLANG, VLLM
 from llm_runner.registry import MODELS_DIR, ModelSpec, discover_models
 
 
@@ -125,33 +125,35 @@ def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size:
 def _resolve_draft(draft_spec: str | None, auto_spec: ModelSpec | None,
                    backend: str = LLAMA) -> Path | None:
     """Resolve the speculative drafter (llama ``--model-draft`` / vllm
-    ``--speculative-config`` model).
+    ``--speculative-config`` / sglang ``--speculative-draft-model-path``).
 
     ``draft_spec`` (from ``--draft``) may be a path (GGUF file, or checkpoint
-    dir for vllm), a registry key, or — vllm only — a Hugging Face repo id
-    that vllm fetches itself. When it is omitted, fall back to the drafter
-    auto-attached to ``auto_spec`` (a sibling ``*-MTP`` / ``*-assistant``
-    GGUF), if any — llama only, since that file is a GGUF.
+    dir for vllm/sglang), a registry key, or — vllm/sglang only — a Hugging
+    Face repo id the engine fetches itself. When it is omitted, fall back to
+    the drafter auto-attached to ``auto_spec`` (a sibling ``*-MTP`` /
+    ``*-assistant`` GGUF), if any — llama only, since that file is a GGUF.
     """
+    hf = backend in HF_ENGINES
     if draft_spec:
         p = Path(draft_spec).expanduser()
-        if p.is_file() or (backend == VLLM and p.is_dir()):
+        if p.is_file() or (hf and p.is_dir()):
             return p.resolve()
         specs = discover_models()
         if draft_spec in specs:
             cand = specs[draft_spec]
-            if cand.backend != backend:
+            # The registry names an engine per format; the format must match.
+            if (cand.backend in HF_ENGINES) != hf:
                 raise click.BadArgumentUsage(
                     f"--draft '{draft_spec}' is a {cand.backend} model; the "
                     f"drafter must match the {backend} backend.")
             return cand.model_path
-        if backend == VLLM and re.fullmatch(r"[\w.-]+/[\w.-]+", draft_spec):
-            return Path(draft_spec)  # HF repo id; vllm downloads it
+        if hf and re.fullmatch(r"[\w.-]+/[\w.-]+", draft_spec):
+            return Path(draft_spec)  # HF repo id; the engine downloads it
         raise click.BadArgumentUsage(
             f"--draft '{draft_spec}' is neither an existing model file/dir nor a "
             "known model key."
         )
-    if backend == VLLM:
+    if hf:
         return None
     return auto_spec.draft_path if auto_spec else None
 
@@ -192,9 +194,10 @@ def _require_backend(backend: str) -> str:
     return binary
 
 
-# `run` options that only mean something to llama-server. Passing one with
-# --backend vllm is almost certainly a mistake (or a stale `restart`
-# override), so warn instead of silently dropping it.
+# `run` options that only mean something to llama-server, or only to the HF
+# engines (vllm, sglang). Passing one to the other side is almost certainly
+# a mistake (or a stale `restart` override), so warn instead of silently
+# dropping it.
 _LLAMA_ONLY_PARAMS = {
     "reasoning": "--reasoning", "n_gpu_layers": "--n-gpu-layers",
     "no_vision": "--no-vision", "kv_unified": "--kv-unified/--no-kv-unified",
@@ -202,7 +205,7 @@ _LLAMA_ONLY_PARAMS = {
     "pooling": "--pooling",
     "batch_size": "--batch-size", "ubatch_size": "--ubatch-size",
 }
-_VLLM_ONLY_PARAMS = {
+_HF_ENGINE_PARAMS = {
     "gpu_mem": "--gpu-mem", "tool_parser": "--tool-parser",
     "reasoning_parser": "--reasoning-parser",
     "trust_remote_code": "--trust-remote-code",
@@ -211,12 +214,13 @@ _VLLM_ONLY_PARAMS = {
 
 def _warn_foreign_flags(ctx: click.Context, backend: str) -> None:
     src = click.core.ParameterSource.COMMANDLINE
+    hf = "vllm/sglang"
     if backend == DECIDER:
         # decider takes only --port / --n-parallel / -X / -E; everything
         # engine-specific is meaningless there.
-        groups = {LLAMA: _LLAMA_ONLY_PARAMS, VLLM: _VLLM_ONLY_PARAMS}
+        groups = {LLAMA: _LLAMA_ONLY_PARAMS, hf: _HF_ENGINE_PARAMS}
     else:
-        groups = {VLLM: _VLLM_ONLY_PARAMS} if backend == LLAMA else {LLAMA: _LLAMA_ONLY_PARAMS}
+        groups = {hf: _HF_ENGINE_PARAMS} if backend == LLAMA else {LLAMA: _LLAMA_ONLY_PARAMS}
     for other, foreign in groups.items():
         used = [flag for name, flag in foreign.items()
                 if ctx.get_parameter_source(name) == src]
@@ -227,7 +231,7 @@ def _warn_foreign_flags(ctx: click.Context, backend: str) -> None:
 
 def _wait_healthy(rec: proc.RunningProcess, timeout: float) -> bool:
     """Poll ``/health`` until the server answers 200, the process dies, or
-    ``timeout`` elapses. Both llama-server and vllm expose it."""
+    ``timeout`` elapses. llama-server, vllm and sglang all expose it."""
     url = f"http://127.0.0.1:{rec.port}/health"
     deadline = time.time() + timeout
     spinner = "|/-\\"
@@ -295,45 +299,62 @@ def config_show() -> None:
     for backend in backends.BACKENDS:
         found = backends.find(backend)
         click.echo(f"  {backend:<6} {found or '(not found)'}")
-    if os.environ.get("LLM_RUNNER_VLLM_BIN"):
-        click.echo("  (vllm overridden by $LLM_RUNNER_VLLM_BIN)")
+    for engine in HF_ENGINES:
+        var = backends.bin_env_var(engine)
+        if os.environ.get(var):
+            click.echo(f"  ({engine} overridden by ${var})")
     if os.environ.get("LLM_RUNNER_DECIDER_DIR"):
         click.echo("  (decider overridden by $LLM_RUNNER_DECIDER_DIR)")
+    tc = backends.toolchain_env()
+    click.echo("\nCUDA toolchain (vllm/sglang kernel JIT):")
+    if not tc:
+        click.echo("  (nvcc not found)")
+    else:
+        limit = backends.nvcc_max_gcc(Path(tc["CUDA_HOME"]))
+        click.echo(f"  CUDA_HOME={tc['CUDA_HOME']}"
+                   + (f"  (nvcc takes GCC ≤ {limit})" if limit else ""))
+        click.echo(f"  CC={tc['CC']}  CXX={tc['CXX']}" if "CC" in tc else
+                   "  (no system GCC nvcc accepts — the inherited compilers apply)")
     gw_port = config_mod.get_gateway_port()
     click.echo(f"\nGateway: {'off' if gw_port is None else f'port {gw_port}'}")
 
 
-@config.command("vllm-bin")
-@click.argument("path", required=False,
-                type=click.Path(dir_okay=False, path_type=Path))
-@click.option("--clear", is_flag=True, help="Forget the stored path.")
-def config_vllm_bin(path: Path | None, clear: bool) -> None:
-    """Persist the path to the `vllm` CLI, or print it when PATH is omitted.
+def _engine_bin_command(engine: str) -> None:
+    """Register `llmctl config <engine>-bin`."""
+    @config.command(f"{engine}-bin")
+    @click.argument("path", required=False,
+                    type=click.Path(dir_okay=False, path_type=Path))
+    @click.option("--clear", is_flag=True, help="Forget the stored path.")
+    def command(path: Path | None, clear: bool) -> None:
+        if clear:
+            config_mod.set_engine_bin(engine, None)
+            click.echo(f"{engine}_bin cleared")
+            return
+        if path is None:
+            configured = config_mod.get_engine_bin(engine)
+            if configured:
+                click.echo(str(configured))
+            else:
+                found = backends.find_engine(engine)
+                click.echo(f"(not set; {'auto-detected ' + found if found else engine + ' not found'})")
+            return
+        if not path.expanduser().is_file():
+            click.echo(f"warning: {path} does not exist", err=True)
+        saved = config_mod.set_engine_bin(engine, path)
+        click.echo(f"{engine}_bin set to {saved}")
+        var = backends.bin_env_var(engine)
+        if os.environ.get(var):
+            click.echo(f"note: ${var} is set and overrides this.", err=True)
 
-    Only needed when vllm lives somewhere llmctl doesn't look: PATH, a
-    conda/venv env named `vllm`, or any conda env. Example:
+    command.help = (
+        f"Persist the path to the `{engine}` CLI, or print it when PATH is omitted.\n\n"
+        f"Only needed when {engine} lives somewhere llmctl doesn't look: PATH, the "
+        f"venv `uv tool install {engine}` made, or ~/.venvs/{engine}. Example:\n\n"
+        f"\b\n  llmctl config {engine}-bin ~/envs/{engine}/bin/{engine}")
 
-      llmctl config vllm-bin ~/miniconda3/envs/vllm/bin/vllm
-    """
-    if clear:
-        config_mod.set_vllm_bin(None)
-        click.echo("vllm_bin cleared")
-        return
-    if path is None:
-        configured = config_mod.get_vllm_bin()
-        if configured:
-            click.echo(str(configured))
-        else:
-            found = backends.find_vllm()
-            click.echo(f"(not set; {'auto-detected ' + found if found else 'vllm not found'})")
-        return
-    resolved = Path(path).expanduser().resolve()
-    if not resolved.is_file():
-        click.echo(f"warning: {resolved} does not exist", err=True)
-    saved = config_mod.set_vllm_bin(resolved)
-    click.echo(f"vllm_bin set to {saved}")
-    if os.environ.get("LLM_RUNNER_VLLM_BIN"):
-        click.echo("note: $LLM_RUNNER_VLLM_BIN is set and overrides this.", err=True)
+
+for _engine in HF_ENGINES:
+    _engine_bin_command(_engine)
 
 
 @config.command("decider-dir")
@@ -562,21 +583,22 @@ def profile_rm(name: str) -> None:
 
 @cli.command()
 @click.argument("model", required=False)
-@click.option("--backend", type=click.Choice(["auto", LLAMA, VLLM, DECIDER]), default="auto",
-              show_default=True,
+@click.option("--backend", type=click.Choice(["auto", LLAMA, VLLM, SGLANG, DECIDER]),
+              default="auto", show_default=True,
               help="Serving engine. auto = llama-server for a GGUF, vllm for a "
-                   "Hugging Face checkpoint directory.")
+                   "Hugging Face checkpoint directory. sglang serves the same "
+                   "checkpoints and is only used when asked for.")
 @click.option("--port", "-p", type=int, default=None,
               help="Listen port. Auto-selected starting at 8080 if omitted or taken.")
 @click.option("--ctx-size", "-c", type=int, default=None,
               help="Context size (default: 32768 for chat, 8192 for --embeddings). "
-                   "vllm: --max-model-len.")
+                   "vllm: --max-model-len, sglang: --context-length.")
 @click.option("--ft", "ft_path",
               type=click.Path(exists=True, path_type=Path),
               help="Path to a finetuned GGUF file, or an HF checkpoint directory "
-                   "for vllm (bypasses the registry).")
+                   "for vllm/sglang (bypasses the registry).")
 @click.option("--name", "ft_name", default=None,
-              help="Override the display name (useful with --ft). For vllm this "
+              help="Override the display name (useful with --ft). For vllm/sglang this "
                    "is also the model id clients send (--served-model-name).")
 @click.option("--group", "group_name", default=None,
               help="Second name the gateway routes by, shared by interchangeable "
@@ -584,9 +606,9 @@ def profile_rm(name: str) -> None:
                    "the model's folder, e.g. gemma-4-26b-a4b-it. 'none' for no group.")
 @click.option("--wait/--no-wait", "wait", default=False,
               help="Block until the server answers /health (or exits). Handy for "
-                   "vllm, which takes a minute or more to load and compile.")
+                   "vllm/sglang, which take a minute or more to load and compile.")
 @click.option("--menu/--no-menu", "-i", "menu", default=None,
-              help="Show the launch-options menu (vision, drafter, reasoning, "
+              help="Show the launch-options menu (backend, vision, drafter, reasoning, "
                    "context, KV cache, slots) before starting. On by default when "
                    "MODEL is picked interactively; choices are remembered per model.")
 @click.option("--profile", "profile", default=None, metavar="NAME",
@@ -604,28 +626,28 @@ def profile_rm(name: str) -> None:
                    "-E VLLM_USE_FLASHINFER_SAMPLER=0.")
 @click.option("--reasoning", is_flag=True, default=False,
               help="Enable reasoning. Disabled by default (--reasoning-budget 0). "
-                   "llama only; for vllm see --reasoning-parser.")
+                   "llama only; for vllm/sglang see --reasoning-parser.")
 @click.option("--kv-quant", type=click.Choice(["f16", "q8_0", "q4_0"]),
               default="f16",
               help="Quantize the KV cache to save VRAM. q8_0 ≈ half the f16 size "
                    "and is near-lossless; q4_0 halves it again with some quality "
                    "cost. Great for fitting big models / long context in VRAM. "
-                   "vllm: q8_0 → --kv-cache-dtype fp8 (no 4-bit KV in vllm).")
+                   "vllm/sglang: q8_0 → an fp8 KV cache (no 4-bit KV there).")
 @click.option("--gpu-mem", "gpu_mem", type=click.FloatRange(0.05, 1.0), default=None,
-              help="vllm only: fraction of *total* GPU memory vllm may claim "
-                   "(--gpu-memory-utilization). vllm refuses to start if that "
-                   "much isn't free, so the default is computed from the VRAM "
-                   "currently free (minus headroom, capped at vllm's own 0.9) — "
-                   "pass it explicitly to pin a value.")
+              help="vllm/sglang only: fraction of *total* GPU memory the engine "
+                   "may claim (vllm --gpu-memory-utilization, sglang "
+                   "--mem-fraction-static). The default is computed from the VRAM "
+                   "currently free, minus headroom (more for sglang, whose "
+                   "fraction leaves out activations) — pass it to pin a value.")
 @click.option("--tool-parser", "tool_parser", default=None,
-              help="vllm only: enable OpenAI tool calling with this parser "
-                   "(--enable-auto-tool-choice --tool-call-parser), e.g. hermes, "
+              help="vllm/sglang only: enable OpenAI tool calling with this parser "
+                   "(--tool-call-parser), e.g. hermes, "
                    "llama3_json, mistral, pythonic, qwen3_coder.")
 @click.option("--reasoning-parser", "reasoning_parser", default=None,
-              help="vllm only: split reasoning into reasoning_content with this "
+              help="vllm/sglang only: split reasoning into reasoning_content with this "
                    "parser (--reasoning-parser), e.g. deepseek_r1, qwen3.")
 @click.option("--trust-remote-code", is_flag=True, default=False,
-              help="vllm only: allow the checkpoint's custom modeling code.")
+              help="vllm/sglang only: allow the checkpoint's custom modeling code.")
 @click.option("--n-gpu-layers", "--ngl", "n_gpu_layers", type=int, default=999,
               help="Layers to offload to GPU (default: all). Lower it to spill "
                    "the rest onto CPU when VRAM is tight (slower, but it fits).")
@@ -655,7 +677,8 @@ def profile_rm(name: str) -> None:
                    "concurrent requests, but they split the KV cache and weaken "
                    "prompt-prefix reuse. Defaults to 1 when a drafter is attached "
                    "(MTP + prefix reuse work best single-stream); otherwise "
-                   "llama-server auto-selects. vllm: --max-num-seqs (default 256).")
+                   "llama-server auto-selects. vllm: --max-num-seqs (default 256), "
+                   "sglang: --max-running-requests.")
 @click.option("--kv-unified/--no-kv-unified", "kv_unified", default=None,
               help="Share one KV buffer across all slots (llama-server "
                    "--kv-unified) so each slot may use the full --ctx-size "
@@ -705,8 +728,8 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     """Start MODEL in the background.
 
     GGUF models run on llama-server; Hugging Face checkpoint directories run
-    on vllm, or on decider.serve when they carry a decider_config.json (see
-    --backend). Use --ft <path> to bypass the registry.
+    on vllm (or sglang with --backend sglang), or on decider.serve when they
+    carry a decider_config.json. Use --ft <path> to bypass the registry.
     """
     spec: ModelSpec | None = None
     if ft_path:
@@ -750,23 +773,23 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         detected = spec.backend
 
     # Backend: what the model format implies unless the user forces it. A
-    # GGUF *can* be forced onto vllm (experimental there, needs --tokenizer via
-    # -X) but an HF directory can never run on llama-server.
+    # GGUF *can* be forced onto vllm/sglang (experimental there, needs a
+    # tokenizer via -X) but an HF directory can never run on llama-server.
     if backend == "auto":
         backend = detected
     elif backend == LLAMA and model_path.is_dir():
         raise click.UsageError(
             f"'{model_path.name}' is a Hugging Face checkpoint directory; "
-            "llama-server only loads GGUF files. Use --backend vllm.")
+            "llama-server only loads GGUF files. Use --backend vllm or sglang.")
     elif backend == DECIDER and not backends.is_decider_model_dir(model_path):
         raise click.UsageError(
             f"'{model_path.name}' is not a decider checkpoint (no decider_config.json).")
     binary = _require_backend(backend)
     _warn_foreign_flags(ctx, backend)
-    if backend == VLLM and kv_quant == "q4_0":
-        raise click.UsageError("vllm has no 4-bit KV cache; use --kv-quant q8_0 "
-                               "(→ fp8) or f16.")
-    # decider.serve speaks the decision protocol itself; on llama/vllm a
+    if backend in HF_ENGINES and kv_quant == "q4_0":
+        raise click.UsageError(f"{backend} has no 4-bit KV cache here; use "
+                               "--kv-quant q8_0 (→ fp8) or f16.")
+    # decider.serve speaks the decision protocol itself; on the other engines a
     # decision model only serves raw completions.
     decision = backend != DECIDER and (spec.decision if spec
                                          else backends.is_decision_model(model_path))
@@ -815,14 +838,15 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
             binary, decider_dir, model_path, port=chosen_port,
             n_parallel=n_parallel, host=config_mod.get_bind_host(), extra=extra_args)
         env = {**launch_env, **env}      # -E overrides the profile defaults
-    elif backend == VLLM:
+    elif backend in HF_ENGINES:
         if gpu_mem is None:
-            picked = backends.default_gpu_mem()
+            picked = backends.default_gpu_mem(backend)
             if picked:
                 gpu_mem, why = picked
                 click.echo(f"Using --gpu-mem {gpu_mem:g} ({why}); pass --gpu-mem "
                            "to override.")
-        cmd = backends.build_vllm_cmd(
+        build = backends.build_vllm_cmd if backend == VLLM else backends.build_sglang_cmd
+        cmd = build(
             binary, model_path, name=name, port=chosen_port, ctx_size=ctx_size,
             kv_quant=kv_quant, gpu_mem=gpu_mem, n_parallel=n_parallel,
             embeddings=embeddings, draft_path=draft_path, spec_type=spec_type,
@@ -858,7 +882,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                                spec_n_max=spec_n_max, n_parallel=n_parallel,
                                cache_ram=cache_ram, kv_unified=kv_unified,
                                host=config_mod.get_bind_host(), extra=extra_args)
-        # Report the llmctl name as the model id (as vLLM's --served-model-name
+        # Report the llmctl name as the model id (as --served-model-name
         # does) instead of the GGUF path, so it matches the gateway's /v1/models.
         if not any(a in ("--alias", "-a") for a in extra_args):
             cmd += ["--alias", name]
@@ -892,7 +916,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     if env:
         click.echo("Env:     " + " ".join(f"{k}={v}" for k, v in env.items()))
     if draft_path:
-        if backend == VLLM:
+        if backend in HF_ENGINES:
             click.echo(f"Speculative drafter: {draft_path.name}  "
                        f"(num_speculative_tokens={spec_n_max})")
         else:
@@ -902,13 +926,13 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     click.echo(f"Logs:  {rec.log_file}")
     click.echo(f"Tail:  llmctl logs {rec.name}")
     if wait:
-        # vllm loads weights, profiles memory and captures CUDA graphs before
-        # it listens; llama-server is usually up in seconds.
-        ok = _wait_healthy(rec, timeout=600 if backend in (VLLM, DECIDER) else 120)
+        # vllm/sglang load weights, profile memory and capture CUDA graphs
+        # before they listen; llama-server is usually up in seconds.
+        ok = _wait_healthy(rec, timeout=600 if backend in (*HF_ENGINES, DECIDER) else 120)
         if not ok:
             raise SystemExit(1)
-    elif backend == VLLM:
-        click.echo("Note: vllm takes a minute or more to become ready; use "
+    elif backend in HF_ENGINES:
+        click.echo(f"Note: {backend} takes a minute or more to become ready; use "
                    "--wait to block on /health.")
     elif backend == DECIDER:
         click.echo("Note: decider loads the weights and captures its CUDA graphs "
@@ -1125,24 +1149,14 @@ def _build_unit() -> str:
         if os.environ.get(var)
     ]
 
-    conda_exe = os.environ.get("CONDA_EXE")
-    if conda_exe:
-        # Source conda + activate the env so PATH and LD_LIBRARY_PATH (CUDA
-        # libs, llama-server) are exactly what works in the interactive shell.
-        profile = Path(conda_exe).resolve().parents[1] / "etc" / "profile.d" / "conda.sh"
-        env_name = os.environ.get("CONDA_DEFAULT_ENV", "base")
-        exec_start = (
-            f"/bin/bash -lc 'source \"{profile}\" && conda activate {env_name} "
-            f"&& exec \"{llmctl}\" restore'"
-        )
-    else:
-        # No conda: bake the current PATH/LD_LIBRARY_PATH so llama-server's
-        # shared libs still resolve under systemd's otherwise-bare environment.
-        env_lines += [
-            f"Environment={var}={os.environ[var]}"
-            for var in ("PATH", "LD_LIBRARY_PATH") if os.environ.get(var)
-        ]
-        exec_start = f"{llmctl} restore"
+    # Bake the current PATH/LD_LIBRARY_PATH so llama-server and its shared
+    # libs resolve under systemd's otherwise-bare environment. vllm/sglang
+    # are recorded by absolute path and get their compilers from llmctl.
+    env_lines += [
+        f"Environment={var}={os.environ[var]}"
+        for var in ("PATH", "LD_LIBRARY_PATH") if os.environ.get(var)
+    ]
+    exec_start = f"{llmctl} restore"
 
     env_block = ("\n".join(env_lines) + "\n") if env_lines else ""
     return (
@@ -1170,8 +1184,8 @@ def restore(names: tuple[str, ...]) -> None:
     Pass NAMES to restore only those manifest entries. Ports are pinned: an
     entry whose port is taken is reported as an error, never moved.
     """
-    # Only demand the binaries the manifest actually needs. A vllm entry
-    # records an absolute binary path, so it doesn't depend on PATH.
+    # Only demand the binaries the manifest actually needs. A vllm/sglang
+    # entry records an absolute binary path, so it doesn't depend on PATH.
     wanted = {s.backend for s in proc.autostart_list()
               if not names or s.name in names}
     for backend in sorted(wanted):
@@ -1235,7 +1249,7 @@ def _restart_all(ctx: click.Context) -> None:
             click.echo(f"skipped: {e.format_message()}", err=True)
             failed.append(p.name)
             continue
-        slow = rec is not None and rec.backend in (VLLM, DECIDER)
+        slow = rec is not None and rec.backend in (*HF_ENGINES, DECIDER)
         if rec is None or not _wait_healthy(rec, timeout=600 if slow else 300):
             failed.append(p.name)
     if failed:
@@ -1987,12 +2001,7 @@ def autostart_install() -> None:
     unit_dir.mkdir(parents=True, exist_ok=True)
     unit_path = unit_dir / SERVICE_NAME
     unit_path.write_text(_build_unit())
-    click.echo(f"Wrote {unit_path}")
-    if os.environ.get("CONDA_EXE"):
-        click.echo(f"Conda env baked in: {os.environ.get('CONDA_DEFAULT_ENV', 'base')}")
-    else:
-        click.echo("warning: no conda env detected — baked current PATH/"
-                   "LD_LIBRARY_PATH instead.", err=True)
+    click.echo(f"Wrote {unit_path}  (baked in the current PATH / LD_LIBRARY_PATH)")
 
     # daemon-reload + enable are required; linger lets it run without an active
     # login session (so it actually fires on a headless boot).

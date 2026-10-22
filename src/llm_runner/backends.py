@@ -1,6 +1,6 @@
 """Serving backends: how to find each server binary and build its argv.
 
-Three backends are supported:
+Four backends are supported:
 
 ``llama``
     llama.cpp's ``llama-server`` serving a single GGUF. The argv builder for
@@ -9,10 +9,16 @@ Three backends are supported:
 
 ``vllm``
     ``vllm serve`` on a Hugging Face-format checkpoint directory (safetensors
-    + ``config.json``). vLLM is a Python package, usually installed in its own
-    venv/conda env rather than on PATH, so :func:`find_vllm` looks in the
-    common places and the location can be pinned with ``llmctl config
-    vllm-bin`` or ``$LLM_RUNNER_VLLM_BIN``.
+    + ``config.json``). vLLM is a Python package with its own CUDA torch, so
+    it lives in its own venv — ``uv tool install vllm`` — which
+    :func:`find_engine` finds; the location can be pinned with ``llmctl
+    config vllm-bin`` or ``$LLM_RUNNER_VLLM_BIN``.
+
+``sglang``
+    ``sglang serve`` on the same checkpoint directories, installed and found
+    the same way (``uv tool install sglang``, ``llmctl config sglang-bin``,
+    ``$LLM_RUNNER_SGLANG_BIN``). Never picked automatically: a checkpoint
+    runs on it with ``--backend sglang``.
 
 ``decider``
     Mapika/decider's ``decider.serve`` (uvicorn) on a decider checkpoint
@@ -26,15 +32,18 @@ Three backends are supported:
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 LLAMA = "llama"
 VLLM = "vllm"
+SGLANG = "sglang"
 DECIDER = "decider"
 # Not a model server: the systemone-proxy started by `llmctl decide` in front
 # of a running llama-server.
@@ -42,7 +51,10 @@ DECIDE = "decide"
 # Not a model server either: the `llmctl gateway` router that puts every
 # running model behind one port. Started with the first model.
 GATEWAY = "gateway"
-BACKENDS = (LLAMA, VLLM, DECIDER)
+BACKENDS = (LLAMA, VLLM, SGLANG, DECIDER)
+# Engines that serve a Hugging Face checkpoint dir behind an OpenAI /v1 API.
+# They take the same llmctl options and are interchangeable for a model.
+HF_ENGINES = (VLLM, SGLANG)
 
 
 # Set for every process llmctl starts. vLLM sends usage stats home unless told
@@ -57,9 +69,19 @@ NO_TELEMETRY_ENV = {
 OFFLINE_ENV = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
 
 
-def launch_env(offline: bool) -> dict[str, str]:
-    """The environment llmctl sets for every backend (``-E`` still wins)."""
-    return {**NO_TELEMETRY_ENV, **(OFFLINE_ENV if offline else {})}
+# SGLang's /health generates a token by default and answers after ~1 s, the
+# gateway's whole probe timeout, so models flapped to "down". Off, it is a
+# cheap readiness check (503 while starting) like llama-server's and vLLM's.
+SGLANG_ENV = {"SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0"}
+
+
+def launch_env(offline: bool, backend: str | None = None) -> dict[str, str]:
+    """The environment llmctl sets for ``backend`` (``-E`` still wins): no
+    telemetry, offline mode, and for vllm/sglang the CUDA toolchain their
+    kernel JIT compiles with (:func:`toolchain_env`)."""
+    return {**NO_TELEMETRY_ENV, **(OFFLINE_ENV if offline else {}),
+            **(toolchain_env() if backend in HF_ENGINES else {}),
+            **(SGLANG_ENV if backend == SGLANG else {})}
 
 
 def with_bind_host(cmd: list[str], backend: str, host: str) -> list[str]:
@@ -81,58 +103,53 @@ def find_llama_server() -> str | None:
     return shutil.which("llama-server")
 
 
-def _conda_roots() -> list[Path]:
-    roots: list[Path] = []
-    conda_exe = os.environ.get("CONDA_EXE")
-    if conda_exe:
-        roots.append(Path(conda_exe).resolve().parents[1])
-    home = Path.home()
-    roots += [home / "miniconda3", home / "anaconda3", home / "miniforge3",
-              home / "mambaforge", home / ".conda"]
-    seen: set[Path] = set()
-    out: list[Path] = []
-    for r in roots:
-        if r not in seen and r.exists():
-            seen.add(r)
-            out.append(r)
-    return out
+# $LLM_RUNNER_<X>_BIN overrides discovery of each Python-packaged engine.
+_BIN_ENV = {VLLM: "LLM_RUNNER_VLLM_BIN", SGLANG: "LLM_RUNNER_SGLANG_BIN"}
 
 
-def find_vllm() -> str | None:
-    """Locate the ``vllm`` CLI.
+def bin_env_var(backend: str) -> str:
+    return _BIN_ENV[backend]
 
-    Order: ``$LLM_RUNNER_VLLM_BIN`` → ``config.json`` ``vllm_bin`` → PATH →
-    a conda/venv env literally named ``vllm`` → any conda env that has it.
-    Returns an absolute path (or None) so the recorded launch argv keeps
-    working from a systemd unit whose PATH lacks the env.
+
+def _uv_tool_dir() -> Path:
+    """Where ``uv tool install`` puts each tool's venv."""
+    env = os.environ.get("UV_TOOL_DIR")
+    if env:
+        return Path(env).expanduser()
+    xdg = os.environ.get("XDG_DATA_HOME")
+    return (Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share") / "uv" / "tools"
+
+
+def find_engine(backend: str) -> str | None:
+    """Locate the ``vllm`` / ``sglang`` CLI.
+
+    Order: ``$LLM_RUNNER_<X>_BIN`` → ``config.json`` ``<x>_bin`` → PATH → the
+    venv ``uv tool install <x>`` made → a venv at ``~/.venvs/<x>``,
+    ``~/venvs/<x>`` or ``~/<x>/.venv``. Returns an absolute path (or None)
+    so the recorded launch argv keeps working from a systemd unit whose PATH
+    lacks ``~/.local/bin``.
     """
-    env = os.environ.get("LLM_RUNNER_VLLM_BIN")
+    env = os.environ.get(_BIN_ENV[backend])
     if env:
         p = Path(env).expanduser()
         return str(p) if p.is_file() else None
 
     from llm_runner import config
-    configured = config.get_vllm_bin()
+    configured = config.get_engine_bin(backend)
     if configured and configured.is_file():
         return str(configured)
 
-    on_path = shutil.which("vllm")
+    on_path = shutil.which(backend)
     if on_path:
-        return on_path
+        return str(Path(on_path).absolute())
 
     home = Path.home()
-    candidates = [home / ".venvs" / "vllm" / "bin" / "vllm",
-                  home / "venvs" / "vllm" / "bin" / "vllm",
-                  home / "vllm" / ".venv" / "bin" / "vllm"]
-    for root in _conda_roots():
-        candidates.append(root / "envs" / "vllm" / "bin" / "vllm")
-    for root in _conda_roots():
-        envs = root / "envs"
-        if envs.is_dir():
-            candidates += sorted(envs.glob("*/bin/vllm"))
-    for c in candidates:
+    for c in (_uv_tool_dir() / backend / "bin" / backend,
+              home / ".venvs" / backend / "bin" / backend,
+              home / "venvs" / backend / "bin" / backend,
+              home / backend / ".venv" / "bin" / backend):
         if c.is_file() and os.access(c, os.X_OK):
-            return str(c.resolve())
+            return str(c)
     return None
 
 
@@ -190,7 +207,7 @@ def find(backend: str) -> str | None:
         return find_systemone_proxy()
     if backend == GATEWAY:
         return sys.executable    # it is llmctl itself (python -m llm_runner)
-    return find_vllm()
+    return find_engine(backend)
 
 
 def missing_hint(backend: str) -> str:
@@ -207,11 +224,109 @@ def missing_hint(backend: str) -> str:
                 "create its venv (`uv venv --python 3.12 .venv312 && uv pip install "
                 "-p .venv312/bin/python -e \".[serve]\"`) and point llmctl at it with "
                 "`llmctl config decider-dir /path/to/decider` (or $LLM_RUNNER_DECIDER_DIR).")
-    return ("`vllm` CLI not found. Install it in its own env (e.g. "
-            "`conda create -n vllm python=3.12 && conda activate vllm && "
-            "pip install vllm`) — llmctl finds an env named `vllm` "
-            "automatically — or point at it with `llmctl config vllm-bin "
-            "/path/to/env/bin/vllm` (or $LLM_RUNNER_VLLM_BIN).")
+    return (f"`{backend}` CLI not found. Install it in its own venv with "
+            f"`uv tool install --torch-backend auto {backend}` (llmctl finds it "
+            f"there), or point at another one with `llmctl config {backend}-bin "
+            f"/path/to/venv/bin/{backend}` (or ${_BIN_ENV[backend]}).")
+
+
+# --------------------------------------------------------------- toolchain --
+
+# vLLM and SGLang JIT-compile CUDA kernels (FlashInfer, sgl-kernel) on first
+# use. nvcc hands host code to $NVCC_CCBIN, else the first `gcc` on PATH;
+# FlashInfer passes `-ccbin $CC` and links with $CXX. Left to the inherited
+# environment that can be a compiler without C++ (conda base's gcc: "cannot
+# execute 'cc1plus'") or one newer than nvcc accepts, so launches pin all
+# of them to a system GCC that nvcc supports.
+_SYSTEM_BIN_DIRS = (Path("/usr/bin"), Path("/usr/local/bin"))
+_CUDA_ROOTS = (Path("/usr/local/cuda"), Path("/opt/cuda"))
+
+
+def find_nvcc() -> Path | None:
+    """nvcc from ``$CUDA_HOME``/``$CUDA_PATH`` → PATH → /usr/local/cuda,
+    /opt/cuda."""
+    for var in ("CUDA_HOME", "CUDA_PATH"):
+        root = os.environ.get(var)
+        if root and (Path(root) / "bin" / "nvcc").is_file():
+            return Path(root) / "bin" / "nvcc"
+    on_path = shutil.which("nvcc")
+    if on_path:
+        return Path(on_path).resolve()
+    return next((r / "bin" / "nvcc" for r in _CUDA_ROOTS
+                 if (r / "bin" / "nvcc").is_file()), None)
+
+
+def nvcc_max_gcc(cuda_root: Path) -> int | None:
+    """Newest GCC major this CUDA's nvcc accepts, read from the version check
+    in its ``crt/host_config.h`` (``#if __GNUC__ > N`` → error). None when
+    the header is missing or the check isn't there."""
+    for header in [cuda_root / "include" / "crt" / "host_config.h",
+                   *sorted(cuda_root.glob("targets/*/include/crt/host_config.h"))]:
+        try:
+            m = re.search(r"#if\s+__GNUC__\s*>\s*(\d+)", header.read_text(errors="replace"))
+        except OSError:
+            continue
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _gcc_major(compiler: Path) -> int | None:
+    try:
+        out = subprocess.run([str(compiler), "-dumpversion"], capture_output=True,
+                             text=True, timeout=5, check=True).stdout
+        return int(out.strip().split(".")[0])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _has_cc1plus(gxx: Path) -> bool:
+    """Whether this g++ can compile C++ (``-print-prog-name`` echoes the bare
+    name back when cc1plus isn't installed)."""
+    try:
+        out = subprocess.run([str(gxx), "-print-prog-name=cc1plus"], capture_output=True,
+                             text=True, timeout=5, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return os.path.isabs(out) and os.path.isfile(out)
+
+
+def host_compiler(max_major: int | None) -> tuple[str, str] | None:
+    """``(gcc, g++)`` from the system bin dirs: the newest ``g++``/``g++-N``
+    with a matching ``gcc`` that can compile C++ and is no newer than
+    ``max_major``. Only system dirs, so an env's compiler on PATH never wins."""
+    found: list[tuple[int, int, Path, Path]] = []
+    for d in _SYSTEM_BIN_DIRS:
+        for gxx in [d / "g++", *sorted(d.glob("g++-[0-9]*"))]:
+            gcc = d / gxx.name.replace("g++", "gcc", 1)
+            if not (gxx.is_file() and gcc.is_file()):
+                continue
+            major = _gcc_major(gxx)
+            if major is None or (max_major is not None and major > max_major):
+                continue
+            # Prefer the unversioned name at equal versions (it's the default).
+            found.append((major, gxx.name == "g++", gxx, gcc))
+    for _, _, gxx, gcc in sorted(found, reverse=True):
+        if _has_cc1plus(gxx):
+            return str(gcc), str(gxx)
+    return None
+
+
+@functools.cache
+def toolchain_env() -> dict[str, str]:
+    """``CUDA_HOME``, ``CC``, ``CXX`` and ``NVCC_CCBIN`` for vllm/sglang
+    launches; empty without nvcc (no JIT to feed). Compilers are left out
+    when no system GCC fits, and then the inherited ones apply."""
+    nvcc = find_nvcc()
+    if nvcc is None:
+        return {}
+    cuda_root = nvcc.parent.parent
+    env = {"CUDA_HOME": str(cuda_root)}
+    pair = host_compiler(nvcc_max_gcc(cuda_root))
+    if pair:
+        gcc, gxx = pair
+        env |= {"CC": gcc, "CXX": gxx, "NVCC_CCBIN": gxx}
+    return env
 
 
 # ------------------------------------------------------------ model format --
@@ -349,23 +464,29 @@ def gpu_memory_mib(device: int = 0) -> tuple[int, int] | None:
 # version). It checks the fraction against *total* VRAM at startup and aborts
 # if that much isn't free, so we never ask for more than is actually free.
 VLLM_DEFAULT_GPU_MEM = 0.9
-_GPU_MEM_HEADROOM_MIB = 768  # CUDA context, torch.compile workspace, other tenants
+# (headroom MiB, cap) per engine. vLLM's fraction covers everything it
+# allocates, so the headroom is just the CUDA context, torch.compile workspace
+# and other tenants. SGLang's --mem-fraction-static covers only weights + KV
+# pool; activations and CUDA graphs come out of what is left, so it needs
+# more of it. Its cap leaves the same share free on an idle card.
+_GPU_MEM_POLICY = {VLLM: (768, VLLM_DEFAULT_GPU_MEM), SGLANG: (3072, 0.88)}
 
 
-def default_gpu_mem() -> tuple[float, str] | None:
-    """Pick --gpu-memory-utilization from the free VRAM right now.
+def default_gpu_mem(backend: str = VLLM) -> tuple[float, str] | None:
+    """Pick ``backend``'s GPU memory fraction from the free VRAM right now.
 
     Returns ``(fraction, reason)`` or None when nvidia-smi is unavailable (then
-    vLLM's default applies). The fraction is what's free minus headroom, capped
-    at vLLM's default and floored at 0.05, rounded down to 2 decimals so the
-    check doesn't fail on rounding.
+    the engine's own default applies). The fraction is what's free minus the
+    engine's headroom, capped and floored at 0.05, rounded down to 2 decimals
+    so vLLM's free-memory check doesn't fail on rounding.
     """
     mem = gpu_memory_mib()
     if mem is None:
         return None
     free, total = mem
-    usable = max(free - _GPU_MEM_HEADROOM_MIB, 0)
-    frac = min(VLLM_DEFAULT_GPU_MEM, int(usable / total * 100) / 100)
+    headroom, cap = _GPU_MEM_POLICY[backend]
+    usable = max(free - headroom, 0)
+    frac = min(cap, int(usable / total * 100) / 100)
     frac = max(frac, 0.05)
     return frac, f"{free} MiB of {total} MiB free"
 
@@ -435,6 +556,80 @@ def _speculative_config(draft_path: Path | None, spec_type: str,
             cfg["prompt_lookup_max"] = 4
         return cfg
     return None
+
+
+# ------------------------------------------------------------- sglang argv --
+
+# llama.cpp KV-cache quant names → SGLang --kv-cache-dtype. Its 4-bit KV
+# (nvfp4 / fp4_mx_block16) needs Blackwell, so q4_0 is rejected like vLLM's.
+_SGLANG_KV_DTYPE = {"f16": "auto", "q8_0": "fp8_e4m3"}
+# llmctl --spec-type → --speculative-algorithm. With a --draft model, eagle /
+# eagle3 name the drafter's kind and anything else is a plain small model
+# (STANDALONE); without one, mtp is the checkpoint's own MTP head (NEXTN).
+_SGLANG_SPEC_DRAFT = {"eagle": "EAGLE", "eagle3": "EAGLE3"}
+_SGLANG_SPEC_SELF = {"mtp": "NEXTN", "ngram": "NGRAM"}
+
+
+def build_sglang_cmd(sglang_bin: str, model_path: Path, *, name: str, port: int,
+                     ctx_size: int, kv_quant: str = "f16",
+                     gpu_mem: float | None = None,
+                     n_parallel: int | None = None,
+                     embeddings: bool = False,
+                     draft_path: Path | None = None,
+                     spec_type: str = "draft-mtp", spec_n_max: int = 3,
+                     tool_parser: str | None = None,
+                     reasoning_parser: str | None = None,
+                     trust_remote_code: bool = False,
+                     host: str = "0.0.0.0",
+                     extra: list[str] | None = None) -> list[str]:
+    """``sglang serve`` with the same options as :func:`build_vllm_cmd`."""
+    cmd = [
+        sglang_bin, "serve",
+        "--model-path", str(model_path),
+        "--host", host,
+        "--port", str(port),
+        "--served-model-name", name,
+        "--context-length", str(ctx_size),
+        # Prometheus /metrics: the gateway reads the queue depth from it.
+        "--enable-metrics",
+    ]
+    if gpu_mem is not None:
+        cmd += ["--mem-fraction-static", f"{gpu_mem:g}"]
+    if n_parallel is not None:
+        cmd += ["--max-running-requests", str(n_parallel)]
+    dtype = _SGLANG_KV_DTYPE.get(kv_quant, "auto")
+    if dtype != "auto":
+        cmd += ["--kv-cache-dtype", dtype]
+    if embeddings:
+        cmd.append("--is-embedding")
+    else:
+        if tool_parser:
+            cmd += ["--tool-call-parser", tool_parser]
+        if reasoning_parser:
+            cmd += ["--reasoning-parser", reasoning_parser]
+        cmd += _sglang_spec_args(draft_path, spec_type, spec_n_max)
+    if trust_remote_code:
+        cmd.append("--trust-remote-code")
+    if extra:
+        cmd += extra
+    return cmd
+
+
+def _sglang_spec_args(draft_path: Path | None, spec_type: str, n: int) -> list[str]:
+    if draft_path is not None:
+        algo = _SGLANG_SPEC_DRAFT.get(spec_type, "STANDALONE")
+        args = ["--speculative-algorithm", algo,
+                "--speculative-draft-model-path", str(draft_path)]
+    elif spec_type in _SGLANG_SPEC_SELF:
+        algo = _SGLANG_SPEC_SELF[spec_type]
+        args = ["--speculative-algorithm", algo]
+    else:
+        return []
+    if algo == "NGRAM":
+        return args + ["--speculative-num-draft-tokens", str(n)]
+    # A chain of n drafted tokens: n steps, one candidate each, n + 1 verified.
+    return args + ["--speculative-num-steps", str(n), "--speculative-eagle-topk", "1",
+                   "--speculative-num-draft-tokens", str(n + 1)]
 
 
 # ------------------------------------------------------------ decider argv --

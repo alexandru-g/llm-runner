@@ -48,7 +48,7 @@ from llm_runner import __version__
 from llm_runner import auth
 from llm_runner import config as config_mod
 from llm_runner import process as proc
-from llm_runner.backends import DECIDE, DECIDER, GATEWAY, VLLM, is_decision_model
+from llm_runner.backends import DECIDE, DECIDER, GATEWAY, SGLANG, VLLM, is_decision_model
 from llm_runner.cluster import (BUSY_HEADER, HEARTBEAT_EVERY, HOP_HEADER, OPENAI, PROTOCOL,
                                 SPILL_HEADER, SYSTEMONE, TOKEN_HEADER, ClusterView,
                                 Instance, RegistryTable,
@@ -87,6 +87,12 @@ def _flag(cmd: tuple[str, ...], *names: str) -> str | None:
         if a in names:
             return cmd[i + 1]
     return None
+
+
+# Prometheus gauge of requests waiting for a free slot, per engine.
+_QUEUE_METRIC = {VLLM: "vllm:num_requests_waiting", SGLANG: "sglang:num_queue_reqs"}
+# The flag carrying the context size in each engine's recorded command.
+_CTX_FLAGS = {VLLM: ("--max-model-len",), SGLANG: ("--context-length",)}
 
 
 _decision_cache: dict[str, bool] = {}
@@ -157,11 +163,11 @@ class LocalModels:
             if m is None:
                 return False
         try:
-            if m.backend == VLLM:
+            if m.backend in _QUEUE_METRIC:
                 with urllib.request.urlopen(f"http://127.0.0.1:{m.port}/metrics",
                                             timeout=0.5) as r:
                     for line in r.read().decode().splitlines():
-                        if line.startswith("vllm:num_requests_waiting"):
+                        if line.startswith(_QUEUE_METRIC[m.backend]):
                             return float(line.rsplit(" ", 1)[1]) > 0
                 return False
             if m.backend != "llama":
@@ -219,13 +225,14 @@ class LocalModels:
             info["vision"] = False
             info["decision"] = True
         if m.api == OPENAI:
-            ctx = _flag(m.cmd, "--max-model-len") if m.backend == VLLM else \
-                _flag(m.cmd, "--ctx-size", "-c")
+            ctx = _flag(m.cmd, *_CTX_FLAGS.get(m.backend, ("--ctx-size", "-c")))
             info["context"] = int(ctx) if ctx and ctx.isdigit() else None
             info["vision"] = "--mmproj" in m.cmd
-            info["embeddings"] = "--embeddings" in m.cmd or "pooling" in m.cmd
+            info["embeddings"] = any(a in m.cmd for a in ("--embeddings", "pooling",
+                                                          "--is-embedding"))
             info["decision"] = _is_decision(m.model_path)
-            par = _flag(m.cmd, "--parallel", "-np", "--max-num-seqs")
+            par = _flag(m.cmd, "--parallel", "-np", "--max-num-seqs",
+                        "--max-running-requests")
             info["parallel"] = int(par) if par and par.isdigit() else None
         return {"id": m.name, "object": "model", "created": int(m.started_at),
                 "owned_by": "llmctl", "llmctl": info}

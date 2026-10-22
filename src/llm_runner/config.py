@@ -5,8 +5,8 @@ across invocations regardless of cwd. Override the location with
 ``LLM_RUNNER_CONFIG_DIR`` (otherwise ``$XDG_CONFIG_HOME/llm-runner`` or
 ``~/.config/llm-runner``).
 
-Settings: ``models_dir`` (where GGUF / HF checkpoints live), ``vllm_bin``
-(path to the ``vllm`` CLI when it isn't on PATH) and ``decider_dir`` (the
+Settings: ``models_dir`` (where GGUF / HF checkpoints live), ``vllm_bin`` and
+``sglang_bin`` (path to each engine's CLI when llmctl doesn't find it), ``decider_dir`` (the
 Mapika/decider clone whose venv serves decider checkpoints) and
 ``gateway_port`` (the all-models port started with the first model, or
 ``"off"``), ``bind_host`` (the address the gateway and every backend listen
@@ -17,7 +17,7 @@ on, default ``0.0.0.0``), ``offline`` (never reach Hugging Face; also
 ``node_advertise``, ``registry_url``, ``cluster_token`` and
 ``registry_serve`` (see ``cluster.py``). Environment variables still
 take precedence over persisted config (see ``registry._resolve_models_dir``
-and ``backends.find_vllm``).
+and ``backends.find_engine``).
 """
 from __future__ import annotations
 
@@ -73,23 +73,27 @@ def set_models_dir(path: Path) -> Path:
     return resolved
 
 
-def get_vllm_bin() -> Path | None:
-    """Return the persisted path to the ``vllm`` CLI, or None if unset."""
-    val = load().get("vllm_bin")
+def get_engine_bin(backend: str) -> Path | None:
+    """Return the persisted path to ``backend``'s CLI (``vllm`` / ``sglang``),
+    or None if unset."""
+    val = load().get(f"{backend}_bin")
     return Path(val).expanduser() if val else None
 
 
-def set_vllm_bin(path: Path | None) -> Path | None:
-    """Persist ``path`` as the vllm CLI (None clears it)."""
+def set_engine_bin(backend: str, path: Path | None) -> Path | None:
+    """Persist ``path`` as ``backend``'s CLI (None clears it). Not resolved:
+    a uv tool's ``~/.local/bin`` symlink keeps pointing at the tool after
+    ``uv tool upgrade`` rebuilds its venv."""
     cfg = load()
+    key = f"{backend}_bin"
     if path is None:
-        cfg.pop("vllm_bin", None)
+        cfg.pop(key, None)
         save(cfg)
         return None
-    resolved = Path(path).expanduser().resolve()
-    cfg["vllm_bin"] = str(resolved)
+    absolute = Path(path).expanduser().absolute()
+    cfg[key] = str(absolute)
     save(cfg)
-    return resolved
+    return absolute
 
 
 def get_decider_dir() -> Path | None:
