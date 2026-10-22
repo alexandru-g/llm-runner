@@ -111,7 +111,14 @@ def _alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    return True
+    # A zombie still answers kill(0) until its parent reaps it, and `run
+    # --wait` is the parent of the server it waits on, so a crash looked
+    # like a slow start.
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state != "Z"
 
 
 def _load_autostart() -> list[LaunchSpec]:

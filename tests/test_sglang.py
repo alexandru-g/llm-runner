@@ -9,6 +9,10 @@ from click.testing import CliRunner
 from llm_runner import backends, cli, config as config_mod, gateway as gw, process as proc
 
 
+# The real probe; conftest stubs ``backends.toolchain_env`` for every test.
+_toolchain_env = backends.toolchain_env
+
+
 def _arg(cmd, flag):
     return cmd[cmd.index(flag) + 1]
 
@@ -179,11 +183,11 @@ def test_toolchain_env_pins_the_compilers(compilers, tmp_path, monkeypatch):
     (cuda / "include" / "crt").mkdir(parents=True)
     (cuda / "include" / "crt" / "host_config.h").write_text("#if __GNUC__ > 13\n")
     monkeypatch.setenv("CUDA_HOME", str(cuda))
-    backends.toolchain_env.cache_clear()
+    _toolchain_env.cache_clear()
     try:
-        env = backends.toolchain_env()
+        env = _toolchain_env()
     finally:
-        backends.toolchain_env.cache_clear()
+        _toolchain_env.cache_clear()
     gxx = str(compilers / "g++-13")
     assert env == {"CUDA_HOME": str(cuda), "CC": str(compilers / "gcc-13"),
                    "CXX": gxx, "NVCC_CCBIN": gxx}

@@ -170,6 +170,15 @@ uv tool install --python 3.12 --torch-backend auto vllm
 vllm --version
 ```
 
+vLLM only sets a floor on `transformers`, so uv installs the newest one,
+which can be newer than the vLLM release was built against. vLLM 0.29 needs
+`transformers<5.17` for Mistral 3 / Pixtral (5.17 renamed a class it
+imports), so pin it there; `uv tool upgrade` keeps a `--with` pin:
+
+```bash
+uv tool install --python 3.12 --torch-backend auto vllm==0.29.0 --with transformers==5.16.1
+```
+
 SGLang pins two pre-release dependencies, which uv only installs when they
 are named explicitly (check `Requires-Dist` in the release's metadata when
 upgrading; for 0.5.22 they are):

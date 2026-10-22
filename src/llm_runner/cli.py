@@ -229,6 +229,18 @@ def _warn_foreign_flags(ctx: click.Context, backend: str) -> None:
                        f"{', '.join(used)}", err=True)
 
 
+def _log_tail(path: str, lines: int = 25) -> str:
+    """The last ``lines`` lines of a log, indented; empty if unreadable."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(f.tell() - 64 * 1024, 0))
+            tail = f.read().decode("utf-8", "replace").splitlines()[-lines:]
+    except OSError:
+        return ""
+    return "\n".join("  " + line for line in tail)
+
+
 def _wait_healthy(rec: proc.RunningProcess, timeout: float) -> bool:
     """Poll ``/health`` until the server answers 200, the process dies, or
     ``timeout`` elapses. llama-server, vllm and sglang all expose it."""
@@ -238,8 +250,13 @@ def _wait_healthy(rec: proc.RunningProcess, timeout: float) -> bool:
     i = 0
     while time.time() < deadline:
         if not proc._alive(rec.pid):
-            click.echo(f"\rServer exited before becoming healthy — see "
-                       f"`llmctl logs {rec.name}`.", err=True)
+            try:
+                os.waitpid(rec.pid, os.WNOHANG)      # it's our child: reap it
+            except ChildProcessError:
+                pass
+            click.echo(f"\rServer exited before becoming healthy. Last lines of "
+                       f"{rec.log_file}:", err=True)
+            click.echo(_log_tail(rec.log_file), err=True)
             return False
         try:
             with urllib.request.urlopen(url, timeout=2) as resp:

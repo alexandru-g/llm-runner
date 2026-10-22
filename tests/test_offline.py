@@ -70,3 +70,4 @@ def test_offline_refuses_download_and_update(cfg):
         assert out.exit_code != 0 and "Offline mode is on" in out.output
     assert runner.invoke(cli.cli, ["config", "offline", "off"]).exit_code == 0
     assert "offline" not in config_mod.load()
+
