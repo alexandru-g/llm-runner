@@ -275,3 +275,67 @@ def test_model_read_whatever_the_declared_type(env):
     status, out = _call(env["port"], "POST", "/v1/chat/completions", {"model": "llama-70b"},
                         headers={"Content-Type": "application/x-www-form-urlencoded"})
     assert status == 404
+
+
+# ------------------------------------------------- vision on vllm/sglang --
+
+def _ckpt(tmp_path, name, vision):
+    d = tmp_path / name
+    d.mkdir()
+    arch = "Qwen3_5ForConditionalGeneration" if vision else "Qwen3ForCausalLM"
+    cfg = {"architectures": [arch], **({"vision_config": {}} if vision else {})}
+    (d / "config.json").write_text(json.dumps(cfg))
+    return str(d)
+
+
+@pytest.mark.parametrize("cmd, limit", [
+    ((), None),
+    (("--limit-mm-per-prompt", '{"image": 0}'), 0),
+    (('--limit-mm-per-prompt={"image":2,"video":0}',), 2),
+    (("--limit-mm-per-prompt.image", "0"), 0),
+    (("--limit-mm-per-prompt.image=1",), 1),
+    (("--limit-mm-data-per-request", '{"image": 0}'), 0),
+    (("--limit-mm-per-prompt", "not json"), None),
+])
+def test_image_limit(cmd, limit):
+    assert gw._image_limit(("vllm", "serve", "m", *cmd)) == limit
+
+
+@pytest.mark.parametrize("backend, extra, sees", [
+    ("vllm", (), True),
+    ("sglang", (), True),
+    ("vllm", ("--limit-mm-per-prompt", '{"image":1}'), True),
+    ("vllm", ("--language-model-only",), False),
+    ("sglang", ("--language-only",), False),
+    ("vllm", ("--limit-mm-per-prompt", '{"image": 0}'), False),
+])
+def test_vision_on_hf_engines(tmp_path, backend, extra, sees):
+    vlm = _ckpt(tmp_path, f"vlm-{backend}-{len(extra)}-{sees}", vision=True)
+    m = gw.Model("m", os.getpid(), 1, backend, 0, vlm, (backend, "serve", vlm, *extra))
+    assert gw._hf_vision(m) is sees
+    text = _ckpt(tmp_path, f"text-{backend}-{len(extra)}-{sees}", vision=False)
+    assert gw._hf_vision(gw.Model("t", os.getpid(), 1, backend, 0, text, (backend,))) is False
+
+
+def test_images_route_to_a_vllm_vision_model(tmp_path):
+    up = _serve(_Upstream, "vlm")
+    state = tmp_path / "running.json"
+    vlm = _ckpt(tmp_path, "qwen3.5-4b", vision=True)
+    rec = _record("t-vlm", up.server_address[1], backend="vllm",
+                  cmd=("vllm", "serve", vlm, "--max-model-len", "4096",
+                       "--limit-mm-per-prompt", '{"image":1}'))
+    state.write_text(json.dumps([{**rec, "model_path": vlm}]))
+    httpd = gw.make_server(0, "127.0.0.1", gw.Gateway(gw.LocalModels(state)))
+    threading.Thread(target=httpd.serve_forever, args=(0.05,), daemon=True).start()
+    try:
+        port = httpd.server_address[1]
+        image = {"model": "t-vlm", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]}
+        status, out = _call(port, "POST", "/v1/chat/completions", image)
+        assert status == 200 and out["who"] == "vlm", out
+        models = {m["id"]: m for m in _call(port, "GET", "/v1/models")[1]["data"]}
+        assert models["t-vlm"]["llmctl"]["vision"] is True
+    finally:
+        for s in (up, httpd):
+            s.shutdown()

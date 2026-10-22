@@ -48,7 +48,8 @@ from llm_runner import __version__
 from llm_runner import auth
 from llm_runner import config as config_mod
 from llm_runner import process as proc
-from llm_runner.backends import DECIDE, DECIDER, GATEWAY, SGLANG, VLLM, is_decision_model
+from llm_runner.backends import (DECIDE, DECIDER, GATEWAY, SGLANG, VLLM, hf_has_vision,
+                                 is_decision_model)
 from llm_runner.cluster import (BUSY_HEADER, HEARTBEAT_EVERY, HOP_HEADER, OPENAI, PROTOCOL,
                                 SPILL_HEADER, SYSTEMONE, TOKEN_HEADER, ClusterView,
                                 Instance, RegistryTable,
@@ -105,6 +106,47 @@ def _is_decision(path: str) -> bool:
         except OSError:
             _decision_cache[path] = False
     return _decision_cache[path]
+
+
+_vision_cache: dict[str, bool] = {}
+# Flags that keep vllm/sglang from loading a checkpoint's vision encoder, and
+# the per-request multimodal limit that can turn images off (``{"image": 0}``).
+_TEXT_ONLY_FLAGS = ("--language-model-only", "--language-only")
+_MM_LIMIT_FLAGS = ("--limit-mm-per-prompt", "--limit-mm-data-per-request")
+
+
+def _image_limit(cmd: tuple[str, ...]) -> int | None:
+    """The image count a vllm/sglang command allows per request, or None when
+    it sets no limit. Takes ``--flag JSON``, ``--flag=JSON`` and vLLM's
+    ``--limit-mm-per-prompt.image N``."""
+    for i, a in enumerate(cmd):
+        name, eq, val = a.partition("=")
+        if name in _MM_LIMIT_FLAGS:
+            raw = val if eq else (cmd[i + 1] if i + 1 < len(cmd) else "")
+            try:
+                limits = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(limits, dict) and isinstance(limits.get("image"), int):
+                return limits["image"]
+        elif name in (f"{f}.image" for f in _MM_LIMIT_FLAGS):
+            raw = val if eq else (cmd[i + 1] if i + 1 < len(cmd) else "")
+            if raw.isdigit():
+                return int(raw)
+    return None
+
+
+def _hf_vision(m: Model) -> bool:
+    """A vllm/sglang instance reads images when its checkpoint has a vision
+    tower (what ``llmctl list`` shows) and the command doesn't leave it out."""
+    if any(a.partition("=")[0] in _TEXT_ONLY_FLAGS for a in m.cmd) or _image_limit(m.cmd) == 0:
+        return False
+    if m.model_path not in _vision_cache:
+        try:
+            _vision_cache[m.model_path] = hf_has_vision(Path(m.model_path))
+        except OSError:
+            _vision_cache[m.model_path] = False
+    return _vision_cache[m.model_path]
 
 
 def _group_of(rec: dict) -> str:
@@ -227,7 +269,9 @@ class LocalModels:
         if m.api == OPENAI:
             ctx = _flag(m.cmd, *_CTX_FLAGS.get(m.backend, ("--ctx-size", "-c")))
             info["context"] = int(ctx) if ctx and ctx.isdigit() else None
-            info["vision"] = "--mmproj" in m.cmd
+            # llama-server sees through its mmproj; vllm/sglang through the
+            # checkpoint's own vision tower.
+            info["vision"] = _hf_vision(m) if m.backend in (VLLM, SGLANG) else "--mmproj" in m.cmd
             info["embeddings"] = any(a in m.cmd for a in ("--embeddings", "pooling",
                                                           "--is-embedding"))
             info["decision"] = _is_decision(m.model_path)
