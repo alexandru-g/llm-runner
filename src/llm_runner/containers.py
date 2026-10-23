@@ -116,18 +116,23 @@ def inspect_image(ref: str) -> dict | None:
         return None
 
 
-def resolve_digest(ref: str) -> str:
+def resolve_digest(ref: str, state_dir: Path | None = None) -> str:
     """The digest ``ref`` is pinned to, checked against the local image.
 
-    A ref pinned by digest is its own answer once the image is present. A
-    tag (allowed only with ``--allow-tag``) resolves to its repo digest, or
-    to the image id for a local build that was never pushed."""
+    A ref pinned by digest is its own answer once the image is present,
+    under its name or as the ID it was loaded as from an archive
+    (``images.local_image``). A tag (allowed only with ``--allow-tag``)
+    resolves to its repo digest, or to the image id for a local build that
+    was never pushed."""
+    from llm_runner import images
+    pinned = pinned_digest(ref)
+    if pinned and state_dir is not None and images.local_image(ref, state_dir):
+        return pinned
     info = inspect_image(ref)
     if info is None:
         raise ContainerError(
-            f"image {ref} is not on this host. llmctl never pulls: `docker pull {ref}` "
-            "(or `docker load` it from the bundle) first.")
-    pinned = pinned_digest(ref)
+            f"image {ref} is not on this host. llmctl never pulls: `docker pull {ref}`, "
+            "or `llmctl images load FILE` for an archive.")
     if pinned:
         return pinned
     repo = ref.rsplit(":", 1)[0] if ":" in ref.rsplit("/", 1)[-1] else ref
@@ -272,7 +277,7 @@ def docker_argv(*, name: str, cmd: list[str], port: int, backend: str,
     for k, v in env.items():
         argv += ["-e", f"{k}={v}"]
     ep = entrypoint(backend, image)
-    argv += ["--entrypoint", ep[0], image]
+    argv += ["--entrypoint", ep[0], runtime.get("run_image") or image]
     argv += container_cmd(cmd, backend=backend, image=image, model_path=model_path,
                           models_dir=models_dir)
     return argv

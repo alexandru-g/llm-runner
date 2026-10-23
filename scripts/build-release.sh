@@ -26,6 +26,8 @@ say() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
+say "Checking images.json against the registry"
+python3 scripts/pin-images.py --check
 say "Building llm-runner $VERSION"
 uv build --quiet --out-dir "$OUT" .
 uv build --quiet --wheel --out-dir "$OUT" packages/systemone-proxy

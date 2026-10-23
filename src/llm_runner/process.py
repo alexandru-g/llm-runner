@@ -311,7 +311,12 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
         cache_dir = None
     offline = config_mod.is_offline()
     if kind == containers.DOCKER:
+        from llm_runner import images
         runtime["container"] = containers.container_name(name, port)
+        # The ref when it resolves, else the image ID it was loaded as from
+        # an archive (looked up on every start, since a load can come later).
+        found = images.local_image(runtime["image"], STATE_DIR)
+        runtime["run_image"], runtime["image_id"] = found or (runtime["image"], None)
         containers.stop_container(runtime["container"], timeout=0)   # a leftover
         argv = containers.docker_argv(
             name=name, cmd=cmd, port=port, backend=backend, model_path=model_path,
@@ -320,7 +325,10 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
             runtime=runtime, models_dir=MODELS_DIR, cache_dir=cache_dir)
         popen_env = dict(os.environ)
         header.insert(0, f"llmctl: runtime=docker image={runtime['image']} "
-                         f"digest={runtime.get('digest')} container={runtime['container']}")
+                         f"digest={runtime.get('digest')} container={runtime['container']}"
+                         + (f" image_id={runtime['image_id']}" if runtime.get("image_id") else "")
+                         + (" (loaded from an archive, run by ID)"
+                            if runtime["run_image"] != runtime["image"] else ""))
     else:
         argv = cmd
         extra: dict[str, str] = {}

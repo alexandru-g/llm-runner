@@ -1063,7 +1063,7 @@ access. The compatibility promise for these interfaces is in
 
 ```bash
 llmctl images                               # the images this llmctl was tested with
-docker pull vllm/vllm-openai@sha256:c291…   # or `docker load` from a bundle
+docker pull vllm/vllm-openai@sha256:c291…   # or `llmctl images load FILE` offline
 llmctl config runtime vllm docker           # every vllm start from now on
 llmctl config runtime llama docker --image ghcr.io/ggml-org/llama.cpp@sha256:…
 llmctl run qwen3-8b --runtime docker --gpu 1     # or per launch
@@ -1092,9 +1092,49 @@ default. What a container start does:
   and `restore` work as for host processes. `stop` also runs `docker stop`.
 
 The image and its digest are reported in `ps`, in `/v1/models` (the
-`llmctl` object's `runtime`, `image` and `image_digest`, per node too), in the
-first lines of the model's log, and in the gateway's log when it starts
-routing to the model.
+`llmctl` object's `runtime`, `image`, `image_digest` and `image_id`, per node
+too), in the first lines of the model's log, and in the gateway's log when it
+starts routing to the model.
+
+### Images on hosts without a registry
+
+```bash
+# where the registry is reachable (needs skopeo):
+llmctl images save vllm -o vllm.tar          # or repo@sha256:…
+# on the offline host:
+llmctl images load vllm.tar --json
+llmctl images                                # present, loaded as fba1a5021627
+llmctl images --protect                      # tag images prune would delete
+```
+
+`docker save` of `repo@sha256:<index>` loses that name: after `docker load`
+the image has no tag and no digest, so the pinned ref doesn't resolve. Its
+image ID survives, and the registry links the two (index → platform
+manifest → config). llmctl runs the pinned ref by that ID:
+
+- `images.json` lists, per platform, the manifest and config digest of each
+  image llmctl ships. On Docker's classic store (overlay2) a loaded image's
+  ID is its config digest, so a plain `docker load` is enough there.
+- `llmctl images load` checks an archive before loading it: against the
+  index and manifest that `llmctl images save` put in it
+  (`llmctl-image.json`), or, for a plain `docker save` archive, against
+  `images.json`. After the load the ID must be the archive's config digest
+  (classic store) or the digest of the manifest it carries (containerd
+  store, the default on fresh Docker 29 installs). It records the ID, so the
+  pinned ref resolves on either store. Use it on containerd-store hosts.
+- The pinned ref stays the identity: `ps`, `apply` and the compile-cache
+  rule `digest` see the index digest; `image_id` records what ran, and the
+  model log says "run by ID". No tag is ever used to find an image.
+- An image with no tag (pulled by digest, or loaded) is what `docker image
+  prune` deletes. `images load` and `images --protect` tag it
+  `llmctl/<repo>:<digest12>` to prevent that.
+
+`llmctl images load --json` prints `{"ok", "ref", "image_id", "tag",
+"platform", "config", "manifest", "verified_by", "host_platform"}`; `save
+--json` prints `{"ok", "ref", "platform", "config", "manifest", "file",
+"size"}`. Exit codes: 3 not a docker save archive or no chain names the
+image (or, for `save`, not pinned), 4 a digest doesn't match, 6 docker,
+skopeo or the registry unavailable, or (`save`) the image isn't on this host.
 
 ### Install a model bundle
 

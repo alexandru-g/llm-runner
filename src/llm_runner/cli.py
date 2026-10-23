@@ -25,6 +25,7 @@ from llm_runner import __version__
 from llm_runner import backends
 from llm_runner import bundle
 from llm_runner import containers
+from llm_runner import images
 from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner import registry
@@ -216,7 +217,7 @@ def _resolve_runtime(backend: str, kind: str | None, image: str | None,
         raise click.UsageError(f"{ref} is not pinned by digest. Use repo@sha256:…, or "
                                "--allow-tag for development.")
     try:
-        digest = containers.resolve_digest(ref)
+        digest = containers.resolve_digest(ref, proc.STATE_DIR)
     except containers.ContainerError as e:
         raise click.UsageError(str(e)) from None
     runtime.update(image=ref, digest=digest)
@@ -439,19 +440,119 @@ def config_runtime(backend: str | None, kind: str | None, image: str | None,
     click.echo(f"{backend}: {kind}" + (f"  {entry['image']}" if "image" in entry else ""))
 
 
-@cli.command("images")
+@cli.group("images", invoke_without_command=True)
 @click.option("--json", "as_json", is_flag=True, help="Print images.json as shipped.")
-def images_cmd(as_json: bool) -> None:
-    """The container images this llmctl version was tested with."""
+@click.option("--protect", is_flag=True,
+              help="Tag present images that have no tag, so `docker image prune` "
+                   "doesn't delete them.")
+@click.pass_context
+def images_cmd(ctx: click.Context, as_json: bool, protect: bool) -> None:
+    """The container images this llmctl version was tested with, and images
+    loaded from archives.
+
+    An image pulled by digest or loaded from an archive has no tag, and
+    `docker image prune` deletes such images; --protect tags them
+    llmctl/<repo>:<digest>. llmctl never runs an image by that tag."""
+    if ctx.invoked_subcommand is not None:
+        return
     imgs = containers.expected_images()
     if as_json:
         click.echo(json.dumps({"schema": "llmctl-images/1", "llmctl": __version__,
                                "images": imgs}, indent=2))
         return
-    for backend, e in imgs.items():
-        present = containers.inspect_image(e["image"]) is not None
-        click.echo(f"{backend:<6} {e['image']}\n       {e.get('tag', '')}  "
-                   f"{'present' if present else 'not on this host'}")
+    refs = {e["image"]: (backend, e.get("tag", "")) for backend, e in imgs.items()}
+    for ref in images.loaded(proc.STATE_DIR):
+        refs.setdefault(ref, ("loaded", ""))
+    unprotected = 0
+    for ref, (label, tag) in refs.items():
+        found = images.local_image(ref, proc.STATE_DIR)
+        if found is None:
+            state = "not on this host"
+        else:
+            state = "present" + (f", loaded as {found[1][7:19]}" if found[0] != ref else "")
+            if images.dangling(ref, proc.STATE_DIR):
+                if protect:
+                    state += f", now tagged {images.protect(ref, found[1])}"
+                else:
+                    state += ", no tag (prune would delete it)"
+                    unprotected += 1
+        click.echo(f"{label:<6} {ref}\n       {tag + '  ' if tag else ''}{state}")
+    if unprotected:
+        click.echo(f"\n{unprotected} image(s) have no tag; `llmctl images --protect` "
+                   "keeps `docker image prune` from deleting them.", err=True)
+
+
+@images_cmd.command("load")
+@click.argument("archive", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Print one JSON result on stdout; messages go to stderr.")
+def images_load(archive: Path, as_json: bool) -> None:
+    """Load a `docker save` archive so llmctl can run it offline.
+
+    Before loading, the archive's image is checked against the registry
+    chain: the one `llmctl images save` put in the archive, or for a plain
+    `docker save` archive, the config digests in images.json. After `docker
+    load`, the image's ID must be the archive's config digest (classic
+    store) or its manifest digest (containerd store). llmctl records the ID,
+    runs the pinned ref by it, and tags the image so prune leaves it.
+
+    \b
+    Exit codes: 0 loaded, 3 not a docker save archive or no chain names its
+    image, 4 a digest doesn't match, 6 docker unavailable, 1 anything else.
+    """
+    if not as_json:
+        click.echo(f"Checking {archive} ...", err=True)
+    try:
+        result = images.load(archive, proc.STATE_DIR)
+    except bundle.BundleError as e:
+        _bundle_fail(e, as_json)
+        return
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    click.echo(f"Loaded {result['ref']}\n  {result['platform']}, image {result['image_id']} "
+               f"(checked through {result['verified_by']}), tagged {result['tag']}")
+    if result["platform"] != result["host_platform"]:
+        click.echo(f"warning: this host is {result['host_platform']}; the image won't run here.",
+                   err=True)
+
+
+@images_cmd.command("save")
+@click.argument("image")
+@click.option("-o", "--output", type=click.Path(dir_okay=False, path_type=Path), required=True,
+              help="Archive to write.")
+@click.option("--platform", "plat", default=None,
+              help="Platform of the local image (default: this host's, e.g. linux/amd64).")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Print one JSON result on stdout; messages go to stderr.")
+def images_save(image: str, output: Path, plat: str | None, as_json: bool) -> None:
+    """Write IMAGE (repo@sha256:… or a backend name) to an archive that
+    `llmctl images load` checks offline.
+
+    It's a `docker save` archive with one more file, llmctl-image.json,
+    holding the registry's index and manifest for the image (read with
+    skopeo, which must be installed). Plain `docker load` still reads it.
+
+    \b
+    Exit codes: 0 written, 3 not pinned by digest, 4 the local image isn't
+    the registry's, 6 not on this host / skopeo missing / registry
+    unreachable, 1 anything else.
+    """
+    ref = containers.default_image(image) if image in containers.CONTAINER_BACKENDS else image
+    if not ref:
+        raise click.BadArgumentUsage(f"No shipped image for {image}.")
+    if not as_json:
+        click.echo(f"Saving {ref} ...", err=True)
+    try:
+        result = images.save(ref, output, proc.STATE_DIR, plat)
+    except bundle.BundleError as e:
+        _bundle_fail(e, as_json)
+        return
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    click.echo(f"Wrote {result['file']} ({_fmt_size(result['size']).strip()}): {ref}, "
+               f"{result['platform']}, config {result['config']}")
 
 
 def _engine_bin_command(engine: str) -> None:

@@ -23,13 +23,13 @@ against it.
   | 0 | success (or nothing to do) | all |
   | 1 | other failure (for `apply`: a start failed) | all |
   | 2 | usage error | all |
-  | 3 | bad manifest / invalid serving files | `install`, `verify`, `cache export`, `apply` |
-  | 4 | checksum or size mismatch, or a listed file missing | `install`, `verify` |
+  | 3 | bad manifest / invalid serving files / bad image archive | `install`, `verify`, `cache export`, `apply`, `images load`, `images save` |
+  | 4 | checksum or size mismatch, a listed file missing, an image digest mismatch | `install`, `verify`, `images load`, `images save` |
   | 5 | name conflict | `install` |
-  | 6 | source unreachable (`oras` missing, pull failed) | `install` |
+  | 6 | source unreachable (`oras`/`skopeo`/docker missing, pull failed, image not on the host) | `install`, `images load`, `images save` |
 
-- `--json` output of `install`, `verify`, `cache export`, `apply` and
-  `images`: the keys documented in the README keep their names, types and
+- `--json` output of `install`, `verify`, `cache export`, `apply`,
+  `images`, `images load` and `images save`: the keys documented in the README keep their names, types and
   meaning. New keys may appear; parse leniently.
 
 ### File formats
@@ -40,7 +40,11 @@ against it.
 - **Serving files** for `llmctl apply`, `version: 1` (README, "Serving
   files"). New keys may be added; existing keys keep their meaning.
 - **`images.json`**, schema `llmctl-images/1`: per backend, `image` (pinned
-  by digest), `tag`, `engine_version`, `entrypoint`, `platforms`, `license`.
+  by digest), `tag`, `engine_version`, `entrypoint`, `platforms`, `license`,
+  and (since 1.1) `by_platform` (per platform, `manifest` and `config`
+  digests).
+- **Image archive sidecar** `llmctl-image.json`, schema `llmctl-image/1`:
+  `ref`, `platform`, and the registry's `index` and `manifest`, base64.
   The images themselves change between releases; that's what the file is
   for.
 - **Provenance sidecar** `.llmctl-source.json` of an installed model: the
@@ -59,7 +63,7 @@ against it.
   `image`, `image_digest`, `context`, `vision`, `embeddings`, `decision`,
   `parallel`, `node`, `local`, and `nodes` (each with `node`, `priority`,
   `local`, `status`, `port`, `context`, `vision`, `runtime`, `image`,
-  `image_digest`).
+  `image_digest`), and since 1.1 `image_id` (in both).
 - API keys: `Authorization: Bearer <key>` as configured with `llmctl
   gateway auth`.
 
@@ -75,7 +79,7 @@ that bumps the protocol version and is a major release.
   `--json` where it exists.
 - Log formats, of llmctl and of the engines.
 - State files under the state directory (`running.json`, `autostart.json`,
-  `profiles.json`, `cache/`) and `config.json`. Use the commands that manage
+  `profiles.json`, `images.json`, `cache/`) and `config.json`. Use the commands that manage
   them.
 - The exact engine arguments llmctl generates, and the images and engine
   versions it was tested with (`images.json`, the README's install pins).

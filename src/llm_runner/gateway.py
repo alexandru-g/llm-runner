@@ -77,8 +77,9 @@ class Model:
     model_path: str
     cmd: tuple[str, ...]
     group: str = ""
-    # (kind, image, digest); kind "host" for every record without a runtime.
-    runtime: tuple[str, str | None, str | None] = ("host", None, None)
+    # (kind, image, digest, image_id); kind "host" for every record without
+    # a runtime. image_id is what docker ran (an archive-loaded image runs by ID).
+    runtime: tuple[str, str | None, str | None, str | None] = ("host", None, None, None)
 
     @property
     def api(self) -> str:
@@ -151,9 +152,9 @@ def _hf_vision(m: Model) -> bool:
     return _vision_cache[m.model_path]
 
 
-def _runtime_of(rec: dict) -> tuple[str, str | None, str | None]:
+def _runtime_of(rec: dict) -> tuple[str, str | None, str | None, str | None]:
     rt = rec.get("runtime") or {}
-    return (rt.get("kind") or "host", rt.get("image"), rt.get("digest"))
+    return (rt.get("kind") or "host", rt.get("image"), rt.get("digest"), rt.get("image_id"))
 
 
 def _group_of(rec: dict) -> str:
@@ -206,8 +207,9 @@ class LocalModels:
         now = {(m.name, m.pid) for m in records}
         for m in records:
             if (m.name, m.pid) not in self._seen:
-                kind, image, digest = m.runtime
-                where = f"docker image={image} digest={digest}" if kind == "docker" else kind
+                kind, image, digest, image_id = m.runtime
+                where = (f"docker image={image} digest={digest} image_id={image_id}"
+                         if kind == "docker" else kind)
                 print(f"model {m.name}: backend={m.backend} port={m.port} runtime={where}",
                       flush=True)
         self._seen = now
@@ -279,7 +281,7 @@ class LocalModels:
                       "path_prefix": f"/m/{m.name}", "status": self.status(m),
                       "group": m.group or None, "model_path": m.model_path,
                       "runtime": m.runtime[0], "image": m.runtime[1],
-                      "image_digest": m.runtime[2]}
+                      "image_digest": m.runtime[2], "image_id": m.runtime[3]}
         if m.backend == DECIDE:
             # It reads images when the llama-server behind it has an mmproj.
             upstream = urlsplit(_flag(m.cmd, "--backend") or "").port
@@ -395,7 +397,8 @@ class Gateway:
                                       "vision": c.info.get("vision"),
                                       "runtime": c.info.get("runtime") or "host",
                                       "image": c.info.get("image"),
-                                      "image_digest": c.info.get("image_digest")}
+                                      "image_digest": c.info.get("image_digest"),
+                                      "image_id": c.info.get("image_id")}
                                      for c in cands]}}
 
     def model_list(self, local_only: bool = False) -> list[dict]:

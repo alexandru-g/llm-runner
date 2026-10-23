@@ -6,17 +6,47 @@
       "image": "vllm/vllm-openai@sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1",
       "tag": "v0.29.0",
       "engine_version": "0.29.0",
-      "entrypoint": ["vllm"],
-      "platforms": ["linux/amd64", "linux/arm64"],
-      "license": "Apache-2.0"
+      "entrypoint": [
+        "vllm"
+      ],
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ],
+      "license": "Apache-2.0",
+      "by_platform": {
+        "linux/amd64": {
+          "manifest": "sha256:082ca6f035279109041ffd3fe0695cb568b29bc580b35c4f297a66a08b216c1b",
+          "config": "sha256:fba1a50216277efefca479e90766799f9c12ec3ab5cd136f01d85dc0ade46750"
+        },
+        "linux/arm64": {
+          "manifest": "sha256:18372a7224938643461b846fb64c5c9d3d6e9727e82caf2dc3043e620c9d4d7a",
+          "config": "sha256:785fd756b4ae1cacda7612cb859dbf227330e8ced9a6fdea42e9379128bebce0"
+        }
+      }
     },
     "llama": {
       "image": "ghcr.io/ggml-org/llama.cpp@sha256:490d8cd8000203a3ab8fdfce14ef931e2aa85affd4dd4447bcc75f299f00fd9a",
       "tag": "server-cuda-b11804",
       "engine_version": "b11804",
-      "entrypoint": ["/app/llama-server"],
-      "platforms": ["linux/amd64", "linux/arm64"],
-      "license": "MIT"
+      "entrypoint": [
+        "/app/llama-server"
+      ],
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ],
+      "license": "MIT",
+      "by_platform": {
+        "linux/amd64": {
+          "manifest": "sha256:e28ed2eea6752a16e22fabb1d449c7557e0ab2494e5d80552e1b6961f1671086",
+          "config": "sha256:9806c8d385d34d4806d19be5edd046aeeb5e1a923cb55a07ea043fc19c97592a"
+        },
+        "linux/arm64": {
+          "manifest": "sha256:97f242d1dc8d82a219d91b5e2b84e42e4fcd500ee7aa07a0d2b6fc08f9aafb01",
+          "config": "sha256:a41d3809acd522d8e2b4b780126696b3ae0e800ac086da34bd9e867b0631b91c"
+        }
+      }
     }
   }
 }

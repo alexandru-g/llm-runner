@@ -204,6 +204,7 @@ def test_start_runs_docker_and_records_the_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(proc, "_save", lambda procs: saved.update(procs=procs))
     monkeypatch.setattr(proc, "autostart_add", lambda **kw: saved.update(auto=kw))
     monkeypatch.setattr(proc.subprocess, "Popen", Popen)
+    monkeypatch.setattr(containers, "inspect_image", lambda ref: {"Id": "sha256:" + "e" * 64})
     stopped = []
     monkeypatch.setattr(containers, "stop_container", lambda n, timeout=20: stopped.append(n))
     models = tmp_path / "models"
@@ -220,6 +221,7 @@ def test_start_runs_docker_and_records_the_runtime(tmp_path, monkeypatch):
     assert rec.runtime["cache_dir"].startswith(str(tmp_path / "cache" / "qwen"))
     log = Path(rec.log_file).read_text()
     assert f"runtime=docker image={IMAGE} digest={DIGEST}" in log
+    assert rec.runtime["image_id"] == "sha256:" + "e" * 64 and "run by ID" not in log
     assert "cache: cold start" in log
     assert proc.chosen_runtime(rec.runtime) == {"kind": "docker", "image": IMAGE,
                                                 "digest": DIGEST, "gpus": "all"}
@@ -246,7 +248,7 @@ def test_describe_and_ps_report_the_image(tmp_path):
                                               "digest": DIGEST}}]))
     local = gw.LocalModels(state)
     [m] = local.models()                       # pid 1 is always alive
-    assert m.runtime == ("docker", IMAGE, DIGEST)
+    assert m.runtime == ("docker", IMAGE, DIGEST, None)
     info = local.describe(m)["llmctl"]
     assert info["runtime"] == "docker" and info["image"] == IMAGE and info["image_digest"] == DIGEST
     assert cli._runtime_label({"kind": "docker", "image": IMAGE, "digest": DIGEST}) == \

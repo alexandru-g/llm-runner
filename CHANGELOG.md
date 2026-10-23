@@ -5,6 +5,33 @@ All notable changes to llm-runner (`llmctl`). The format follows
 [semantic versioning](https://semver.org); what the version protects is in
 [docs/compatibility.md](docs/compatibility.md).
 
+## [1.1.0] - 2026-10-23
+
+Images delivered as files run offline, on either Docker image store.
+
+### Added
+
+- **Images loaded from archives run.** After `docker load`, an image saved
+  by digest has no name, so `repo@sha256:<index>` didn't resolve and the
+  start failed. llmctl now runs the pinned ref by the image ID the registry
+  links it to (index → platform manifest → config). The identity stays the
+  index digest, so `ps`, `apply` and compile caches (`cache rule: digest`)
+  are unchanged. There is no tag fallback.
+- `images.json` lists each shipped image's manifest and config digest per
+  platform (`by_platform`), checked against the registry with
+  `scripts/pin-images.py`.
+- `llmctl images load FILE` checks an archive against that chain, loads it,
+  confirms the ID (the config digest on the classic store, the archive's
+  manifest digest on the containerd store) and records it.
+- `llmctl images save REF|BACKEND -o FILE` writes a `docker save` archive
+  that carries the registry's index and manifest (`llmctl-image.json`), so
+  images llmctl doesn't ship can be checked offline too. Needs skopeo.
+- `llmctl images --protect`: tags images that have no tag
+  (`llmctl/<repo>:<digest12>`), since `docker image prune` deletes those;
+  `images` warns about them and `images load` tags what it loads.
+- `image_id` in `/v1/models` (and per node), the model log and the gateway
+  log: what docker ran.
+
 ## [1.0.0] - 2026-10-22
 
 The first stable release: llmctl can now run a production host from pinned
@@ -64,4 +91,5 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.1.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.1.0
 [1.0.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.0.0
