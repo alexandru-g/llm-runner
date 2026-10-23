@@ -5,6 +5,18 @@ All notable changes to llm-runner (`llmctl`). The format follows
 [semantic versioning](https://semver.org); what the version protects is in
 [docs/compatibility.md](docs/compatibility.md).
 
+## [1.1.1] - 2026-10-23
+
+### Fixed
+
+- The embedding-mode guess matched name hints as substrings, so a chat model
+  whose folder name merely contained "gte", "e5", "bge" or "minilm" (e.g.
+  `qwen3.5-4b-imgtest`) started as an embedding model: vLLM `--runner
+  pooling`, which also changed its compile-cache key, so a shipped cache
+  missed. Hints now match whole name tokens ("embed" as a prefix), and an HF
+  folder whose `config.json` declares a text-generating architecture is
+  never guessed as an embedding model.
+
 ## [1.1.0] - 2026-10-23
 
 Images delivered as files run offline, on either Docker image store.
@@ -91,5 +103,6 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.1.1]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.1.1
 [1.1.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.1.0
 [1.0.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.0.0
