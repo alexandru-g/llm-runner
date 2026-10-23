@@ -73,6 +73,8 @@ OPTIONS: dict[str, tuple[str, str]] = {
     "kv_unified": ("--kv-unified/--no-kv-unified", "bool"),
     "ctx_checkpoints": ("--ctx-checkpoints", "int"),
     "cache_ram": ("--cache-ram", "int"),
+    "restart": ("--restart", "str"),
+    "restart_max": ("--restart-max", "int"),
 }
 SPECIAL = ("model", "port", "args", "env")
 KEYS = (*SPECIAL, *OPTIONS)

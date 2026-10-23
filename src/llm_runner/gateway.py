@@ -49,6 +49,7 @@ from llm_runner import auth
 from llm_runner import config as config_mod
 from llm_runner import metrics as metrics_mod
 from llm_runner import process as proc
+from llm_runner import supervisor as sup_mod
 from llm_runner.backends import (DECIDE, DECIDER, GATEWAY, SGLANG, VLLM, hf_has_vision,
                                  is_decision_model)
 from llm_runner.cluster import (BUSY_HEADER, HEARTBEAT_EVERY, HOP_HEADER, OPENAI, PROTOCOL,
@@ -422,10 +423,10 @@ class GatewayMetrics:
             yield {"node": node}, 1 if node in up else 0
 
     def _states(self):
-        for m in self.gw.local.models():
-            state = _STATE_OF.get(self.gw.local.status(m), "down")
-            yield {"model": m.name, "node": self.gw.node, "backend": m.backend,
-                   "state": state}, 1
+        for d in self.gw.local_described():
+            info = d["llmctl"]
+            yield {"model": d["id"], "node": self.gw.node, "backend": info["backend"],
+                   "state": _STATE_OF.get(info["status"], info["status"])}, 1
 
     def render(self) -> str:
         return self.registry.render()
@@ -456,6 +457,9 @@ class Gateway:
             else None
         self._last_log: tuple | None = None
         self.metrics = GatewayMetrics(self)
+        # Restarts crashed models; its loop runs in serve().
+        self.supervisor = sup_mod.Supervisor(
+            on_restart=lambda name: self.metrics.restarts.inc(model=name, node=self.node))
 
     @property
     def token(self) -> str | None:
@@ -463,8 +467,27 @@ class Gateway:
 
     # -------------------------------------------------------------- models --
     def local_described(self) -> list[dict]:
+        """The live local models, plus supervised ones that are down
+        (``restarting`` or ``crashed``): routable, so a call gets a 503."""
         models = self.local.models()
-        return [self.local.describe(m, models) for m in models]
+        out = [self.local.describe(m, models) for m in models]
+        live = {m.name for m in models}
+        for d in out:
+            t = self.supervisor.state(d["id"])
+            d["llmctl"]["restarts"] = t.total_restarts if t else 0
+        down = {t.name: t for t in self.supervisor.down() if t.name not in live}
+        if down:
+            for spec in proc.autostart_list():
+                t = down.get(spec.name)
+                if t is None:
+                    continue
+                m = Model(spec.name, 0, spec.port, spec.backend, 0.0, spec.model_path,
+                          tuple(spec.cmd), _group_of(vars(spec)),
+                          _runtime_of({"runtime": spec.runtime}))
+                d = self.local.describe(m, models)
+                d["llmctl"].update(status=t.state, restarts=t.total_restarts)
+                out.append(d)
+        return out
 
     def own_registry(self) -> bool:
         """This gateway is the registry and reports to itself (no hop needed)."""
@@ -680,23 +703,43 @@ def make_handler(gw: Gateway):
             print(f"{self.address_string()} {fmt % args}", flush=True)
 
         # ---------------------------------------------------------- replies --
-        def _json(self, status: int, payload: dict) -> None:
+        def _json(self, status: int, payload: dict, headers: dict | None = None) -> None:
             body = json.dumps(payload).encode()
             self._replied = True
             self._obs["status"] = status
             self.send_response(status)
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
 
-        def _error(self, status: int, code: str, message: str) -> None:
+        def _error(self, status: int, code: str, message: str,
+                   headers: dict | None = None) -> None:
             self._obs["code"] = code
             kind = "invalid_request_error" if status < 500 else "server_error"
             self._json(status, {"error": {"message": message, "type": kind,
                                           "param": "model" if "model" in code else None,
-                                          "code": code}})
+                                          "code": code}}, headers)
+
+        def _unavailable(self, name: str, why: str) -> None:
+            """503 for a model that is configured here but not answering."""
+            wait = gw.supervisor.retry_after(name)
+            self._error(503, "model_unavailable", f"{name} is unavailable: {why}",
+                        {"Retry-After": str(wait)} if wait is not None else None)
+
+        def _configured_down(self, name: str | None) -> str | None:
+            """Why ``name`` (a model or group in this machine's autostart
+            manifest) isn't running, or None if it isn't configured here."""
+            if not name:
+                return None
+            for spec in proc.autostart_list():
+                if spec.backend != GATEWAY and name in (spec.name, spec.group):
+                    t = gw.supervisor.state(spec.name)
+                    return f"it is {t.state}" if t else "it is not running"
+            return None
 
         def _body(self) -> bytes | None:
             if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
@@ -853,6 +896,8 @@ def make_handler(gw: Gateway):
                 insts = gw.instances(local_only=hop)
                 cands = order([i for i in insts if name in (i.id, i.group)
                                and (node is None or i.node == node)])
+                if not cands and node is None and (why := self._configured_down(name)):
+                    return self._unavailable(name, why)
                 if not cands:
                     where = f" on node \"{node}\"" if node else ""
                     return self._error(404, "model_not_found",
@@ -897,6 +942,10 @@ def make_handler(gw: Gateway):
                 cands = pick(gw.instances(local_only=hop), requested, api,
                              needs_vision=has_images(payload))
             except Unroutable as e:
+                name, pin = split_pin(requested) if isinstance(requested, str) else (None, None)
+                if e.code == "model_not_found" and pin is None and \
+                        (why := self._configured_down(name)):
+                    return self._unavailable(name, why)
                 return self._error(e.status, e.code, e.message)
             if hop and self.headers.get(SPILL_HEADER) == "1":
                 cands = [c for c in cands if not gw.local.busy(c.id)]
@@ -1057,8 +1106,11 @@ def make_handler(gw: Gateway):
                         gw.metrics.failovers.inc(model=c.id, from_node=c.node,
                                                  reason="unreachable")
                         return "failed"
-                    self._error(502, "upstream_unavailable",
-                                f"{c.id} ({where}) is not answering: {e}")
+                    if c.local:
+                        self._unavailable(c.id, f"its server ({where}) is not answering")
+                    else:
+                        self._error(502, "upstream_unavailable",
+                                    f"{c.id} ({where}) is not answering: {e}")
                     return "done"
                 if spill and resp.status == 503 and resp.getheader(BUSY_HEADER):
                     resp.read()
@@ -1141,6 +1193,18 @@ def make_handler(gw: Gateway):
                 print(f"relay: {who}: {self.command} {self.path} for "
                       f"{self.address_string()} after {sent} bytes ({e!r})", flush=True)
                 self._obs["code"] = "client_left" if side == "client" else "stream_aborted"
+                if side == "upstream" and stream and chunked:
+                    # Say so instead of cutting the stream: one last SSE
+                    # event with an OpenAI-style error, then a clean end.
+                    event = b"data: " + json.dumps({"error": {
+                        "message": "The model stopped answering mid-stream.",
+                        "type": "server_error", "param": None,
+                        "code": "model_unavailable"}}).encode() + b"\n\n"
+                    try:
+                        self.wfile.write(b"%x\r\n%s\r\n0\r\n\r\n" % (len(event), event))
+                        self._obs["code"] = "model_unavailable"
+                    except OSError:
+                        pass
                 self.close_connection = True
             finally:
                 self._obs["usage"], code = _usage_and_code(bytes(keep), stream)
@@ -1181,6 +1245,7 @@ def serve(port: int = DEFAULT_PORT, host: str = "0.0.0.0") -> None:
         role = "registry" if gw.table else "node"
         print(f"cluster: {role}, reporting to {gw.cluster.registry_url or 'itself'}", flush=True)
         threading.Thread(target=gw.run_heartbeats, args=(stop,), daemon=True).start()
+    threading.Thread(target=gw.supervisor.run, args=(stop,), daemon=True).start()
 
     def _term(*_):
         raise KeyboardInterrupt

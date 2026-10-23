@@ -884,6 +884,13 @@ def profile_rm(name: str) -> None:
               help="GPUs the server may use (default all). Containers get them "
                    "through CDI or --gpus; host processes through "
                    "CUDA_VISIBLE_DEVICES.")
+@click.option("--restart", "restart", type=click.Choice(["on-failure", "never"]),
+              default=None,
+              help="If the server crashes after it was ready: the gateway restarts it "
+                   "(on-failure, the default; backoff 2 s…60 s) or leaves it down.")
+@click.option("--restart-max", "restart_max", type=click.IntRange(1, 100), default=None,
+              help="Give up (state: crashed) after this many restarts in 10 minutes "
+                   "(default 5).")
 @click.option("--kv-cache-mem", "kv_cache_mem", default=None, metavar="SIZE",
               help="vllm only: fixed KV cache size per GPU (--kv-cache-memory-bytes), "
                    "e.g. 6G, instead of sizing it from free memory. Hybrid models "
@@ -982,6 +989,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         ctx_size: int | None, ft_path: Path | None, ft_name: str | None,
         group_name: str | None, wait: bool, menu: bool | None, profile: str | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
         runtime_kind: str | None, image: str | None, allow_tag: bool, gpu: str | None,
+        restart: str | None, restart_max: int | None,
         kv_cache_mem: str | None,
         reasoning: bool,
         kv_quant: str, gpu_mem: float | None, tool_parser: str | None,
@@ -1191,7 +1199,8 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         group = ""
     rec = proc.start(name=name, cmd=cmd, port=chosen_port,
                      model_path=str(model_path), run_args=run_args,
-                     backend=backend, env=env, group=group, runtime=runtime)
+                     backend=backend, env=env, group=group, runtime=runtime,
+                     restart=restart, restart_max=restart_max)
     click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  backend={backend}"
                + (f"  group={group}" if group else ""))
     rt = rec.runtime or {}
@@ -1230,23 +1239,105 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
 @cli.command("ps")
 @click.option("--all", "-a", "show_all", is_flag=True,
               help="Every model in the cluster, with the node calls go to (needs the gateway).")
-def ps_cmd(show_all: bool) -> None:
-    """List running models."""
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON.")
+def ps_cmd(show_all: bool, as_json: bool) -> None:
+    """List running models, and crashed ones the gateway is restarting.
+
+    STATE comes from the gateway's supervisor: starting, ready, restarting
+    (down, a restart is due) or crashed (down, given up). RESTARTS counts its
+    restarts since the gateway started. `llmctl events -f` follows them."""
     if show_all:
         return _ps_cluster()
+    from llm_runner import supervisor
     procs = proc.list_running()
-    if not procs:
+    states = supervisor.read_states()
+    live = {p.name for p in procs}
+    rows = [{"name": p.name, "pid": p.pid, "port": p.port, "backend": p.backend,
+             "started_at": p.started_at, "group": p.group or None,
+             "model_path": p.model_path, "runtime": p.runtime,
+             **_ps_state(states.get(p.name), alive=True)} for p in procs]
+    specs = {s.name: s for s in proc.autostart_list()}
+    for name, st in states.items():
+        if name not in live and st.get("state") in supervisor.DOWN_STATES and name in specs:
+            sp = specs[name]
+            rows.append({"name": name, "pid": None, "port": sp.port, "backend": sp.backend,
+                         "started_at": None, "group": sp.group or None,
+                         "model_path": sp.model_path, "runtime": sp.runtime,
+                         **_ps_state(st, alive=False)})
+    if as_json:
+        click.echo(json.dumps({"models": rows}, indent=2))
+        return
+    if not rows:
         click.echo("(no models running)")
         return
-    click.echo(f"{'PID':<8} {'PORT':<6} {'BACKEND':<8} {'STARTED':<20} {'NAME':<28} RUNTIME")
-    click.echo("-" * 100)
-    for p in procs:
-        started = dt.datetime.fromtimestamp(p.started_at).strftime("%Y-%m-%d %H:%M:%S")
-        click.echo(f"{p.pid:<8} {p.port:<6} {p.backend:<8} {started:<20} {p.name:<28} "
-                   f"{_runtime_label(p.runtime)}")
+    click.echo(f"{'PID':<8} {'PORT':<6} {'BACKEND':<8} {'STARTED':<20} {'NAME':<28} "
+               f"{'STATE':<11} {'RESTARTS':<8} RUNTIME")
+    click.echo("-" * 120)
+    for r in rows:
+        started = (dt.datetime.fromtimestamp(r["started_at"]).strftime("%Y-%m-%d %H:%M:%S")
+                   if r["started_at"] else "-")
+        state = r["state"] or "-"
+        if r["next_restart_in"] is not None:
+            state += f" ({r['next_restart_in']:.0f}s)"
+        click.echo(f"{r['pid'] or '-':<8} {r['port']:<6} {r['backend']:<8} {started:<20} "
+                   f"{r['name']:<28} {state:<11} {r['restarts']:<8} "
+                   f"{_runtime_label(r['runtime'])}")
     gw = _gateway_record()
     if gw:
         click.echo(f"\nAll models: {_gateway_url(gw.port)}  (GET /v1/models lists them)")
+
+
+def _ps_state(st: dict | None, alive: bool) -> dict:
+    """``ps`` columns from the supervisor's record (None: not supervised yet,
+    e.g. the gateway is off or the model is new)."""
+    st = st or {}
+    state = st.get("state")
+    if alive and state in ("restarting", "crashed"):
+        state = "starting"          # restarted since the gateway last wrote
+    return {"state": state, "restarts": st.get("restarts", 0),
+            "next_restart_in": st.get("next_restart_in") if not alive else None,
+            "last_error": st.get("last_error")}
+
+
+@cli.command("events")
+@click.option("-f", "--follow", is_flag=True, help="Keep printing new events.")
+@click.option("-n", "lines", type=int, default=20, show_default=True,
+              help="How many past events to show.")
+@click.option("--json", "as_json", is_flag=True, help="The JSON lines as written.")
+def events_cmd(follow: bool, lines: int, as_json: bool) -> None:
+    """What the gateway's supervisor did: deaths, restarts, give-ups."""
+    path = proc.STATE_DIR / "events.jsonl"
+
+    def show(line: str) -> None:
+        if as_json:
+            click.echo(line.rstrip())
+            return
+        try:
+            e = json.loads(line)
+        except ValueError:
+            return
+        click.echo(f"{e.get('ts', '')}  {e.get('model', ''):<28} {e.get('event', ''):<15} "
+                   f"{e.get('detail', '')}")
+    try:
+        with open(path) as f:
+            for line in f.readlines()[-lines:] if lines > 0 else []:
+                show(line)
+            while follow:
+                line = f.readline()
+                if line:
+                    show(line)
+                else:
+                    time.sleep(0.5)
+    except FileNotFoundError:
+        if not follow:
+            click.echo("(no events yet)")
+            return
+        while not path.exists():
+            time.sleep(0.5)
+        ctx = click.get_current_context()
+        ctx.invoke(events_cmd, follow=True, lines=0, as_json=as_json)
+    except KeyboardInterrupt:
+        pass
 
 
 def _runtime_label(rt: dict | None) -> str:
@@ -1596,7 +1687,8 @@ def _restart_one(ctx: click.Context, identifier: str,
         cmd = backends.with_bind_host(spec.cmd, spec.backend, config_mod.get_bind_host())
         rec = proc.start(name=spec.name, cmd=cmd, port=spec.port,
                          model_path=spec.model_path, backend=spec.backend,
-                         env=spec.env, group=spec.group)
+                         env=spec.env, group=spec.group, restart=spec.restart,
+                         restart_max=spec.restart_max)
         click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}")
         return rec
 

@@ -84,6 +84,9 @@ class LaunchSpec:
     # The runtime as chosen (kind, image, digest, gpus, network); the
     # container name and cache dir are worked out again at each start.
     runtime: dict | None = None
+    # What the gateway's supervisor does when it crashes (supervisor.py).
+    restart: str = "on-failure"
+    restart_max: int = 5
 
     def run_cmd(self) -> list[str]:
         """The ``llmctl run …`` argv that reproduces this launch, port pinned."""
@@ -135,7 +138,8 @@ def _load_autostart() -> list[LaunchSpec]:
         raw = json.loads(AUTOSTART_FILE.read_text())
     except json.JSONDecodeError:
         return []
-    return [LaunchSpec(**r) for r in raw]
+    known = set(LaunchSpec.__dataclass_fields__)
+    return [LaunchSpec(**{k: v for k, v in r.items() if k in known}) for r in raw]
 
 
 def _save_autostart(specs: list[LaunchSpec]) -> None:
@@ -151,7 +155,8 @@ def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
                   run_args: list[str] | None = None,
                   backend: str = "llama",
                   env: dict[str, str] | None = None, group: str | None = None,
-                  runtime: dict | None = None) -> None:
+                  runtime: dict | None = None, restart: str | None = None,
+                  restart_max: int | None = None) -> None:
     """Upsert a launch spec into the autostart manifest (keyed by name).
 
     Ports are pinned, so a port can only be restored to one model: entries
@@ -162,7 +167,8 @@ def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
     specs.append(LaunchSpec(name=name, cmd=list(cmd), port=port,
                             model_path=model_path, run_args=list(run_args or []),
                             backend=backend, env=dict(env or {}), group=group,
-                            runtime=chosen_runtime(runtime)))
+                            runtime=chosen_runtime(runtime),
+                            restart=restart or "on-failure", restart_max=restart_max or 5))
     _save_autostart(specs)
 
 
@@ -198,7 +204,9 @@ def autostart_sync() -> tuple[list[LaunchSpec], list[LaunchSpec]]:
                    model_path=p.model_path,
                    run_args=old[p.name].run_args if p.name in old else [],
                    backend=p.backend, env=dict(p.env), group=p.group,
-                   runtime=chosen_runtime(p.runtime))
+                   runtime=chosen_runtime(p.runtime),
+                   restart=old[p.name].restart if p.name in old else "on-failure",
+                   restart_max=old[p.name].restart_max if p.name in old else 5)
         for p in list_running()
     ]
     live = {s.name for s in kept}
@@ -248,7 +256,8 @@ def restore(names: list[str] | None = None,
             rec = start(name=spec.name, cmd=cmd, port=spec.port,
                         model_path=spec.model_path, run_args=spec.run_args,
                         backend=spec.backend, env=spec.env, group=spec.group,
-                        runtime=spec.runtime)
+                        runtime=spec.runtime, restart=spec.restart,
+                        restart_max=spec.restart_max)
             results.append((spec, f"started pid={rec.pid} port={rec.port}"))
         except Exception as e:  # never let one bad spec abort the rest
             results.append((spec, f"error: {e}"))
@@ -282,7 +291,8 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
           run_args: list[str] | None = None,
           backend: str = "llama",
           env: dict[str, str] | None = None, group: str | None = None,
-          runtime: dict | None = None) -> RunningProcess:
+          runtime: dict | None = None, restart: str | None = None,
+          restart_max: int | None = None) -> RunningProcess:
     """Launch ``cmd`` detached. ``env`` is layered over the current environment
     (e.g. VLLM_* tuning knobs) and remembered so restore/restart reproduce it.
     Telemetry is always off, offline mode keeps backends off the hub, and
@@ -373,7 +383,7 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
     # Remember this launch so `restore` can bring it back after a reboot.
     autostart_add(name=name, cmd=cmd, port=port, model_path=model_path,
                   run_args=run_args, backend=backend, env=env, group=group,
-                  runtime=runtime)
+                  runtime=runtime, restart=restart, restart_max=restart_max)
     return rec
 
 
@@ -381,6 +391,9 @@ def stop(identifier: str, *, timeout: float = 10.0) -> RunningProcess | None:
     target = find(identifier)
     if target is None:
         return None
+    # An explicit stop means "don't autostart this next boot". Done first, so
+    # the gateway's supervisor never takes the dying process for a crash.
+    autostart_remove(target.name)
     container = (target.runtime or {}).get("container")
     if container:
         # SIGTERM to `docker run` reaches the engine too, but a SIGKILL'd
@@ -395,8 +408,6 @@ def stop(identifier: str, *, timeout: float = 10.0) -> RunningProcess | None:
         _signal_group(target.pid, signal.SIGKILL)
     procs = [p for p in reconcile() if p.pid != target.pid]
     _save(procs)
-    # An explicit stop means "don't autostart this next boot".
-    autostart_remove(target.name)
     return target
 
 

@@ -200,7 +200,7 @@ class _BrokenStream(_Upstream):
         self.close_connection = True       # dies before the last chunk
 
 
-def test_upstream_dying_mid_stream_is_logged(tmp_path, capsys):
+def test_upstream_dying_mid_stream_ends_with_an_error_event(tmp_path, capsys):
     up = _serve(_BrokenStream)
     state = tmp_path / "running.json"
     state.write_text(json.dumps([_record("gemma", up.server_address[1])]))
@@ -212,9 +212,12 @@ def test_upstream_dying_mid_stream_is_logged(tmp_path, capsys):
                      body=json.dumps({"model": "gemma", "stream": True}),
                      headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
-        with pytest.raises(http.client.IncompleteRead):
-            resp.read()
+        body = resp.read()                  # a clean end, not IncompleteRead
         conn.close()
+        assert body.startswith(b"data: 0\n\n")
+        last = json.loads(body.strip().split(b"\n\n")[-1][len(b"data: "):])
+        assert last["error"]["code"] == "model_unavailable"
+        assert last["error"]["type"] == "server_error"
         out = ""
         for _ in range(40):              # the gateway logs from its own thread
             out += capsys.readouterr().out
@@ -258,8 +261,10 @@ def test_dead_and_unreachable_models(env):
     os.utime(env["state"], (time.time() + 5, time.time() + 5))   # force a reload
     status, out = _call(env["port"], "GET", "/v1/models")
     assert {m["id"] for m in out["data"]} == {"gemma-4-26b-q4", "quyet.decide"}
+    # A local model whose server refuses: 503, not 502 (since 1.2).
     status, out = _call(env["port"], "POST", "/v1/chat/completions", {"model": "gemma"})
-    assert status == 502 and out["error"]["code"] == "upstream_unavailable"
+    assert status == 503 and out["error"]["code"] == "model_unavailable"
+    assert out["error"]["type"] == "server_error"
 
 
 def test_one_model_needs_no_name():
