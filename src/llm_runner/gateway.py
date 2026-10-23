@@ -47,6 +47,7 @@ from urllib.parse import unquote, urlsplit
 from llm_runner import __version__
 from llm_runner import auth
 from llm_runner import config as config_mod
+from llm_runner import metrics as metrics_mod
 from llm_runner import process as proc
 from llm_runner.backends import (DECIDE, DECIDER, GATEWAY, SGLANG, VLLM, hf_has_vision,
                                  is_decision_model)
@@ -95,6 +96,13 @@ def _flag(cmd: tuple[str, ...], *names: str) -> str | None:
 
 # Prometheus gauge of requests waiting for a free slot, per engine.
 _QUEUE_METRIC = {VLLM: "vllm:num_requests_waiting", SGLANG: "sglang:num_queue_reqs"}
+# Requests waiting for a slot, per engine, for llmctl_requests_queued.
+_WAITING_METRIC = {**_QUEUE_METRIC, "llama": "llamacpp:requests_deferred"}
+# Engines with a Prometheus /metrics on their own port.
+_METRICS_BACKENDS = (VLLM, SGLANG, "llama")
+# Metrics endpoints: the scrape-only token, else the API-key policy.
+METRICS_PATHS = ("/metrics", "/metrics/sd")
+_STATE_OF = {"ready": "ready", "loading": "starting", "down": "down"}
 # The flag carrying the context size in each engine's recorded command.
 _CTX_FLAGS = {VLLM: ("--max-model-len",), SGLANG: ("--context-length",)}
 
@@ -245,6 +253,32 @@ class LocalModels:
         except (OSError, ValueError, KeyError, IndexError):
             return False
 
+    def backend_metrics(self, m: Model, timeout: float = 2.0) -> str | None:
+        """The engine's own /metrics text, or None (no endpoint, not answering)."""
+        if m.backend not in _METRICS_BACKENDS:
+            return None
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{m.port}/metrics",
+                                        timeout=timeout) as r:
+                return r.read().decode(errors="replace")
+        except (OSError, ValueError):
+            return None
+
+    def waiting(self, m: Model) -> float | None:
+        """Requests waiting for a slot on this model, from its engine."""
+        name = _WAITING_METRIC.get(m.backend)
+        text = self.backend_metrics(m, timeout=0.5) if name else None
+        if text is None:
+            return None
+        total = None
+        for line in text.splitlines():
+            if line.startswith(name) and line[len(name):len(name) + 1] in ("{", " "):
+                try:
+                    total = (total or 0.0) + float(line.rsplit(" ", 1)[1])
+                except ValueError:
+                    pass
+        return total
+
     def status(self, m: Model) -> str:
         now = time.monotonic()
         hit = self._health.get(m.port)
@@ -334,6 +368,69 @@ def _answers_as(url: str, node: str, timeout: float = 1.0) -> bool:
         return False
 
 
+class GatewayMetrics:
+    """What ``/metrics`` reports. Calls are counted by the gateway the client
+    called (a call another gateway hands on is not counted again where it
+    lands); ``node`` is where the model that answered runs."""
+
+    def __init__(self, gw: "Gateway"):
+        self.gw = gw
+        r = self.registry = metrics_mod.Registry()
+        lbl = ("model", "node", "backend")
+        self.requests = r.counter("llmctl_requests_total",
+                                  "Calls answered, by HTTP status.", lbl + ("status",))
+        self.errors = r.counter("llmctl_request_errors_total",
+                                "Calls that ended in an error, by error code.", lbl + ("code",))
+        self.duration = r.histogram("llmctl_request_duration_seconds",
+                                    "From the call to its last byte.", lbl)
+        self.ttft = r.histogram("llmctl_time_to_first_token_seconds",
+                                "Streamed calls: from the call to the first event.", lbl,
+                                buckets=metrics_mod.TTFT_BUCKETS)
+        self.tokens = r.counter("llmctl_tokens_total",
+                                "Tokens from the replies' usage, in (prompt) and out.",
+                                lbl + ("direction",))
+        self.in_flight = r.gauge("llmctl_requests_in_flight",
+                                 "Calls being relayed now.", lbl)
+        r.gauge("llmctl_requests_queued", "Calls waiting for a slot in the engine.", lbl,
+                collect=self._queued)
+        self.spills = r.counter("llmctl_spills_total",
+                                "Calls the best instance was too busy for, sent elsewhere.",
+                                ("model", "from_node", "to_node"))
+        self.failovers = r.counter("llmctl_failovers_total",
+                                   "Instances that refused a call before answering.",
+                                   ("model", "from_node", "reason"))
+        r.gauge("llmctl_node_up", "Cluster nodes seen by this gateway: 1 up, 0 gone.",
+                ("node",), collect=self._nodes)
+        r.gauge("llmctl_instance_state", "1 for the current state of each local model.",
+                ("model", "node", "backend", "state"), collect=self._states)
+        self.restarts = r.counter("llmctl_instance_restarts_total",
+                                  "Restarts by the gateway's supervisor.", ("model", "node"))
+        r.gauge("llmctl_build_info", "The llmctl version.", ("version", "node"),
+                collect=lambda: [({"version": __version__, "node": gw.node}, 1)])
+        self._seen_nodes: set[str] = set()
+
+    def _queued(self):
+        for m in self.gw.local.models():
+            n = self.gw.local.waiting(m)
+            if n is not None:
+                yield {"model": m.name, "node": self.gw.node, "backend": m.backend}, n
+
+    def _nodes(self):
+        up = {self.gw.node} | {n["node"] for n in self.gw.view.nodes()}
+        self._seen_nodes |= up
+        for node in sorted(self._seen_nodes):
+            yield {"node": node}, 1 if node in up else 0
+
+    def _states(self):
+        for m in self.gw.local.models():
+            state = _STATE_OF.get(self.gw.local.status(m), "down")
+            yield {"model": m.name, "node": self.gw.node, "backend": m.backend,
+                   "state": state}, 1
+
+    def render(self) -> str:
+        return self.registry.render()
+
+
 class Gateway:
     """State shared by the request threads: local models, and in a cluster
     the node's view of the others (plus the registry table on the registry)."""
@@ -358,6 +455,7 @@ class Gateway:
         self.table = RegistryTable(__version__) if self.cluster and self.cluster.registry_serve \
             else None
         self._last_log: tuple | None = None
+        self.metrics = GatewayMetrics(self)
 
     @property
     def token(self) -> str | None:
@@ -542,6 +640,33 @@ class Gateway:
                           for n in self.view.nodes()]}
 
 
+def _usage_and_code(body: bytes, stream: bool) -> tuple[dict | None, str | None]:
+    """``usage`` and ``error.code`` from a reply body (JSON), or from the
+    last SSE event that carries a usage."""
+    if not body:
+        return None, None
+    docs: list = []
+    if stream:
+        for line in reversed(body.split(b"\n")):
+            if line.startswith(b"data:") and b'"usage"' in line:
+                try:
+                    docs = [json.loads(line[5:])]
+                except ValueError:
+                    continue
+                break
+    else:
+        try:
+            docs = [json.loads(body)]
+        except ValueError:
+            return None, None
+    doc = docs[0] if docs and isinstance(docs[0], dict) else {}
+    usage = doc.get("usage") if isinstance(doc.get("usage"), dict) else None
+    err = doc.get("error")
+    code = err.get("code") if isinstance(err, dict) and isinstance(err.get("code"), str) \
+        else None
+    return usage, code
+
+
 def make_handler(gw: Gateway):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -558,6 +683,7 @@ def make_handler(gw: Gateway):
         def _json(self, status: int, payload: dict) -> None:
             body = json.dumps(payload).encode()
             self._replied = True
+            self._obs["status"] = status
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -566,6 +692,7 @@ def make_handler(gw: Gateway):
                 self.wfile.write(body)
 
         def _error(self, status: int, code: str, message: str) -> None:
+            self._obs["code"] = code
             kind = "invalid_request_error" if status < 500 else "server_error"
             self._json(status, {"error": {"message": message, "type": kind,
                                           "param": "model" if "model" in code else None,
@@ -613,6 +740,9 @@ def make_handler(gw: Gateway):
         # ---------------------------------------------------------- routing --
         def _handle(self) -> None:
             self._replied = False
+            # What /metrics learns about this call (see _record).
+            self._obs = {"t0": time.monotonic(), "count": False, "inst": None,
+                         "status": None, "code": None, "ttft": None, "usage": None}
             try:
                 self._route()
             except Exception as e:  # never drop a connection without an answer
@@ -621,6 +751,78 @@ def make_handler(gw: Gateway):
                 self.close_connection = True
                 if not self._replied:
                     self._error(500, "gateway_error", f"llmctl gateway: {type(e).__name__}: {e}")
+            finally:
+                self._record()
+
+        def _record(self) -> None:
+            o = self._obs
+            if not o["count"]:
+                return
+            c = o["inst"]
+            lbl = {"model": c.id if c else "", "node": c.node if c else "",
+                   "backend": (c.info.get("backend") or "") if c else ""}
+            m = gw.metrics
+            status = o["status"] or 0
+            m.requests.inc(**lbl, status=str(status))
+            if status >= 400 or o["code"]:
+                m.errors.inc(**lbl, code=o["code"] or f"http_{status}")
+            if c is not None:
+                m.duration.observe(time.monotonic() - o["t0"], **lbl)
+                if o["ttft"] is not None:
+                    m.ttft.observe(o["ttft"], **lbl)
+                usage = o["usage"] or {}
+                for direction, key in (("in", "prompt_tokens"), ("out", "completion_tokens")):
+                    if isinstance(usage.get(key), int):
+                        m.tokens.inc(usage[key], **lbl, direction=direction)
+
+        def _metrics_ok(self) -> bool:
+            """Scrapes: the scrape-only token when one is set, else the API-key
+            policy (``/v1`` callers' keys)."""
+            policy = gw.access()
+            if policy.mode == auth.OFF or not policy.needs_key(self.client_address[0],
+                                                              self.headers):
+                return True
+            if policy.metrics_token:
+                if policy.is_metrics_token(self.headers):
+                    return True
+                self._error(401, "invalid_api_key", "Scrapes need the metrics token: "
+                            "Authorization: Bearer <token> (`llmctl gateway metrics-token`).")
+                return False
+            return self._key_ok()
+
+        def _metrics(self, path: str) -> None:
+            if path == "/metrics":
+                body = gw.metrics.render().encode()
+                ctype = "text/plain; version=0.0.4; charset=utf-8"
+            elif path == "/metrics/sd":
+                host = self.headers.get("Host") or f"{lan_ip()}:{gw.port}"
+                body = json.dumps([
+                    {"targets": [host],
+                     "labels": {"__metrics_path__": f"/metrics/backends/{m.name}",
+                                "model": m.name, "node": gw.node, "backend": m.backend}}
+                    for m in gw.local.models() if m.backend in _METRICS_BACKENDS]).encode()
+                ctype = "application/json"
+            else:
+                name = unquote(path[len("/metrics/backends/"):])
+                m = next((x for x in gw.local.models() if x.name == name), None)
+                if m is None or m.backend not in _METRICS_BACKENDS:
+                    return self._error(404, "model_not_found",
+                                       f"No local model \"{name}\" with engine metrics.")
+                text = gw.local.backend_metrics(m)
+                if text is None:
+                    return self._error(503, "model_unavailable",
+                                       f"{name}'s engine is not answering /metrics.")
+                body = metrics_mod.add_labels(text, {"model": m.name, "node": gw.node,
+                                                     "backend": m.backend}).encode()
+                ctype = "text/plain; version=0.0.4; charset=utf-8"
+            self._replied = True
+            self._obs["status"] = 200
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
 
         def _route(self) -> None:
             path, _, query = self.path.partition("?")
@@ -635,12 +837,17 @@ def make_handler(gw: Gateway):
             hop = HOP_HEADER in self.headers
             if hop and not self._authorized():
                 return
-            if not hop and path not in OPEN_PATHS and not self._key_ok():
+            is_metrics = path in METRICS_PATHS or path.startswith("/metrics/backends/")
+            if not hop and path not in OPEN_PATHS and not is_metrics and not self._key_ok():
                 return
             if path == "/cluster/v1/status":
                 return self._json(200, gw.status())
+            if not hop and self.command in ("GET", "HEAD") and (
+                    path in METRICS_PATHS or path.startswith("/metrics/backends/")):
+                return self._metrics(path) if self._metrics_ok() else None
 
             if path.startswith("/m/"):
+                self._obs["count"] = not hop
                 name, _, rest = path[3:].partition("/")
                 name, node = split_pin(unquote(name))
                 insts = gw.instances(local_only=hop)
@@ -674,6 +881,7 @@ def make_handler(gw: Gateway):
 
             api = SYSTEMONE if path.rstrip("/") in ("/v1/systemone", "/v1/decisions",
                                                     "/v1/spec") else OPENAI
+            self._obs["count"] = not hop
             payload = None
             ctype = self.headers.get("Content-Type", "")
             if body and not ctype.startswith("multipart/"):
@@ -709,6 +917,7 @@ def make_handler(gw: Gateway):
             return self._forward(cands, lambda c: self.path, body_for)
 
         def _busy(self) -> None:
+            self._obs.update(status=503, code="busy")
             body = json.dumps({"error": {"message": "all slots busy", "type": "server_error",
                                          "param": None, "code": "busy"}}).encode()
             self._replied = True
@@ -769,6 +978,9 @@ def make_handler(gw: Gateway):
                     else:
                         result = attempt(c, last, spill=not c.local)
                     if result == "done":
+                        if busy:
+                            gw.metrics.spills.inc(model=c.id, from_node=busy[0].node,
+                                                  to_node=c.node)
                         return
                     if result == "busy":
                         busy.append(c)
@@ -785,6 +997,8 @@ def make_handler(gw: Gateway):
                  spill: bool = False) -> str:
             """"done" (a reply was relayed), "failed" (try the next instance) or
             "busy" (a remote instance with every slot taken; only with spill)."""
+            self._obs["inst"] = c
+            lbl = {"model": c.id, "node": c.node, "backend": c.info.get("backend") or ""}
             tls, relay = False, None
             if c.local:
                 host, port, extra = "127.0.0.1", c.info["port"], {}
@@ -819,6 +1033,7 @@ def make_handler(gw: Gateway):
                     extra[SPILL_HEADER] = "1"
             conn = (http.client.HTTPSConnection if tls else http.client.HTTPConnection)(
                 host, port, timeout=10)
+            gw.metrics.in_flight.add(1, **lbl)
             try:
                 replaced = {k.lower() for k in extra}
                 if "authorization" in replaced:
@@ -839,6 +1054,8 @@ def make_handler(gw: Gateway):
                         f"node {c.node} (via {relay})" if relay else f"node {c.node} ({c.url})"
                     if not last:
                         print(f"failover: {c.id} on {c.node} unreachable ({e})", flush=True)
+                        gw.metrics.failovers.inc(model=c.id, from_node=c.node,
+                                                 reason="unreachable")
                         return "failed"
                     self._error(502, "upstream_unavailable",
                                 f"{c.id} ({where}) is not answering: {e}")
@@ -856,16 +1073,29 @@ def make_handler(gw: Gateway):
                     gone = resp.status == 404 and not c.local and b"model_not_found" in data
                     if resp.status in (502, 503) or gone or is_context_error(resp.status, data):
                         print(f"failover: {c.id} on {c.node} answered {resp.status}", flush=True)
+                        gw.metrics.failovers.inc(
+                            model=c.id, from_node=c.node,
+                            reason="gone" if gone else str(resp.status)
+                            if resp.status in (502, 503) else "context")
                         return "failed"
                     self._relay(resp, data)
                     return "done"
                 self._relay(resp)
                 return "done"
             finally:
+                gw.metrics.in_flight.add(-1, **lbl)
                 conn.close()
 
         def _relay(self, resp: http.client.HTTPResponse, data: bytes | None = None) -> None:
             self._replied = True
+            self._obs["status"] = resp.status
+            ctype = (resp.getheader("Content-Type") or "").lower()
+            stream = ctype.startswith("text/event-stream")
+            # Kept to read `usage` (and an error code) from: a JSON reply
+            # whole, up to 4 MiB; the tail of a stream, where the usage
+            # chunk comes last.
+            keep = bytearray()
+            keep_json = "json" in ctype and int(resp.getheader("Content-Length") or 0) <= 4 << 20
             self.send_response(resp.status, resp.reason)
             length = str(len(data)) if data is not None else resp.getheader("Content-Length")
             for k, v in resp.getheaders():
@@ -880,6 +1110,7 @@ def make_handler(gw: Gateway):
             sent, side = 0, "client"
             try:
                 if data is not None:
+                    keep += data
                     self.wfile.write(data)
                     return
                 while True:
@@ -888,6 +1119,13 @@ def make_handler(gw: Gateway):
                     side = "client"
                     if not chunk:
                         break
+                    if stream and self._obs["ttft"] is None:
+                        self._obs["ttft"] = time.monotonic() - self._obs["t0"]
+                    if stream:
+                        keep += chunk
+                        del keep[:-32768]
+                    elif keep_json and len(keep) < 4 << 20:
+                        keep += chunk
                     if chunked:
                         self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
                     else:
@@ -902,7 +1140,12 @@ def make_handler(gw: Gateway):
                 who = "client left" if side == "client" else "upstream broke"
                 print(f"relay: {who}: {self.command} {self.path} for "
                       f"{self.address_string()} after {sent} bytes ({e!r})", flush=True)
+                self._obs["code"] = "client_left" if side == "client" else "stream_aborted"
                 self.close_connection = True
+            finally:
+                self._obs["usage"], code = _usage_and_code(bytes(keep), stream)
+                if resp.status >= 400 and code and not self._obs["code"]:
+                    self._obs["code"] = code
 
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _handle
 

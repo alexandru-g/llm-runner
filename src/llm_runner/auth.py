@@ -68,6 +68,9 @@ class Policy:
     keys: dict[str, str] = field(default_factory=dict)        # name -> sha256
     local: tuple[Network, ...] = tuple(parse_network(n) for n in DEFAULT_LOCAL)
     proxies: tuple[Network, ...] = ()
+    # sha256 of the scrape-only token for /metrics*, or None: then scrapes
+    # need an API key like any other call.
+    metrics_token: str | None = None
 
     def caller(self, peer: str, headers) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
         """The address a request is judged by; None means "unknown", i.e.
@@ -101,11 +104,14 @@ class Policy:
     def needs_key(self, peer: str, headers) -> bool:
         return self.mode == ON and not self.is_local(self.caller(peer, headers))
 
+    def is_metrics_token(self, headers) -> bool:
+        key = _sent_key(headers)
+        return bool(key and self.metrics_token
+                    and hmac.compare_digest(hash_key(key), self.metrics_token))
+
     def key_name(self, headers) -> str | None:
         """The name of the key a request carries, or None."""
-        auth = headers.get("Authorization") or ""
-        key = auth[7:].strip() if auth[:7].lower() == "bearer " else \
-            (headers.get("X-Api-Key") or "").strip()
+        key = _sent_key(headers)
         if not key:
             return None
         digest = hash_key(key)
@@ -116,9 +122,17 @@ class Policy:
         return found
 
 
+def _sent_key(headers) -> str:
+    auth = headers.get("Authorization") or ""
+    return auth[7:].strip() if auth[:7].lower() == "bearer " else \
+        (headers.get("X-Api-Key") or "").strip()
+
+
 def policy_from(cfg: dict) -> Policy:
     mode = ON if cfg.get("gateway_auth") == ON else OFF
     keys = cfg.get("gateway_keys") if isinstance(cfg.get("gateway_keys"), dict) else {}
+    mtok = cfg.get("gateway_metrics_token") if isinstance(
+        cfg.get("gateway_metrics_token"), str) else None
     try:
         local = tuple(parse_network(n) for n in cfg.get("gateway_local_networks")
                       or DEFAULT_LOCAL)
@@ -128,8 +142,8 @@ def policy_from(cfg: dict) -> Policy:
         # keep the mode and keys, use the defaults, and say so.
         print(f"auth: ignoring the networks in the config ({e}); using the defaults",
               flush=True)
-        return Policy(mode=mode, keys=dict(keys))
-    return Policy(mode=mode, keys=dict(keys), local=local, proxies=proxies)
+        return Policy(mode=mode, keys=dict(keys), metrics_token=mtok)
+    return Policy(mode=mode, keys=dict(keys), local=local, proxies=proxies, metrics_token=mtok)
 
 
 class ConfigPolicy:

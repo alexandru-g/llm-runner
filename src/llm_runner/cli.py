@@ -74,6 +74,7 @@ def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size:
             "--host", host,
             "--embeddings",
             "--pooling", pooling,
+            "--metrics",
             *(extra or []),
         ]
     cmd = [
@@ -93,6 +94,8 @@ def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size:
         "--threads", "8",
         "--port", str(port),
         "--host", host,
+        # Prometheus /metrics, re-exported by the gateway (/metrics/backends/…).
+        "--metrics",
     ]
     if n_parallel is not None:
         cmd.extend(["--parallel", str(n_parallel)])
@@ -2051,6 +2054,30 @@ def gateway_key_rm(name: str) -> None:
         raise click.UsageError(f"No key called {name}.")
     config_mod.update(gateway_keys=keys or None)
     click.echo(f"Key {name} revoked.")
+
+
+@gateway.command("metrics-token")
+@click.option("--clear", is_flag=True,
+              help="Forget it: scrapes then need an API key, like other calls.")
+def gateway_metrics_token(clear: bool) -> None:
+    """Make a scrape-only token for /metrics, /metrics/sd and
+    /metrics/backends/*, and print it. Only its hash is kept.
+
+    A monitoring host with it can scrape but can't run models. Like API
+    keys it's needed only from outside the local networks, with auth on;
+    while none is set, scrapes need an API key. A new token replaces the
+    old one.
+    """
+    from llm_runner import auth
+    if clear:
+        config_mod.update(gateway_metrics_token=None)
+        click.echo("Metrics token cleared; scrapes need an API key when auth asks for one.")
+        return
+    token = auth.new_key()
+    config_mod.update(gateway_metrics_token=auth.hash_key(token))
+    click.echo(token)
+    click.echo("Metrics token set (it replaces any earlier one and is not shown again). "
+               "vmagent: `bearer_token_file` in the scrape and http_sd configs.", err=True)
 
 
 @cli.group(invoke_without_command=True)
