@@ -5,6 +5,57 @@ All notable changes to llm-runner (`llmctl`). The format follows
 [semantic versioning](https://semver.org); what the version protects is in
 [docs/compatibility.md](docs/compatibility.md).
 
+## [1.2.0] - 2026-10-23
+
+Monitoring and operations: metrics, crash recovery, structured logs and
+traces, for a production host watched from another machine.
+
+### Added
+
+- **Metrics.** `GET /metrics` on every gateway, in Prometheus text format,
+  without a new dependency:
+  - calls by status and error code, latency and time-to-first-token
+    histograms;
+  - tokens from `usage`, in-flight and queued calls;
+  - spills, failovers, node up, each model's state and its restarts.
+  `GET /metrics/backends/<model>` re-exports each engine's own metrics with
+  `model`, `node` and `backend` labels, and `GET /metrics/sd` lists them for
+  Prometheus HTTP service discovery. llama-server now runs with `--metrics`.
+- `llmctl gateway metrics-token`: a scrape-only token, so a monitoring host
+  needs no key that can run models. Without one, scrapes follow the
+  API-key rules of `/v1`.
+- **The gateway restarts crashed models.** A model in the autostart
+  manifest that dies after it was ready is restarted after 2, 4, 8 … s
+  (capped at 60 s). After 5 restarts in 10 minutes it is left down as
+  `crashed`. Per model: `run --restart on-failure|never`, `--restart-max N`,
+  and `restart:`/`restart_max:` in serving files.
+- `llmctl ps` shows STATE and RESTARTS and takes `--json`. `llmctl events
+  [-f]` follows the supervisor, and `/v1/models` lists down models as
+  `restarting` or `crashed`.
+- `scripts/chaos-test.py MODEL`: kills a model mid-stream and checks the
+  client gets an error within 10 s and the model serves again within 120 s.
+  Measured on ws: error at once, serving again in 5 s (llama.cpp on the
+  host) and 7 s (in Docker).
+- **JSON logs.** `llmctl config gateway-log json` writes one object per
+  line. Each call logs its request id, trace id, model, status, timings and
+  tokens, and never prompt or reply text, in any mode.
+- **Request ids.** `X-Request-Id` is kept from the client (or made), sent
+  to the engine and returned on every reply.
+- **Traces.** The gateway continues the client's W3C trace and gives each
+  engine a `traceparent`. `llmctl config gateway-otlp URL` exports gateway
+  spans over OTLP/HTTP (off by default).
+
+### Changed
+
+- A call for a model that is configured but down answers **503
+  `model_unavailable`** with `Retry-After`, instead of 404 `model_not_found`
+  (process gone) or 502 `upstream_unavailable` (port refusing). This counts
+  as a bug fix within 1.x (docs/compatibility.md).
+- A stream whose engine dies ends with an SSE error event and a clean end
+  of the response, instead of a cut connection.
+- `llmctl stop` takes a model out of the autostart manifest before stopping
+  it, so the gateway never restarts a model that was stopped on purpose.
+
 ## [1.1.1] - 2026-10-23
 
 ### Fixed
@@ -103,6 +154,7 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.2.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.2.0
 [1.1.1]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.1.1
 [1.1.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.1.0
 [1.0.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.0.0

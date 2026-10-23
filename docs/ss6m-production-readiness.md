@@ -155,6 +155,11 @@ most 15 minutes).
   down.
 - Re-export or document the backends' own metrics (vLLM and llama-server
   both expose `/metrics`).
+- **Done in 1.2.0:** `/metrics` with all of the above plus tokens, instance
+  state and restarts; `/metrics/backends/<model>` re-exports each engine's
+  metrics with labels, `/metrics/sd` serves HTTP service discovery, and
+  `llmctl gateway metrics-token` gives scrapers a token that can't run
+  models (README, "Monitoring and operations").
 - **Done 2026-10-22:** `/healthz` (process alive) and `/readyz` on the
   gateway, for Compose and the M0 edge. `/readyz` answers 200 only when
   every model in the autostart manifest is running and ready. A crashed
@@ -172,6 +177,12 @@ A0 M0.4 runs chaos tests the router must pass:
 - A full GPU, a node that disappears mid-stream, and a registry restart each
   have a defined outcome and a test.
 - Restart policy and backoff per instance are configured, not implicit.
+- **Done in 1.2.0 (killed backend, restart policy):** the gateway restarts
+  crashed models, with backoff and give-up settable per model. A down model
+  answers 503 `model_unavailable` with `Retry-After`, and a broken stream
+  ends with an SSE error event. `scripts/chaos-test.py` measured on ws: the
+  error at once, serving again in 5–7 s. Full GPU, node loss mid-stream and
+  registry restart still need their own tests.
 - **Observed 2026-10-21, cause open.** SS6M's BM-LLM-01 sent 256 streaming chat
   requests at concurrency 16 from ws to orin's gateway, with Gemma 4 12B and
   26B-A4B on llama-server. 6 and 7 requests failed with a client-side read
@@ -211,7 +222,9 @@ A0 M0.4 runs chaos tests the router must pass:
 - **Request limits.** Maximum body size, maximum tokens per request,
   per-client rate limits and queue limits, with OpenAI-style errors.
 - **Structured logs.** JSON lines with request ids, matching the audit event
-  ids.
+  ids. **Done in 1.2.0:** `llmctl config gateway-log json`, `X-Request-Id`
+  kept or made and returned, W3C trace propagation and optional OTLP span
+  export.
 - **Python 3.10 support,** or a clear statement that the CLI runs from its
   container only. orin's Ubuntu 22.04 ships Python 3.10, and the project
   requires 3.11 or later.

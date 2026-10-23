@@ -934,7 +934,8 @@ same model id the gateway lists.
 For a proxy or Compose health check, `GET /healthz` answers while the gateway
 is up, and `GET /readyz` answers 200 only when every model in the autostart
 manifest is running and ready (503 with each model's status otherwise). A
-crashed model stays in the manifest, so it turns readiness off.
+crashed model stays in the manifest, so it turns readiness off until the
+gateway restarts it (see "Monitoring and operations").
 
 ### Who can reach the gateway: bind address and API keys
 
@@ -1234,6 +1235,7 @@ models:
     ctx: 32768
     n_parallel: 8
     kv_cache_mem: 6G
+    restart: on-failure               # or never; restart_max: 5 (in 10 min)
     args: ["--max-num-batched-tokens", "8192"]
     env: {VLLM_LOGGING_LEVEL: INFO}
 ```
@@ -1264,6 +1266,122 @@ Keys: `model`, `port`, `args`, `env`, and the `run` options `backend`,
 `reasoning_parser`, `trust_remote_code`, `reasoning`, `embeddings`,
 `no_vision`, `draft`, `no_draft`, `spec_type`, `spec_n_max`,
 `n_gpu_layers`, `kv_unified`, `ctx_checkpoints`, `cache_ram`.
+
+## Monitoring and operations
+
+What a monitoring stack (Prometheus or VictoriaMetrics, Loki or
+VictoriaLogs, an OpenTelemetry collector) reads from a node, and what
+happens when a model dies. The names below are covered by
+[docs/compatibility.md](docs/compatibility.md).
+
+### Metrics
+
+Every gateway serves Prometheus text format:
+
+| Endpoint | What |
+|---|---|
+| `GET /metrics` | the gateway's own metrics (below) |
+| `GET /metrics/sd` | [HTTP service discovery](https://prometheus.io/docs/prometheus/latest/http_sd/) JSON: one target per local engine, with `__metrics_path__` and `model`, `node`, `backend` labels |
+| `GET /metrics/backends/<model>` | that engine's own `/metrics` (vLLM, SGLang, llama-server), with `model`, `node`, `backend` added to every sample |
+
+Gateway metrics, labelled `model`, `node` (where the model ran) and
+`backend`:
+
+| Metric | Type |
+|---|---|
+| `llmctl_requests_total{…,status}` | counter, by HTTP status |
+| `llmctl_request_errors_total{…,code}` | counter, by error code (`model_unavailable`, `model_not_found`, `busy`, `stream_aborted`, `client_left`, or the engine's own) |
+| `llmctl_request_duration_seconds` | histogram, call to last byte |
+| `llmctl_time_to_first_token_seconds` | histogram, streamed calls: call to first event (buckets 0.05…60 s) |
+| `llmctl_tokens_total{…,direction="in"\|"out"}` | counter, from the replies' `usage` (streams only with `stream_options.include_usage`; the engines' own counters are under `/metrics/backends`) |
+| `llmctl_requests_in_flight`, `llmctl_requests_queued` | gauges: being relayed; waiting for an engine slot |
+| `llmctl_spills_total{model,from_node,to_node}`, `llmctl_failovers_total{model,from_node,reason}` | counters |
+| `llmctl_node_up{node}` | 1 for nodes in the cluster view, 0 for ones that left |
+| `llmctl_instance_state{…,state}` | 1 for each local model's state: `starting`, `ready`, `restarting`, `crashed`, `down` |
+| `llmctl_instance_restarts_total{model,node}` | supervisor restarts |
+| `llmctl_build_info{version,node}` | 1 |
+
+A call is counted by the gateway the client called, not again by a node it
+was handed to, so sums over all scraped gateways don't double count.
+llama-server runs with `--metrics` (models started before 1.2 get it at
+their next restart).
+
+Scrapes follow the API-key rules of `/v1`: open from the local networks,
+otherwise they need a key. `llmctl gateway metrics-token` makes a
+scrape-only token instead, so the monitoring host holds nothing that can
+run a model:
+
+```yaml
+# vmagent / Prometheus
+scrape_configs:
+  - job_name: llmctl
+    bearer_token_file: /etc/vmagent/llmctl-token
+    static_configs: [{targets: ["ws:9000", "orin:9000"]}]
+  - job_name: llmctl-engines
+    bearer_token_file: /etc/vmagent/llmctl-token
+    http_sd_configs:
+      - url: http://ws:9000/metrics/sd
+        bearer_token_file: /etc/vmagent/llmctl-token
+      - url: http://orin:9000/metrics/sd
+        bearer_token_file: /etc/vmagent/llmctl-token
+```
+
+### When a model dies
+
+The gateway supervises the models in the autostart manifest that it has
+seen ready. One that crashes is restarted from its launch spec after 2, 4,
+8 … s (capped at 60 s); after 5 restarts within 10 minutes it's left down
+as `crashed`, and 10 minutes ready resets the count. `run --restart never`
+leaves it down at once, `--restart-max N` changes the limit, and serving
+files take `restart:` and `restart_max:`. `llmctl stop` takes a model out
+of the manifest first, so a stop is never mistaken for a crash, and a
+model that dies before it was ever ready (a failed load) isn't restarted.
+
+What clients see:
+
+- A call for a configured model that is down gets **503
+  `model_unavailable`** with `Retry-After`, in the OpenAI error format.
+  Other nodes' instances of the model are tried first.
+- A stream whose engine dies ends with one last SSE event,
+  `data: {"error": {"code": "model_unavailable", …}}`, and a clean end
+  of the response, instead of a cut connection.
+
+`llmctl ps` shows each model's STATE and RESTARTS (`--json` for scripts),
+including down models the gateway is restarting; `llmctl events -f` follows
+the supervisor; `/v1/models` lists down models with `status: restarting`
+or `crashed`. `scripts/chaos-test.py MODEL` kills a model mid-stream and
+checks the error arrives within 10 s and the model serves again within
+120 s.
+
+### Logs, request ids and traces
+
+```bash
+llmctl config gateway-log json                 # one JSON object per line
+llmctl config gateway-otlp http://lab:4318     # export spans (off by default)
+llmctl gateway restart                         # both take effect at a restart
+```
+
+- JSON lines have `ts`, `level`, `node`, `event` and `msg`. Each call
+  logs `event: "request"` with `request_id`, `trace_id`, `method`, `path`,
+  `model`, `backend`, `served_by`, `status`, `code`, `duration_ms`,
+  `ttft_ms`, `tokens_in`, `tokens_out`, `bytes_out` and `client`.
+  Supervisor, failover, spill, relay and cluster events have their own
+  `event`. Health checks and scrapes aren't logged.
+- No prompt or reply text is logged, in any mode. The engines don't log
+  prompts either: llmctl never passes vLLM's `--enable-log-requests`,
+  SGLang's `--log-requests` or llama-server's `--verbose`.
+- `X-Request-Id` from the client is kept (up to 128 visible characters),
+  otherwise one is made. It goes to the engine and comes back on every
+  reply, errors included.
+- The gateway continues the client's W3C `traceparent` (or starts a trace),
+  and sends each engine a `traceparent` for its upstream attempt. With an
+  OTLP endpoint it exports a server span per call and a client span per
+  attempt, from a background queue that drops spans rather than slowing
+  calls. vLLM exports its own spans when started with
+  `args: ["--otlp-traces-endpoint", "http://lab:4317"]`; the pinned image
+  includes the OpenTelemetry SDK.
+- `LLM_RUNNER_GATEWAY_LOG` and `LLM_RUNNER_GATEWAY_OTLP` override the two
+  settings.
 
 ## Configuration
 

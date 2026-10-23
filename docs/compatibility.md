@@ -28,8 +28,12 @@ against it.
   | 5 | name conflict | `install` |
   | 6 | source unreachable (`oras`/`skopeo`/docker missing, pull failed, image not on the host) | `install`, `images load`, `images save` |
 
+  `llmctl ps --json` prints `{"models": [...]}`, each with `name`, `pid`,
+  `port`, `backend`, `started_at`, `group`, `model_path`, `runtime`,
+  `state`, `restarts`, `next_restart_in`, `last_error`.
+
 - `--json` output of `install`, `verify`, `cache export`, `apply`,
-  `images`, `images load` and `images save`: the keys documented in the README keep their names, types and
+  `images`, `images load`, `images save` and (since 1.2) `ps`: the keys documented in the README keep their names, types and
   meaning. New keys may appear; parse leniently.
 
 ### File formats
@@ -38,7 +42,8 @@ against it.
   (README, "Install a model bundle"). llmctl 1.x reads schema 1. A new
   schema gets a new name; 1.x keeps reading `/1`.
 - **Serving files** for `llmctl apply`, `version: 1` (README, "Serving
-  files"). New keys may be added; existing keys keep their meaning.
+  files"). New keys may be added; existing keys keep their meaning
+  (`restart` and `restart_max` since 1.2).
 - **`images.json`**, schema `llmctl-images/1`: per backend, `image` (pinned
   by digest), `tag`, `engine_version`, `entrypoint`, `platforms`, `license`,
   and (since 1.1) `by_platform` (per platform, `manifest` and `config`
@@ -58,8 +63,20 @@ against it.
   (`{"error": {"code", "message", "type"}}`) with HTTP status codes.
 - `/healthz` (the gateway is up) and `/readyz` (200 only when every
   autostart model is ready).
+- Since 1.2: a call for a model that is configured on the node but down
+  answers **503 `model_unavailable`** (with `Retry-After` when a restart is
+  due); a stream whose engine dies ends with an SSE event
+  `data: {"error": {"code": "model_unavailable", …}}`. Before 1.2 these
+  were 404/502 and a cut stream; 1.2 treats the old behaviour as a bug.
+- `X-Request-Id` on every reply (the client's, when valid, else a new one),
+  and W3C `traceparent` continued to the engines.
+- Metrics (since 1.2): `/metrics`, `/metrics/sd` (HTTP SD JSON) and
+  `/metrics/backends/<model>`, the `llmctl_*` metric names, types and
+  labels listed in the README ("Monitoring and operations"). New metrics
+  and label values may appear; the engines' own metrics are theirs.
 - In `GET /v1/models`, each model's `llmctl` object: `backend`, `api`,
-  `port`, `path_prefix`, `status`, `group`, `model_path`, `runtime`,
+  `port`, `path_prefix`, `status` (`ready`, `loading`, `down`, and since 1.2
+  `restarting`, `crashed`), `restarts` (1.2), `group`, `model_path`, `runtime`,
   `image`, `image_digest`, `context`, `vision`, `embeddings`, `decision`,
   `parallel`, `node`, `local`, and `nodes` (each with `node`, `priority`,
   `local`, `status`, `port`, `context`, `vision`, `runtime`, `image`,
@@ -77,9 +94,14 @@ that bumps the protocol version and is a major release.
 
 - Human-readable output: tables, messages, wording, column order. Use
   `--json` where it exists.
-- Log formats, of llmctl and of the engines.
+- Log formats, of llmctl and of the engines, except the gateway's JSON
+  lines (since 1.2), whose keys are covered: `ts`, `level`, `node`, `event`,
+  `msg`, and for `event: "request"` the keys listed in the README. They
+  never contain prompt or reply text.
 - State files under the state directory (`running.json`, `autostart.json`,
-  `profiles.json`, `images.json`, `cache/`) and `config.json`. Use the commands that manage
+  `profiles.json`, `images.json`, `supervisor.json`, `events.jsonl`,
+  `cache/`) and `config.json`. Use `llmctl ps --json` and `llmctl events
+  --json`. Use the commands that manage
   them.
 - The exact engine arguments llmctl generates, and the images and engine
   versions it was tested with (`images.json`, the README's install pins).

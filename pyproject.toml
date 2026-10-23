@@ -1,6 +1,6 @@
 [project]
 name = "llm-runner"
-version = "1.2.0.dev2"
+version = "1.2.0"
 description = "Run local model servers (llama-server, vLLM, SGLang) on hosts or in containers, behind one OpenAI-compatible gateway."
 readme = "README.md"
 requires-python = ">=3.11"
