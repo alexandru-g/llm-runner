@@ -32,6 +32,9 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import json
+import os
+import re
+import uuid
 import secrets
 import signal
 import socket
@@ -47,9 +50,11 @@ from urllib.parse import unquote, urlsplit
 from llm_runner import __version__
 from llm_runner import auth
 from llm_runner import config as config_mod
+from llm_runner import logs
 from llm_runner import metrics as metrics_mod
 from llm_runner import process as proc
 from llm_runner import supervisor as sup_mod
+from llm_runner import tracing
 from llm_runner.backends import (DECIDE, DECIDER, GATEWAY, SGLANG, VLLM, hf_has_vision,
                                  is_decision_model)
 from llm_runner.cluster import (BUSY_HEADER, HEARTBEAT_EVERY, HOP_HEADER, OPENAI, PROTOCOL,
@@ -104,6 +109,8 @@ _METRICS_BACKENDS = (VLLM, SGLANG, "llama")
 # Metrics endpoints: the scrape-only token, else the API-key policy.
 METRICS_PATHS = ("/metrics", "/metrics/sd")
 _STATE_OF = {"ready": "ready", "loading": "starting", "down": "down"}
+# A client's X-Request-Id is kept when it is up to 128 visible ASCII characters.
+_REQUEST_ID = re.compile(r"[\x21-\x7e]{1,128}")
 # The flag carrying the context size in each engine's recorded command.
 _CTX_FLAGS = {VLLM: ("--max-model-len",), SGLANG: ("--context-length",)}
 
@@ -219,8 +226,9 @@ class LocalModels:
                 kind, image, digest, image_id = m.runtime
                 where = (f"docker image={image} digest={digest} image_id={image_id}"
                          if kind == "docker" else kind)
-                print(f"model {m.name}: backend={m.backend} port={m.port} runtime={where}",
-                      flush=True)
+                logs.emit(f"model {m.name}: backend={m.backend} port={m.port} runtime={where}",
+                          event="model", model=m.name, backend=m.backend, port=m.port,
+                          runtime=kind, image=image, image_digest=digest, image_id=image_id)
         self._seen = now
 
     def busy(self, name: str) -> bool:
@@ -457,6 +465,8 @@ class Gateway:
             else None
         self._last_log: tuple | None = None
         self.metrics = GatewayMetrics(self)
+        # OTLP span export, when configured (serve() sets it up).
+        self.exporter: tracing.Exporter | None = None
         # Restarts crashed models; its loop runs in serve().
         self.supervisor = sup_mod.Supervisor(
             on_restart=lambda name: self.metrics.restarts.inc(model=name, node=self.node))
@@ -593,10 +603,11 @@ class Gateway:
         direct = {n["url"]: _answers_as(n["url"], n["node"]) for n in self.view.nodes()}
         for n in self.view.nodes():
             if direct[n["url"]] != self._direct.get(n["url"], True):
-                print(f"cluster: {n['node']} at {n['url']} " +
-                      ("answers again; calling it directly" if direct[n["url"]] else
-                       f"does not answer; its calls go through the registry "
-                       f"({self.cluster.registry_url})"), flush=True)
+                logs.emit(f"cluster: {n['node']} at {n['url']} " +
+                          ("answers again; calling it directly" if direct[n["url"]] else
+                           f"does not answer; its calls go through the registry "
+                           f"({self.cluster.registry_url})"), event="cluster",
+                          level="info" if direct[n["url"]] else "warn", peer=n["node"])
         self._direct = direct
 
     def relay_url(self, c: Instance) -> str | None:
@@ -615,12 +626,13 @@ class Gateway:
             return
         self._last_log = state
         if self.view.error:
-            print(f"cluster: {self.view.error}", flush=True)
+            logs.emit(f"cluster: {self.view.error}", event="cluster", level="error")
         else:
-            print(f"cluster: node {self.node} (priority {self.priority}) at "
-                  f"{self.view.node_url}; other nodes: {', '.join(nodes) or '(none)'}", flush=True)
+            logs.emit(f"cluster: node {self.node} (priority {self.priority}) at "
+                      f"{self.view.node_url}; other nodes: {', '.join(nodes) or '(none)'}",
+                      event="cluster", nodes=nodes)
         for w in self.view.warnings:
-            print(f"cluster warning: {w}", flush=True)
+            logs.emit(f"cluster warning: {w}", event="cluster", level="warn")
 
     def run_heartbeats(self, stop: threading.Event) -> None:
         last_sent, last_mtime = 0.0, None
@@ -700,7 +712,8 @@ def make_handler(gw: Gateway):
         disable_nagle_algorithm = True
 
         def log_message(self, fmt, *args):  # one line per request, to the log file
-            print(f"{self.address_string()} {fmt % args}", flush=True)
+            if not logs.is_json():           # JSON mode writes its own (_record)
+                print(f"{self.address_string()} {fmt % args}", flush=True)
 
         # ---------------------------------------------------------- replies --
         def _json(self, status: int, payload: dict, headers: dict | None = None) -> None:
@@ -710,6 +723,7 @@ def make_handler(gw: Gateway):
             self.send_response(status)
             for k, v in (headers or {}).items():
                 self.send_header(k, v)
+            self.send_header("X-Request-Id", self._obs["rid"])
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -783,9 +797,19 @@ def make_handler(gw: Gateway):
         # ---------------------------------------------------------- routing --
         def _handle(self) -> None:
             self._replied = False
-            # What /metrics learns about this call (see _record).
+            sent_id = self.headers.get("X-Request-Id") or ""
+            # What /metrics and the request log learn about this call (_record).
             self._obs = {"t0": time.monotonic(), "count": False, "inst": None,
-                         "status": None, "code": None, "ttft": None, "usage": None}
+                         "status": None, "code": None, "ttft": None, "usage": None,
+                         "rid": sent_id if _REQUEST_ID.fullmatch(sent_id) else uuid.uuid4().hex,
+                         "failovers": 0, "bytes": 0, "trace": None}
+            self._trace = tracing.Context.from_headers(self.headers)
+            path = self.path.partition("?")[0]
+            self._span = self._trace.span(
+                f"{self.command} {path}", tracing.SERVER, **{
+                    "http.request.method": self.command, "url.path": path,
+                    "llmctl.request_id": self._obs["rid"], "llmctl.node": gw.node})
+            self._obs["trace"] = {"trace_id": self._trace.trace_id}
             try:
                 self._route()
             except Exception as e:  # never drop a connection without an answer
@@ -799,6 +823,8 @@ def make_handler(gw: Gateway):
 
         def _record(self) -> None:
             o = self._obs
+            self._log_request()
+            self._export_span()
             if not o["count"]:
                 return
             c = o["inst"]
@@ -817,6 +843,47 @@ def make_handler(gw: Gateway):
                 for direction, key in (("in", "prompt_tokens"), ("out", "completion_tokens")):
                     if isinstance(usage.get(key), int):
                         m.tokens.inc(usage[key], **lbl, direction=direction)
+
+        def _export_span(self) -> None:
+            path = self.path.partition("?")[0]
+            if gw.exporter is None or not self._trace.sampled or path in OPEN_PATHS \
+                    or path.startswith("/metrics"):
+                return
+            o, c = self._obs, self._obs["inst"]
+            usage = o["usage"] or {}
+            self._span.error = (o["status"] or 0) >= 500 or o["code"] == "model_unavailable"
+            self._span.end(**{
+                "http.response.status_code": o["status"], "error.type": o["code"],
+                "llmctl.model": c.id if c else None,
+                "llmctl.backend": c.info.get("backend") if c else None,
+                "llmctl.served_by": c.node if c else None,
+                "llmctl.ttft_ms": None if o["ttft"] is None else round(o["ttft"] * 1000, 1),
+                "gen_ai.usage.input_tokens": usage.get("prompt_tokens"),
+                "gen_ai.usage.output_tokens": usage.get("completion_tokens"),
+                "llmctl.failovers": o["failovers"] or None})
+            gw.exporter.submit(self._span)
+
+        def _log_request(self) -> None:
+            """JSON mode: one line per call, without bodies. Probes and scrapes
+            (health, /metrics) are left out."""
+            if not logs.is_json():
+                return
+            path = self.path.partition("?")[0]
+            if path in OPEN_PATHS or path.startswith("/metrics"):
+                return
+            o, c = self._obs, self._obs["inst"]
+            usage = o["usage"] or {}
+            logs.request({
+                "request_id": o["rid"], "trace_id": (o["trace"] or {}).get("trace_id"),
+                "method": self.command, "path": path,
+                "model": c.id if c else None, "backend": c.info.get("backend") if c else None,
+                "served_by": c.node if c else None, "status": o["status"], "code": o["code"],
+                "duration_ms": round((time.monotonic() - o["t0"]) * 1000, 1),
+                "ttft_ms": None if o["ttft"] is None else round(o["ttft"] * 1000, 1),
+                "tokens_in": usage.get("prompt_tokens"),
+                "tokens_out": usage.get("completion_tokens"),
+                "bytes_out": o["bytes"], "failovers": o["failovers"] or None,
+                "client": self.address_string()}, f"{self.command} {path} {o['status']}")
 
         def _metrics_ok(self) -> bool:
             """Scrapes: the scrape-only token when one is set, else the API-key
@@ -861,6 +928,7 @@ def make_handler(gw: Gateway):
             self._replied = True
             self._obs["status"] = 200
             self.send_response(200)
+            self.send_header("X-Request-Id", self._obs["rid"])
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -972,6 +1040,7 @@ def make_handler(gw: Gateway):
             self._replied = True
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
+            self.send_header("X-Request-Id", self._obs["rid"])
             self.send_header(BUSY_HEADER, "1")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -1035,8 +1104,9 @@ def make_handler(gw: Gateway):
                         busy.append(c)
                 if not busy:
                     return
-                print(f"spill: every instance of {cands[0].id} is busy; queueing on "
-                      f"{busy[0].node}", flush=True)
+                logs.emit(f"spill: every instance of {cands[0].id} is busy; queueing on "
+                          f"{busy[0].node}", event="spill", model=cands[0].id,
+                          request_id=self._obs["rid"])
                 cands = busy
             for n, c in enumerate(cands):
                 if attempt(c, n == len(cands) - 1, spill=False) == "done":
@@ -1080,9 +1150,16 @@ def make_handler(gw: Gateway):
                 extra = {HOP_HEADER: gw.node, TOKEN_HEADER: gw.token or ""}
                 if spill:
                     extra[SPILL_HEADER] = "1"
+            attempt = self._trace.span(f"upstream {c.id}", tracing.CLIENT,
+                                       parent=self._span.span_id, **{
+                                           "llmctl.model": c.id, "llmctl.node": c.node,
+                                           "server.address": host, "server.port": port})
+            extra = {**extra, "X-Request-Id": self._obs["rid"],
+                     "traceparent": self._trace.traceparent(attempt)}
             conn = (http.client.HTTPSConnection if tls else http.client.HTTPConnection)(
                 host, port, timeout=10)
             gw.metrics.in_flight.add(1, **lbl)
+            outcome = "error"
             try:
                 replaced = {k.lower() for k in extra}
                 if "authorization" in replaced:
@@ -1098,11 +1175,16 @@ def make_handler(gw: Gateway):
                     conn.sock.settimeout(None)   # a long generation is not a hang
                     conn.request(self.command, path, body=body or None, headers=headers)
                     resp = conn.getresponse()
+                    attempt.attrs["http.response.status_code"] = resp.status
                 except OSError as e:
+                    attempt.attrs["error.type"] = type(e).__name__
                     where = f"port {port}" if c.local else \
                         f"node {c.node} (via {relay})" if relay else f"node {c.node} ({c.url})"
                     if not last:
-                        print(f"failover: {c.id} on {c.node} unreachable ({e})", flush=True)
+                        logs.emit(f"failover: {c.id} on {c.node} unreachable ({e})",
+                                  event="failover", level="warn", model=c.id, peer=c.node,
+                                  reason="unreachable", request_id=self._obs["rid"])
+                        self._obs["failovers"] += 1
                         gw.metrics.failovers.inc(model=c.id, from_node=c.node,
                                                  reason="unreachable")
                         return "failed"
@@ -1124,7 +1206,10 @@ def make_handler(gw: Gateway):
                     # last heartbeat.
                     gone = resp.status == 404 and not c.local and b"model_not_found" in data
                     if resp.status in (502, 503) or gone or is_context_error(resp.status, data):
-                        print(f"failover: {c.id} on {c.node} answered {resp.status}", flush=True)
+                        logs.emit(f"failover: {c.id} on {c.node} answered {resp.status}",
+                                  event="failover", level="warn", model=c.id, peer=c.node,
+                                  reason=str(resp.status), request_id=self._obs["rid"])
+                        self._obs["failovers"] += 1
                         gw.metrics.failovers.inc(
                             model=c.id, from_node=c.node,
                             reason="gone" if gone else str(resp.status)
@@ -1133,10 +1218,16 @@ def make_handler(gw: Gateway):
                     self._relay(resp, data)
                     return "done"
                 self._relay(resp)
+                outcome = "done"
                 return "done"
             finally:
                 gw.metrics.in_flight.add(-1, **lbl)
                 conn.close()
+                if gw.exporter is not None and self._trace.sampled:
+                    status = attempt.attrs.get("http.response.status_code") or 0
+                    attempt.error = outcome != "done" or status >= 500
+                    attempt.end()
+                    gw.exporter.submit(attempt)
 
         def _relay(self, resp: http.client.HTTPResponse, data: bytes | None = None) -> None:
             self._replied = True
@@ -1151,8 +1242,9 @@ def make_handler(gw: Gateway):
             self.send_response(resp.status, resp.reason)
             length = str(len(data)) if data is not None else resp.getheader("Content-Length")
             for k, v in resp.getheaders():
-                if k.lower() not in _HOP:
+                if k.lower() not in _HOP and k.lower() != "x-request-id":
                     self.send_header(k, v)
+            self.send_header("X-Request-Id", self._obs["rid"])
             chunked = length is None and self.command != "HEAD" and resp.status not in (204, 304)
             if chunked:
                 self.send_header("Transfer-Encoding", "chunked")
@@ -1164,6 +1256,7 @@ def make_handler(gw: Gateway):
                 if data is not None:
                     keep += data
                     self.wfile.write(data)
+                    self._obs["bytes"] = len(data)
                     return
                 while True:
                     side = "upstream"
@@ -1183,6 +1276,7 @@ def make_handler(gw: Gateway):
                     else:
                         self.wfile.write(chunk)
                     sent += len(chunk)
+                    self._obs["bytes"] = sent
                 if chunked:
                     self.wfile.write(b"0\r\n\r\n")
             except (OSError, http.client.HTTPException) as e:
@@ -1190,8 +1284,10 @@ def make_handler(gw: Gateway):
                 # nothing more, and one whose upstream broke sees the stream
                 # cut short. Closing upstream (in _try) stops generation.
                 who = "client left" if side == "client" else "upstream broke"
-                print(f"relay: {who}: {self.command} {self.path} for "
-                      f"{self.address_string()} after {sent} bytes ({e!r})", flush=True)
+                logs.emit(f"relay: {who}: {self.command} {self.path} for "
+                          f"{self.address_string()} after {sent} bytes ({e!r})",
+                          event="relay", level="warn", request_id=self._obs["rid"],
+                          side=side, bytes_out=sent)
                 self._obs["code"] = "client_left" if side == "client" else "stream_aborted"
                 if side == "upstream" and stream and chunked:
                     # Say so instead of cutting the stream: one last SSE
@@ -1235,15 +1331,26 @@ def serve(port: int = DEFAULT_PORT, host: str = "0.0.0.0") -> None:
     cluster = config_mod.get_cluster()
     gw = Gateway(LocalModels(), cluster, port)
     httpd = make_server(port, host, gw)
-    print(f"llmctl gateway {__version__} on http://{host}:{port}/v1  "
-          f"(node {gw.node}, state: {proc.STATE_FILE})", flush=True)
+    cfg = config_mod.load()
+    logs.configure(os.environ.get("LLM_RUNNER_GATEWAY_LOG") or cfg.get("gateway_log_format"),
+                   gw.node)
+    endpoint = os.environ.get("LLM_RUNNER_GATEWAY_OTLP") or cfg.get("gateway_otlp_endpoint")
+    if endpoint:
+        gw.exporter = tracing.Exporter(endpoint, {"service.name": "llmctl-gateway",
+                                                  "service.version": __version__,
+                                                  "host.name": gw.node})
+        logs.emit(f"otlp: exporting gateway spans to {gw.exporter.url}", event="otlp")
+    logs.emit(f"llmctl gateway {__version__} on http://{host}:{port}/v1  "
+              f"(node {gw.node}, state: {proc.STATE_FILE})", event="start",
+              version=__version__, port=port)
     stop = threading.Event()
     if gw.cluster:
         if not gw.token:
-            print("cluster: no token set; registry and other nodes will refuse this one "
-                  "(`llmctl registry set URL --token T`)", flush=True)
+            logs.emit("cluster: no token set; registry and other nodes will refuse this one "
+                      "(`llmctl registry set URL --token T`)", event="cluster", level="warn")
         role = "registry" if gw.table else "node"
-        print(f"cluster: {role}, reporting to {gw.cluster.registry_url or 'itself'}", flush=True)
+        logs.emit(f"cluster: {role}, reporting to {gw.cluster.registry_url or 'itself'}",
+                  event="cluster")
         threading.Thread(target=gw.run_heartbeats, args=(stop,), daemon=True).start()
     threading.Thread(target=gw.supervisor.run, args=(stop,), daemon=True).start()
 
@@ -1257,4 +1364,6 @@ def serve(port: int = DEFAULT_PORT, host: str = "0.0.0.0") -> None:
     finally:
         stop.set()
         gw.goodbye()
+        if gw.exporter is not None:
+            gw.exporter.close()
         httpd.server_close()

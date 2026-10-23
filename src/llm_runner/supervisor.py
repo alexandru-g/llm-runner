@@ -31,6 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from llm_runner import logs
 from llm_runner import process as proc
 from llm_runner.backends import GATEWAY
 
@@ -112,7 +113,8 @@ class Supervisor:
             try:
                 self.tick()
             except Exception as e:  # a bad pass mustn't end supervision
-                print(f"supervisor: {type(e).__name__}: {e}", flush=True)
+                logs.emit(f"supervisor: {type(e).__name__}: {e}", event="supervisor",
+                          level="error")
 
     def _reap(self) -> None:
         for pid in list(self.children):
@@ -208,7 +210,9 @@ class Supervisor:
     def _event(self, name: str, event: str, detail: str) -> None:
         line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": name,
                 "event": event, "detail": detail}
-        print(f"supervisor: {name}: {event} ({detail})", flush=True)
+        logs.emit(f"supervisor: {name}: {event} ({detail})", event="supervisor",
+                  level="warn" if event in ("restarting", "crashed", "restart_failed")
+                  else "info", model=name, action=event, detail=detail)
         try:
             self.state_dir.mkdir(parents=True, exist_ok=True)
             with open(self.state_dir / "events.jsonl", "a") as f:

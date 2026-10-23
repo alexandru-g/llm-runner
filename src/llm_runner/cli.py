@@ -648,6 +648,46 @@ def config_gateway(port: int | None, off: bool) -> None:
                    "`llmctl gateway stop && llmctl gateway start` moves it.", err=True)
 
 
+@config.command("gateway-log")
+@click.argument("fmt", required=False, type=click.Choice(["text", "json"]))
+def config_gateway_log(fmt: str | None) -> None:
+    """Set the gateway's log format: text (default) or json (one JSON object
+    per line, for Vector/Loki/VictoriaLogs). JSON request lines carry
+    request_id, trace_id, model, status, timings and token counts, never
+    prompt or reply text. Takes effect at `llmctl gateway restart`.
+    LLM_RUNNER_GATEWAY_LOG overrides it. With no FMT, print the setting."""
+    if fmt is None:
+        click.echo(config_mod.load().get("gateway_log_format") or "text")
+        return
+    config_mod.update(gateway_log_format=None if fmt == "text" else fmt)
+    click.echo(f"gateway log format: {fmt} (from the next `llmctl gateway restart`)")
+
+
+@config.command("gateway-otlp")
+@click.argument("endpoint", required=False)
+@click.option("--clear", is_flag=True, help="Stop exporting spans.")
+def config_gateway_otlp(endpoint: str | None, clear: bool) -> None:
+    """Export the gateway's trace spans to an OpenTelemetry collector over
+    OTLP/HTTP, e.g. http://lab:4318. Off by default: nothing leaves this
+    machine. Trace context (traceparent) reaches the models either way.
+    Takes effect at `llmctl gateway restart`; LLM_RUNNER_GATEWAY_OTLP
+    overrides it. With no ENDPOINT, print the setting."""
+    if clear:
+        config_mod.update(gateway_otlp_endpoint=None)
+        click.echo("gateway span export: off (from the next `llmctl gateway restart`)")
+        return
+    if endpoint is None:
+        click.echo(config_mod.load().get("gateway_otlp_endpoint") or "off")
+        return
+    u = urllib.parse.urlsplit(endpoint)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise click.BadParameter("an http(s):// URL, e.g. http://collector:4318",
+                                 param_hint="ENDPOINT")
+    config_mod.update(gateway_otlp_endpoint=endpoint.rstrip("/"))
+    click.echo(f"gateway spans go to {endpoint.rstrip('/')}/v1/traces "
+               "(from the next `llmctl gateway restart`)")
+
+
 @config.command("bind")
 @click.argument("host", required=False)
 @click.option("--reset", is_flag=True, help=f"Back to {config_mod.DEFAULT_BIND_HOST} "

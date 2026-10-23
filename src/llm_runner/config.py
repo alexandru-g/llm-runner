@@ -13,7 +13,9 @@ Mapika/decider clone whose venv serves decider checkpoints) and
 on, default ``0.0.0.0``), ``offline`` (never reach Hugging Face; also
 ``LLM_RUNNER_OFFLINE=1``), the gateway's API key settings (``gateway_auth``,
 ``gateway_keys``, ``gateway_local_networks``, ``gateway_proxies``,
-``gateway_upstream_key`` and ``gateway_metrics_token``, see ``auth.py``), plus the cluster settings: ``node_name``, ``node_priority``,
+``gateway_upstream_key`` and ``gateway_metrics_token``, see ``auth.py``), the
+gateway's ``gateway_log_format`` and ``gateway_otlp_endpoint`` (``logs.py``,
+``tracing.py``), plus the cluster settings: ``node_name``, ``node_priority``,
 ``node_advertise``, ``registry_url``, ``cluster_token`` and
 ``registry_serve`` (see ``cluster.py``). Environment variables still
 take precedence over persisted config (see ``registry._resolve_models_dir``
