@@ -268,7 +268,7 @@ class _Menu:
         emb = self.ctx.params.get("embeddings")
         if emb is None:
             path = self.target.spec.model_path
-            emb = looks_like_embedding_model(path.stem if path.is_file() else path.name)
+            emb = looks_like_embedding_model(path.stem if path.is_file() else path.name, path)
         return _chat(self.target) and not self.target.decision and not emb
 
     def _valid(self, s: Setting, value: Any) -> bool:

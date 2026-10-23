@@ -28,7 +28,9 @@ right. ``run`` then wires it up as ``--model-draft`` for faster generation.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -94,15 +96,29 @@ class ModelSpec:
 # Substrings that mark a GGUF as an embedding model, so `run` can default to
 # --embeddings without an explicit flag. Matched case-insensitively against the
 # model's filename stem. Override either way with --embeddings/--no-embeddings.
-_EMBEDDING_NAME_HINTS = (
-    "bge", "e5", "gte", "nomic-embed", "mxbai-embed", "arctic-embed",
-    "minilm", "embed",
-)
+# Whole name tokens (split on - _ . and spaces) that mark an embedding model,
+# and token prefixes ("embedding", "embeddinggemma"). Substrings would misfire:
+# "gte" is in "imgtest", "e5" in many version strings.
+_EMBEDDING_NAME_TOKENS = frozenset({"bge", "e5", "gte", "minilm"})
+_EMBEDDING_NAME_PREFIXES = ("embed",)
+# config.json architectures that generate text; such a folder is never
+# started as an embedding model, whatever its name says.
+_GENERATIVE_ARCH = re.compile(r"For(CausalLM|ConditionalGeneration|ImageTextToText)$")
 
 
-def looks_like_embedding_model(name: str) -> bool:
-    low = name.lower()
-    return any(hint in low for hint in _EMBEDDING_NAME_HINTS)
+def looks_like_embedding_model(name: str, path: Path | None = None) -> bool:
+    """Guess embedding mode from a model's name, unless ``path`` (an HF
+    folder) declares a text-generating architecture."""
+    if path is not None and path.is_dir():
+        try:
+            archs = json.loads((path / "config.json").read_text()).get("architectures") or []
+        except (OSError, ValueError, AttributeError):
+            archs = []
+        if any(_GENERATIVE_ARCH.search(str(a)) for a in archs):
+            return False
+    tokens = [t for t in re.split(r"[-_.\s]+", name.lower()) if t]
+    return any(t in _EMBEDDING_NAME_TOKENS or t.startswith(_EMBEDDING_NAME_PREFIXES)
+               for t in tokens)
 
 
 def _find_mmproj(folder: Path) -> Path | None:

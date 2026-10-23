@@ -1072,7 +1072,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     # Default embeddings mode by filename when the user didn't force it.
     stem = model_path.stem if model_path.is_file() else model_path.name
     if embeddings is None:
-        embeddings = registry.looks_like_embedding_model(stem)
+        embeddings = registry.looks_like_embedding_model(stem, model_path)
         if embeddings:
             click.echo(f"Detected embedding model '{stem}' — starting "
                        "in --embeddings mode (use --no-embeddings to override).")

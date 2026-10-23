@@ -301,3 +301,4 @@ def test_shipped_images_carry_their_platform_ids():
         for p in e["by_platform"].values():
             assert re.fullmatch(r"sha256:[0-9a-f]{64}", p["config"])
             assert re.fullmatch(r"sha256:[0-9a-f]{64}", p["manifest"])
+
