@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -387,13 +388,17 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
     return rec
 
 
-def stop(identifier: str, *, timeout: float = 10.0) -> RunningProcess | None:
+def stop(identifier: str, *, timeout: float = 10.0,
+         keep_autostart: bool = False) -> RunningProcess | None:
+    """Stop a model. ``keep_autostart`` is for a planned restart, which
+    holds the model first (:func:`hold`) so nothing takes it for a crash."""
     target = find(identifier)
     if target is None:
         return None
     # An explicit stop means "don't autostart this next boot". Done first, so
     # the gateway's supervisor never takes the dying process for a crash.
-    autostart_remove(target.name)
+    if not keep_autostart:
+        autostart_remove(target.name)
     container = (target.runtime or {}).get("container")
     if container:
         # SIGTERM to `docker run` reaches the engine too, but a SIGKILL'd
@@ -409,6 +414,100 @@ def stop(identifier: str, *, timeout: float = 10.0) -> RunningProcess | None:
     procs = [p for p in reconcile() if p.pid != target.pid]
     _save(procs)
     return target
+
+
+# ----------------------------------------------------- planned restarts --
+# A model being restarted on purpose (`llmctl apply` swapping its files or
+# flags) is "held": the gateway answers 503 model_unavailable for it, not
+# 404, and the supervisor leaves it alone. A hold lapses by itself, so one
+# left by a killed `apply` can't pin a model down for ever.
+HOLD_TTL = 900.0
+
+
+def _holds_file(state_dir: Path | None) -> Path:
+    return (state_dir or STATE_DIR) / "holds.json"
+
+
+def holds(state_dir: Path | None = None) -> dict[str, dict]:
+    """Held models still in their time: ``{name: {reason, group, until}}``."""
+    try:
+        raw = json.loads(_holds_file(state_dir).read_text())
+    except (OSError, ValueError):
+        return {}
+    now = time.time()
+    return {n: h for n, h in raw.items() if isinstance(h, dict) and h.get("until", 0) > now}
+
+
+def hold(name: str, reason: str, *, group: str | None = None,
+         ttl: float = HOLD_TTL) -> None:
+    held = holds()
+    held[name] = {"reason": reason, "group": group or None, "until": time.time() + ttl}
+    _write_holds(held)
+
+
+def release(name: str) -> None:
+    held = holds()
+    if held.pop(name, None) is not None:
+        _write_holds(held)
+
+
+def _write_holds(held: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _holds_file(None).with_suffix(".tmp")
+    tmp.write_text(json.dumps(held, indent=2))
+    os.replace(tmp, _holds_file(None))
+
+
+# --------------------------------------------------------------- events --
+def record_event(name: str, event: str, detail: str = "", *,
+                 state_dir: Path | None = None, **fields) -> bool:
+    """Append one line to ``<state>/events.jsonl`` (``llmctl events``).
+
+    ``fields`` (pid, port, by, reason, log …) go in as keys; None is left
+    out. The same event for the same pid twice in a row is written once:
+    ``run --wait`` and the gateway's supervisor both see a model get
+    ready. Returns whether a line was written."""
+    path = (state_dir or STATE_DIR) / "events.jsonl"
+    pid = fields.get("pid")
+    if pid is not None and _last_event(path, name) == (event, pid):
+        return False
+    line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": name, "event": event,
+            "detail": detail, **{k: v for k, v in fields.items() if v is not None}}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(line) + "\n")
+    except OSError:
+        return False
+    return True
+
+
+def _last_event(path: Path, name: str) -> tuple[str, int] | None:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 16384))
+            tail = f.read().decode(errors="replace").splitlines()
+    except OSError:
+        return None
+    for raw in reversed(tail):
+        try:
+            e = json.loads(raw)
+        except ValueError:
+            continue
+        if e.get("model") == name:
+            return e.get("event"), e.get("pid")
+    return None
+
+
+def last_log(name: str) -> Path | None:
+    """The newest log of a model called ``name``, running or not."""
+    pattern = re.compile(re.escape(name) + r"-\d+-\d+\.log")
+    try:
+        logs = [p for p in LOG_DIR.iterdir() if pattern.fullmatch(p.name)]
+    except OSError:
+        return None
+    return max(logs, key=lambda p: p.stat().st_mtime, default=None)
 
 
 def _signal_group(pid: int, sig: int) -> None:

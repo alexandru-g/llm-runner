@@ -1241,6 +1241,10 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                      model_path=str(model_path), run_args=run_args,
                      backend=backend, env=env, group=group, runtime=runtime,
                      restart=restart, restart_max=restart_max)
+    by, why = (ctx.obj or {}).get("by", "run"), (ctx.obj or {}).get("reason")
+    proc.record_event(rec.name, "started", f"by {by}" + (f", {why}" if why else "")
+                      + f"; pid {rec.pid} port {rec.port}", pid=rec.pid, port=rec.port,
+                      by=by, reason=why, log=rec.log_file)
     click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  backend={backend}"
                + (f"  group={group}" if group else ""))
     rt = rec.runtime or {}
@@ -1265,8 +1269,17 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     if wait:
         # vllm/sglang load weights, profile memory and capture CUDA graphs
         # before they listen; llama-server is usually up in seconds.
-        ok = _wait_healthy(rec, timeout=600 if backend in (*HF_ENGINES, DECIDER) else 120)
-        if not ok:
+        timeout = 600 if backend in (*HF_ENGINES, DECIDER) else 120
+        t0 = time.time()
+        if _wait_healthy(rec, timeout=timeout):
+            proc.record_event(rec.name, "ready", f"pid {rec.pid} port {rec.port} after "
+                              f"{time.time() - t0:.0f} s", pid=rec.pid, port=rec.port, by=by)
+        else:
+            why = ("exited before it was ready" if not proc._alive(rec.pid)
+                   else f"not ready after {timeout} s")
+            proc.record_event(rec.name, "start_failed", f"pid {rec.pid} {why}; log "
+                              f"{rec.log_file}", pid=rec.pid, by=by, reason=why,
+                              log=rec.log_file)
             raise SystemExit(1)
     elif backend in HF_ENGINES:
         click.echo(f"Note: {backend} takes a minute or more to become ready; use "
@@ -1345,7 +1358,9 @@ def _ps_state(st: dict | None, alive: bool) -> dict:
               help="How many past events to show.")
 @click.option("--json", "as_json", is_flag=True, help="The JSON lines as written.")
 def events_cmd(follow: bool, lines: int, as_json: bool) -> None:
-    """What the gateway's supervisor did: deaths, restarts, give-ups."""
+    """What happened to models: starts (`run`, `apply`), readiness, failed
+    starts (with the log), stops, and the gateway supervisor's deaths,
+    restarts and give-ups."""
     path = proc.STATE_DIR / "events.jsonl"
 
     def show(line: str) -> None:
@@ -1462,11 +1477,17 @@ def stop(identifier: str | None) -> None:
     if rec is None:
         raise click.UsageError(f"No running model matches '{identifier}'.")
     click.echo(f"Stopped {rec.name}  pid={rec.pid}  port={rec.port}")
+    stopped = [rec]
     # A decision endpoint is useless without its model: take it down too.
     if rec.backend != backends.DECIDE:
         for p in _proxy_attached_to(rec.port):
             proc.stop(str(p.pid))
             click.echo(f"Stopped {p.name}  pid={p.pid}  port={p.port}")
+            stopped.append(p)
+    for p in stopped:
+        if p.backend != GATEWAY:
+            proc.record_event(p.name, "stopped", f"by stop; pid {p.pid}", pid=p.pid,
+                              port=p.port, by="stop")
     # The gateway came up with the first model and goes down with the last,
     # unless this machine is in a cluster (it still routes to the others).
     gw = _gateway_record()
@@ -1523,7 +1544,8 @@ def logs(identifier: str | None, lines: int, follow: bool) -> None:
     """Print the tail of a running model's log.
 
     With no IDENTIFIER: if exactly one model is running, tail its log;
-    otherwise show an interactive picker.
+    otherwise show an interactive picker. A NAME that isn't running shows
+    its last log (a failed start, a stopped model).
     """
     if identifier is None:
         running = _models_running()
@@ -1536,8 +1558,14 @@ def logs(identifier: str | None, lines: int, follow: bool) -> None:
     else:
         target = proc.find(identifier)
         if target is None:
-            raise click.UsageError(f"No running model matches '{identifier}'.")
-    log_path = Path(target.log_file)
+            last = proc.last_log(identifier)
+            if last is None:
+                raise click.UsageError(f"No running model matches '{identifier}', "
+                                       "and it has no log.")
+            click.echo(f"({identifier} is not running; its last log, {last}, from "
+                       f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last.stat().st_mtime))})",
+                       err=True)
+    log_path = Path(target.log_file) if target is not None else last
     if not log_path.exists():
         raise click.UsageError(f"Log file missing: {log_path}")
 
@@ -3061,13 +3089,23 @@ def apply_cmd(files: tuple[Path, ...], dry_run: bool, prune: bool, wait: bool,
     if not dry_run:
         out = sys.stderr if as_json else sys.stdout
         for a in [a for a in actions if a.action in ("stop", "restart")]:
-            proc.stop(a.name)
+            # A restart is planned: held, so callers get 503 (not 404) until
+            # the new instance is up, and kept in autostart meanwhile.
+            planned = a.action == "restart"
+            if planned and (old := proc.find(a.name)) is not None:
+                proc.hold(a.name, f"llmctl apply: {a.reason}", group=old.group)
+            rec = proc.stop(a.name, keep_autostart=planned)
+            if rec is not None:
+                proc.record_event(a.name, "stopped", f"by apply, {a.action}: {a.reason}; "
+                                  f"pid {rec.pid}", pid=rec.pid, port=rec.port, by="apply",
+                                  reason=f"{a.action}: {a.reason}")
         for a in [a for a in actions if a.action in ("start", "restart")]:
             say(f"\n==> llmctl run {shlex.join(a.argv)}")
             try:
                 with contextlib.redirect_stdout(out):
                     run.main(args=[*a.argv, "--wait" if wait else "--no-wait"],
-                             prog_name="llmctl run", standalone_mode=False)
+                             prog_name="llmctl run", standalone_mode=False,
+                             obj={"by": "apply", "reason": f"{a.action}: {a.reason}"})
             except SystemExit as ex:
                 if ex.code:
                     a.action, a.reason, failed = "error", "did not become healthy", True
@@ -3075,6 +3113,8 @@ def apply_cmd(files: tuple[Path, ...], dry_run: bool, prune: bool, wait: bool,
                 a.action, a.reason, failed = "error", ex.format_message(), True
             except Exception as ex:          # one bad entry never stops the rest
                 a.action, a.reason, failed = "error", str(ex), True
+            finally:
+                proc.release(a.name)
             if a.action == "error":
                 say(f"error: {a.name}: {a.reason}")
     if as_json:

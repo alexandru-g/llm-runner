@@ -935,7 +935,9 @@ For a proxy or Compose health check, `GET /healthz` answers while the gateway
 is up, and `GET /readyz` answers 200 only when every model in the autostart
 manifest is running and ready (503 with each model's status otherwise). A
 crashed model stays in the manifest, so it turns readiness off until the
-gateway restarts it (see "Monitoring and operations").
+gateway restarts it (see "Monitoring and operations"). A gateway with no
+model declared and none running answers 503 too, because it has nothing
+to serve.
 
 ### Who can reach the gateway: bind address and API keys
 
@@ -1335,21 +1337,44 @@ as `crashed`, and 10 minutes ready resets the count. `run --restart never`
 leaves it down at once, `--restart-max N` changes the limit, and serving
 files take `restart:` and `restart_max:`. `llmctl stop` takes a model out
 of the manifest first, so a stop is never mistaken for a crash, and a
-model that dies before it was ever ready (a failed load) isn't restarted.
+model that dies before it was ever ready (a failed load) isn't restarted:
+it gets a `start_failed` event naming its log.
+
+A planned restart is not a crash either. When `llmctl apply` restarts a
+model (new files, new flags), it holds the model first: the supervisor
+leaves it alone, and the model is supervised again once the new instance
+is ready. Callers never see it vanish, because the gateway answers 503
+until the new instance is ready.
 
 What clients see:
 
 - A call for a configured model that is down gets **503
   `model_unavailable`** with `Retry-After`, in the OpenAI error format.
-  Other nodes' instances of the model are tried first.
+  Other nodes' instances of the model are tried first. The same goes for
+  a model that `apply` is restarting (`Retry-After: 30`) and one whose
+  engine is still loading (`Retry-After: 10`), never a 404 in between.
 - A stream whose engine dies ends with one last SSE event,
   `data: {"error": {"code": "model_unavailable", …}}`, and a clean end
   of the response, instead of a cut connection.
 
 `llmctl ps` shows each model's STATE and RESTARTS (`--json` for scripts),
-including down models the gateway is restarting; `llmctl events -f` follows
-the supervisor; `/v1/models` lists down models with `status: restarting`
-or `crashed`. `scripts/chaos-test.py MODEL` kills a model mid-stream and
+including down models the gateway is restarting; `/v1/models` lists down
+models with `status: restarting` or `crashed`.
+
+`llmctl events [-f] [--json]` lists what happened to models, one JSON line
+each in `<state>/events.jsonl`:
+
+| event | when | by |
+|---|---|---|
+| `started` | a model was launched (pid, port, log) | `run`, `apply` |
+| `ready` | it answered `/health` | `run --wait`, `apply --wait`, `supervisor` |
+| `start_failed` | it exited, or wasn't ready in time, before it was ever ready (log) | `run --wait`, `apply --wait`, `supervisor` |
+| `stopped` | it was stopped on purpose (`apply` gives the reason) | `stop`, `apply` |
+| `restarting`, `restarted`, `restart_failed`, `crashed`, `starting`, `forgotten` | crash handling | `supervisor` |
+
+Each line has `ts`, `model`, `event` and `detail`, plus `pid`, `port`,
+`by`, `reason` and `log` when they apply. `llmctl logs NAME` shows the last
+log of a model that isn't running, such as one that failed to start. `scripts/chaos-test.py MODEL` kills a model mid-stream and
 checks the error arrives within 10 s and the model serves again within
 120 s.
 

@@ -5,6 +5,36 @@ All notable changes to llm-runner (`llmctl`). The format follows
 [semantic versioning](https://semver.org); what the version protects is in
 [docs/compatibility.md](docs/compatibility.md).
 
+## [Unreleased]
+
+### Fixed
+
+- `llmctl apply` restarting a model no longer makes the gateway answer 404
+  `model_not_found` between stopping the old instance and starting the new
+  one. The model is held for the restart, and calls get 503
+  `model_unavailable` with `Retry-After: 30` until the new instance is
+  ready. A held model stays in the autostart manifest, and the supervisor
+  leaves it alone.
+- A local engine that answers 503 while it loads (llama-server's "Loading
+  model") now gives callers the gateway's 503 `model_unavailable` with
+  `Retry-After: 10`, as a model that isn't listening yet does.
+- The supervisor takes an instance started by someone else (`apply`, `run`)
+  as a new one. Before, if the swap happened between two of its checks,
+  it counted the new instance as the old, ready one. That skipped the new
+  instance's `ready` event, and a failed new instance would have been
+  restarted as if it had crashed.
+
+### Added
+
+- `llmctl events` lists more than the supervisor's actions. It now also
+  shows `started`, `ready`, `start_failed` and `stopped` from `run`,
+  `apply` and `stop`. Events carry `pid`, `port`, `by`, `reason` and `log`
+  keys where they apply. A start that fails names its log in a
+  `start_failed` event, including one under `apply --no-wait`, which the
+  supervisor reports.
+- `llmctl logs NAME` shows the last log of a model that isn't running, for
+  example one whose start failed.
+
 ## [1.2.0] - 2026-10-23
 
 Monitoring and operations: metrics, crash recovery, structured logs and

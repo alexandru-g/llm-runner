@@ -3,8 +3,11 @@
 A model is supervised when it is in the autostart manifest (every ``run``
 puts it there; ``llmctl stop`` takes it out first, so a stop is never
 mistaken for a crash) and this gateway has seen it ready. One that dies
-before it was ever ready is a failed start, not a crash: it is left alone,
-as are manifest entries at boot, which ``llmctl restore`` starts.
+before it was ever ready is a failed start, not a crash: it gets a
+``start_failed`` event naming its log and is left alone, as are manifest
+entries at boot, which ``llmctl restore`` starts. A model held for a planned
+restart (``process.hold``, by ``llmctl apply``) is not watched until the
+hold ends, and is then new: it must get ready again to be supervised.
 
 Policy per model (``run --restart``, ``--restart-max``, the same keys in
 serving files): ``on-failure`` (the default) restarts with exponential
@@ -69,6 +72,7 @@ class Tracked:
     total_restarts: int = 0
     next_at: float | None = None
     last_error: str | None = None
+    log: str | None = None
 
 
 class Supervisor:
@@ -128,10 +132,15 @@ class Supervisor:
     def tick(self) -> None:
         self._reap()
         now = self.clock()
-        live = {p.name: p for p in proc.list_running() if p.backend != GATEWAY}
-        specs = {s.name: s for s in proc.autostart_list() if s.backend != GATEWAY}
+        held = proc.holds(self.state_dir)
+        live = {p.name: p for p in proc.list_running()
+                if p.backend != GATEWAY and p.name not in held}
+        specs = {s.name: s for s in proc.autostart_list()
+                 if s.backend != GATEWAY and s.name not in held}
         due: list[str] = []
         with self._lock:
+            for name in held:
+                self.tracked.pop(name, None)
             for name in list(self.tracked):
                 if name not in specs and name not in live:
                     t = self.tracked.pop(name)
@@ -139,15 +148,20 @@ class Supervisor:
                         self._event(name, "forgotten", "no longer in autostart (stopped)")
             for name, p in live.items():
                 t = self.tracked.setdefault(name, Tracked(name))
+                if t.pid is not None and t.pid != p.pid and p.pid not in self.children:
+                    # Replaced by someone else (`apply`, `run`) between two
+                    # ticks: a new instance, supervised once it is ready.
+                    t = self.tracked[name] = Tracked(name, total_restarts=t.total_restarts)
                 if t.pid != p.pid:
-                    t.pid, t.ready_since = p.pid, None
+                    t.pid, t.ready_since, t.log = p.pid, None, p.log_file
                     if t.state in DOWN_STATES:
                         t.state = STARTING
-                        self._event(name, STARTING, f"pid {p.pid}")
+                        self._event(name, STARTING, f"pid {p.pid}", pid=p.pid, port=p.port)
                 if self.health(p.port):
                     if t.state != READY:
                         t.state, t.ready_since, t.seen_ready = READY, now, True
-                        self._event(name, READY, f"pid {p.pid} port {p.port}")
+                        self._event(name, READY, f"pid {p.pid} port {p.port}",
+                                    pid=p.pid, port=p.port)
                     elif t.ready_since is not None and now - t.ready_since >= WINDOW:
                         t.restarts.clear()
                 elif t.state == READY:
@@ -156,18 +170,25 @@ class Supervisor:
                 if name in live:
                     continue
                 t = self.tracked.get(name)
+                if t is not None and not t.seen_ready and t.pid is not None:
+                    self.tracked.pop(name)       # died before it was ever ready
+                    self._event(name, "start_failed", f"pid {t.pid} exited before it was "
+                                f"ready; log {t.log}", pid=t.pid, log=t.log)
+                    continue
                 if t is None or not t.seen_ready:
-                    continue                     # never ready here: boot, or a failed start
+                    continue                     # never seen here: boot, or after a failed start
                 t.restarts = [r for r in t.restarts if now - r < WINDOW]
                 if t.state not in DOWN_STATES:
-                    t.pid, t.ready_since = None, None
+                    dead, t.pid, t.ready_since = t.pid, None, None
                     if getattr(spec, "restart", ON_FAILURE) == NEVER:
                         t.state = CRASHED
-                        self._event(name, CRASHED, "died; restart policy is never")
+                        self._event(name, CRASHED, "died; restart policy is never",
+                                    pid=dead, log=t.log)
                         continue
                     t.state, t.next_at = RESTARTING, now + backoff(len(t.restarts))
                     self._event(name, RESTARTING,
-                                f"died; restart in {backoff(len(t.restarts)):.0f} s")
+                                f"died; restart in {backoff(len(t.restarts)):.0f} s",
+                                pid=dead, log=t.log)
                 if t.state == RESTARTING:
                     limit = getattr(spec, "restart_max", DEFAULT_MAX) or DEFAULT_MAX
                     if len(t.restarts) >= limit:
@@ -199,26 +220,22 @@ class Supervisor:
                 self._event(name, "restart_failed", status)
             else:
                 t.state, t.last_error = STARTING, None
-                self._event(name, "restarted", status)
                 pid = status.partition("pid=")[2].split(" ")[0]
+                self._event(name, "restarted", status,
+                            pid=int(pid) if pid.isdigit() else None, port=port)
                 if pid.isdigit():
                     self.children.add(int(pid))
         if self.on_restart:
             self.on_restart(name)
 
     # ------------------------------------------------------------- output --
-    def _event(self, name: str, event: str, detail: str) -> None:
-        line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": name,
-                "event": event, "detail": detail}
+    def _event(self, name: str, event: str, detail: str, **fields) -> None:
         logs.emit(f"supervisor: {name}: {event} ({detail})", event="supervisor",
-                  level="warn" if event in ("restarting", "crashed", "restart_failed")
-                  else "info", model=name, action=event, detail=detail)
-        try:
-            self.state_dir.mkdir(parents=True, exist_ok=True)
-            with open(self.state_dir / "events.jsonl", "a") as f:
-                f.write(json.dumps(line) + "\n")
-        except OSError:
-            pass
+                  level="warn" if event in ("restarting", "crashed", "restart_failed",
+                                            "start_failed") else "info",
+                  model=name, action=event, detail=detail, **fields)
+        proc.record_event(name, event, detail, state_dir=self.state_dir, by="supervisor",
+                          **fields)
 
     def snapshot(self) -> dict:
         now = self.clock()

@@ -62,12 +62,19 @@ against it.
   per-model prefixes `/m/<name>/...`, and its error format
   (`{"error": {"code", "message", "type"}}`) with HTTP status codes.
 - `/healthz` (the gateway is up) and `/readyz` (200 only when every
-  autostart model is ready).
+  autostart model is ready; 503 when no model is declared or running).
 - Since 1.2: a call for a model that is configured on the node but down
   answers **503 `model_unavailable`** (with `Retry-After` when a restart is
   due); a stream whose engine dies ends with an SSE event
   `data: {"error": {"code": "model_unavailable", …}}`. Before 1.2 these
   were 404/502 and a cut stream; 1.2 treats the old behaviour as a bug.
+  Since 1.3 the same 503 also covers a model that `llmctl apply` is
+  restarting, which used to get a 404 for a moment, and a local engine
+  that answers its own 503 while it loads.
+- Since 1.3: `llmctl events --json` lines. Each has `ts`, `model`, `event`
+  and `detail`, and `pid`, `port`, `by`, `reason` and `log` when known.
+  The event names are those in the README table. New events and keys may
+  be added in a minor release.
 - `X-Request-Id` on every reply (the client's, when valid, else a new one),
   and W3C `traceparent` continued to the engines.
 - Metrics (since 1.2): `/metrics`, `/metrics/sd` (HTTP SD JSON) and
@@ -100,7 +107,7 @@ that bumps the protocol version and is a major release.
   never contain prompt or reply text.
 - State files under the state directory (`running.json`, `autostart.json`,
   `profiles.json`, `images.json`, `supervisor.json`, `events.jsonl`,
-  `cache/`) and `config.json`. Use `llmctl ps --json` and `llmctl events
+  `holds.json`, `cache/`) and `config.json`. Use `llmctl ps --json` and `llmctl events
   --json`. Use the commands that manage
   them.
 - The exact engine arguments llmctl generates, and the images and engine

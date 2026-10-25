@@ -109,6 +109,10 @@ _METRICS_BACKENDS = (VLLM, SGLANG, "llama")
 # Metrics endpoints: the scrape-only token, else the API-key policy.
 METRICS_PATHS = ("/metrics", "/metrics/sd")
 _STATE_OF = {"ready": "ready", "loading": "starting", "down": "down"}
+# Retry-After for a model held for a planned restart (`llmctl apply`), and
+# for one whose engine says it is still loading.
+HELD_RETRY_AFTER = 30
+LOADING_RETRY_AFTER = 10
 # A client's X-Request-Id is kept when it is up to 128 visible ASCII characters.
 _REQUEST_ID = re.compile(r"[\x21-\x7e]{1,128}")
 # The flag carrying the context size in each engine's recorded command.
@@ -288,10 +292,10 @@ class LocalModels:
                     pass
         return total
 
-    def status(self, m: Model) -> str:
+    def status(self, m: Model, fresh: bool = False) -> str:
         now = time.monotonic()
         hit = self._health.get(m.port)
-        if hit and now - hit[0] < HEALTH_TTL:
+        if hit and now - hit[0] < HEALTH_TTL and not fresh:
             return hit[1]
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{m.port}/health", timeout=1) as r:
@@ -738,21 +742,37 @@ def make_handler(gw: Gateway):
                                           "param": "model" if "model" in code else None,
                                           "code": code}}, headers)
 
-        def _unavailable(self, name: str, why: str) -> None:
+        def _unavailable(self, name: str, down: tuple[str, int | None]) -> None:
             """503 for a model that is configured here but not answering."""
-            wait = gw.supervisor.retry_after(name)
+            why, wait = down
             self._error(503, "model_unavailable", f"{name} is unavailable: {why}",
                         {"Retry-After": str(wait)} if wait is not None else None)
 
-        def _configured_down(self, name: str | None) -> str | None:
+        def _configured_down(self, name: str | None) -> tuple[str, int | None] | None:
             """Why ``name`` (a model or group in this machine's autostart
-            manifest) isn't running, or None if it isn't configured here."""
+            manifest, or one held for a planned restart) isn't running, and
+            the Retry-After to send; None if it isn't configured here."""
             if not name:
                 return None
+            if held := self._held(name):
+                return held
             for spec in proc.autostart_list():
                 if spec.backend != GATEWAY and name in (spec.name, spec.group):
                     t = gw.supervisor.state(spec.name)
-                    return f"it is {t.state}" if t else "it is not running"
+                    return (f"it is {t.state}" if t else "it is not running",
+                            gw.supervisor.retry_after(spec.name))
+            return None
+
+        @staticmethod
+        def _loading(name: str) -> bool:
+            m = next((m for m in gw.local.models() if m.name == name), None)
+            return m is not None and gw.local.status(m, fresh=True) == "loading"
+
+        @staticmethod
+        def _held(name: str) -> tuple[str, int] | None:
+            for held, h in proc.holds().items():
+                if name in (held, h.get("group")):
+                    return f"it is being restarted ({h.get('reason')})", HELD_RETRY_AFTER
             return None
 
         def _body(self) -> bytes | None:
@@ -964,8 +984,8 @@ def make_handler(gw: Gateway):
                 insts = gw.instances(local_only=hop)
                 cands = order([i for i in insts if name in (i.id, i.group)
                                and (node is None or i.node == node)])
-                if not cands and node is None and (why := self._configured_down(name)):
-                    return self._unavailable(name, why)
+                if not cands and node is None and (down := self._configured_down(name)):
+                    return self._unavailable(name, down)
                 if not cands:
                     where = f" on node \"{node}\"" if node else ""
                     return self._error(404, "model_not_found",
@@ -1012,8 +1032,8 @@ def make_handler(gw: Gateway):
             except Unroutable as e:
                 name, pin = split_pin(requested) if isinstance(requested, str) else (None, None)
                 if e.code == "model_not_found" and pin is None and \
-                        (why := self._configured_down(name)):
-                    return self._unavailable(name, why)
+                        (down := self._configured_down(name)):
+                    return self._unavailable(name, down)
                 return self._error(e.status, e.code, e.message)
             if hop and self.headers.get(SPILL_HEADER) == "1":
                 cands = [c for c in cands if not gw.local.busy(c.id)]
@@ -1189,7 +1209,9 @@ def make_handler(gw: Gateway):
                                                  reason="unreachable")
                         return "failed"
                     if c.local:
-                        self._unavailable(c.id, f"its server ({where}) is not answering")
+                        self._unavailable(c.id, self._held(c.id) or (
+                            f"its server ({where}) is not answering",
+                            gw.supervisor.retry_after(c.id)))
                     else:
                         self._error(502, "upstream_unavailable",
                                     f"{c.id} ({where}) is not answering: {e}")
@@ -1197,6 +1219,15 @@ def make_handler(gw: Gateway):
                 if spill and resp.status == 503 and resp.getheader(BUSY_HEADER):
                     resp.read()
                     return "busy"
+                if last and c.local and resp.status == 503 and (down := self._held(c.id) or (
+                        ("it is loading", LOADING_RETRY_AFTER) if self._loading(c.id) else None)):
+                    # The engine's own "Loading model" (llama-server answers
+                    # while it loads; vLLM doesn't listen yet): the same 503
+                    # as for any model that is coming back.
+                    resp.read()
+                    attempt.attrs["error.type"] = "loading"
+                    self._unavailable(c.id, down)
+                    return "done"
                 length = resp.getheader("Content-Length")
                 if not last and (resp.status in (502, 503) or (
                         resp.status in (400, 404, 413, 422) and length is not None
