@@ -1851,11 +1851,6 @@ def _proxy_attached_to(port: int) -> list[proc.RunningProcess]:
               help="Backend calls in flight per request (default: the model's --parallel).")
 @click.option("--wait/--no-wait", "wait", default=True, show_default=True,
               help="Wait until the endpoint is up (it self-tests the GGUF first).")
-@click.option("--profile", "profile", default=None, metavar="NAME",
-              help="Set the launch options from a profile: last, default, fast, "
-                   "long, multi, serve, lean, or one saved from the menu (`llmctl "
-                   "profile list`). Flags typed alongside it win. With the menu, "
-                   "the menu opens on it.")
 @click.option("--extra", "-X", "extra", multiple=True,
               help="Extra argument(s) for `systemone-proxy serve`.")
 def decide_start(identifier: str | None, port: int | None, profile: str | None, cache: str,
