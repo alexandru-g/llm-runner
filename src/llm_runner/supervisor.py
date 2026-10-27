@@ -235,8 +235,9 @@ class Supervisor:
                   level="warn" if event in ("restarting", "crashed", "restart_failed",
                                             "start_failed") else "info",
                   model=name, action=event, detail=detail, **fields)
+        spec = proc.autostart_find(name)
         proc.record_event(name, event, detail, state_dir=self.state_dir, by="supervisor",
-                          **fields)
+                          owner=spec.owner if spec else None, **fields)
 
     def snapshot(self) -> dict:
         now = self.clock()

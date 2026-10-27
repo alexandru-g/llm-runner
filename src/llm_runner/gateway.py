@@ -87,6 +87,7 @@ class Model:
     # (kind, image, digest, image_id); kind "host" for every record without
     # a runtime. image_id is what docker ran (an archive-loaded image runs by ID).
     runtime: tuple[str, str | None, str | None, str | None] = ("host", None, None, None)
+    owner: str | None = None             # `run --owner`
 
     @property
     def api(self) -> str:
@@ -214,7 +215,8 @@ class LocalModels:
                 self._records = [
                     Model(r["name"], r["pid"], r["port"], r.get("backend", "llama"),
                           r.get("started_at", 0.0), r.get("model_path", ""),
-                          tuple(r.get("cmd", ())), _group_of(r), _runtime_of(r))
+                          tuple(r.get("cmd", ())), _group_of(r), _runtime_of(r),
+                          r.get("owner"))
                     for r in raw if r.get("backend") != GATEWAY]
                 self._log_new(self._records)
             records = list(self._records)
@@ -326,7 +328,7 @@ class LocalModels:
     def describe(self, m: Model, models: list[Model] | None = None) -> dict:
         info: dict = {"backend": m.backend, "api": m.api, "port": m.port,
                       "path_prefix": f"/m/{m.name}", "status": self.status(m),
-                      "group": m.group or None, "model_path": m.model_path,
+                      "group": m.group or None, "owner": m.owner, "model_path": m.model_path,
                       "runtime": m.runtime[0], "image": m.runtime[1],
                       "image_digest": m.runtime[2], "image_id": m.runtime[3]}
         if m.backend == DECIDE:

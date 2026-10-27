@@ -182,7 +182,11 @@ def _run_option_args(ctx: click.Context) -> list[str]:
     for p in ctx.command.params:
         if not isinstance(p, click.Option) or p.name in ("port", "wait", "menu", "profile"):
             continue
-        if ctx.get_parameter_source(p.name) != src:
+        source = ctx.get_parameter_source(p.name)
+        # An owner from $LLMCTL_OWNER is kept too, so a restart from elsewhere
+        # doesn't drop it.
+        if source != src and not (p.name == "owner" and
+                                  source == click.core.ParameterSource.ENVIRONMENT):
             continue
         val = ctx.params[p.name]
         if p.is_flag:
@@ -915,6 +919,10 @@ def profile_rm(name: str) -> None:
               help="Second name the gateway routes by, shared by interchangeable "
                    "models (e.g. every quant of one model, across machines). Default: "
                    "the model's folder, e.g. gemma-4-26b-a4b-it. 'none' for no group.")
+@click.option("--owner", "owner", default=None, envvar="LLMCTL_OWNER", metavar="TAG",
+              help="Who is starting it, e.g. a session's name (A1). Shown in `llmctl ps` "
+                   "and `llmctl events`, and kept across restarts. Default: "
+                   "$LLMCTL_OWNER, else none.")
 @click.option("--wait/--no-wait", "wait", default=False,
               help="Block until the server answers /health (or exits). Handy for "
                    "vllm/sglang, which take a minute or more to load and compile.")
@@ -1056,7 +1064,7 @@ def profile_rm(name: str) -> None:
 @click.pass_context
 def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         ctx_size: int | None, ft_path: Path | None, ft_name: str | None,
-        group_name: str | None, wait: bool, menu: bool | None, profile: str | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
+        group_name: str | None, owner: str | None, wait: bool, menu: bool | None, profile: str | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
         runtime_kind: str | None, image: str | None, allow_tag: bool, dns: str | None, gpu: str | None,
         restart: str | None, restart_max: int | None,
         kv_cache_mem: str | None,
@@ -1267,6 +1275,10 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     if group_name is not None and group_name.lower() != "none" and \
             not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", group_name):
         raise click.UsageError("A group name is letters, digits, '.', '_' and '-'.")
+    if owner is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.:@/-]{0,63}", owner):
+        raise click.UsageError("An owner tag is up to 64 letters, digits, spaces and "
+                               "'_.:@/-', starting with a letter or digit.")
+    owner = owner or None
     if group_name is None:
         group = "" if ft_path else registry.default_group(model_path)
     else:
@@ -1276,11 +1288,11 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     rec = proc.start(name=name, cmd=cmd, port=chosen_port,
                      model_path=str(model_path), run_args=run_args,
                      backend=backend, env=env, group=group, runtime=runtime,
-                     restart=restart, restart_max=restart_max)
+                     restart=restart, restart_max=restart_max, owner=owner)
     by, why = (ctx.obj or {}).get("by", "run"), (ctx.obj or {}).get("reason")
     proc.record_event(rec.name, "started", f"by {by}" + (f", {why}" if why else "")
                       + f"; pid {rec.pid} port {rec.port}", pid=rec.pid, port=rec.port,
-                      by=by, reason=why, log=rec.log_file)
+                      by=by, reason=why, log=rec.log_file, owner=owner)
     click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  backend={backend}"
                + (f"  group={group}" if group else ""))
     rt = rec.runtime or {}
@@ -1309,13 +1321,14 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         t0 = time.time()
         if _wait_healthy(rec, timeout=timeout):
             proc.record_event(rec.name, "ready", f"pid {rec.pid} port {rec.port} after "
-                              f"{time.time() - t0:.0f} s", pid=rec.pid, port=rec.port, by=by)
+                              f"{time.time() - t0:.0f} s", pid=rec.pid, port=rec.port, by=by,
+                              owner=owner)
         else:
             why = ("exited before it was ready" if not proc._alive(rec.pid)
                    else f"not ready after {timeout} s")
             proc.record_event(rec.name, "start_failed", f"pid {rec.pid} {why}; log "
                               f"{rec.log_file}", pid=rec.pid, by=by, reason=why,
-                              log=rec.log_file)
+                              log=rec.log_file, owner=owner)
             raise SystemExit(1)
     elif backend in HF_ENGINES:
         click.echo(f"Note: {backend} takes a minute or more to become ready; use "
@@ -1342,7 +1355,7 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
     states = supervisor.read_states()
     live = {p.name for p in procs}
     rows = [{"name": p.name, "pid": p.pid, "port": p.port, "backend": p.backend,
-             "started_at": p.started_at, "group": p.group or None,
+             "started_at": p.started_at, "group": p.group or None, "owner": p.owner,
              "model_path": p.model_path, "runtime": p.runtime,
              **_ps_state(states.get(p.name), alive=True)} for p in procs]
     specs = {s.name: s for s in proc.autostart_list()}
@@ -1350,7 +1363,7 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
         if name not in live and st.get("state") in supervisor.DOWN_STATES and name in specs:
             sp = specs[name]
             rows.append({"name": name, "pid": None, "port": sp.port, "backend": sp.backend,
-                         "started_at": None, "group": sp.group or None,
+                         "started_at": None, "group": sp.group or None, "owner": sp.owner,
                          "model_path": sp.model_path, "runtime": sp.runtime,
                          **_ps_state(st, alive=False)})
     if as_json:
@@ -1360,7 +1373,7 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
         click.echo("(no models running)")
         return
     click.echo(f"{'PID':<8} {'PORT':<6} {'BACKEND':<8} {'STARTED':<20} {'NAME':<28} "
-               f"{'STATE':<11} {'RESTARTS':<8} RUNTIME")
+               f"{'STATE':<11} {'RESTARTS':<8} {'OWNER':<10} RUNTIME")
     click.echo("-" * 120)
     for r in rows:
         started = (dt.datetime.fromtimestamp(r["started_at"]).strftime("%Y-%m-%d %H:%M:%S")
@@ -1369,7 +1382,7 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
         if r["next_restart_in"] is not None:
             state += f" ({r['next_restart_in']:.0f}s)"
         click.echo(f"{r['pid'] or '-':<8} {r['port']:<6} {r['backend']:<8} {started:<20} "
-                   f"{r['name']:<28} {state:<11} {r['restarts']:<8} "
+                   f"{r['name']:<28} {state:<11} {r['restarts']:<8} {r['owner'] or '-':<10} "
                    f"{_runtime_label(r['runtime'])}")
     gw = _gateway_record()
     if gw:
@@ -1408,7 +1421,7 @@ def events_cmd(follow: bool, lines: int, as_json: bool) -> None:
         except ValueError:
             return
         click.echo(f"{e.get('ts', '')}  {e.get('model', ''):<28} {e.get('event', ''):<15} "
-                   f"{e.get('detail', '')}")
+                   f"{e.get('detail', '')}" + (f"  [owner {e['owner']}]" if e.get("owner") else ""))
     try:
         with open(path) as f:
             for line in f.readlines()[-lines:] if lines > 0 else []:
@@ -1523,7 +1536,7 @@ def stop(identifier: str | None) -> None:
     for p in stopped:
         if p.backend != GATEWAY:
             proc.record_event(p.name, "stopped", f"by stop; pid {p.pid}", pid=p.pid,
-                              port=p.port, by="stop")
+                              port=p.port, by="stop", owner=p.owner)
     # The gateway came up with the first model and goes down with the last,
     # unless this machine is in a cluster (it still routes to the others).
     gw = _gateway_record()
@@ -1792,7 +1805,7 @@ def _restart_one(ctx: click.Context, identifier: str,
         rec = proc.start(name=spec.name, cmd=cmd, port=spec.port,
                          model_path=spec.model_path, backend=spec.backend,
                          env=spec.env, group=spec.group, restart=spec.restart,
-                         restart_max=spec.restart_max)
+                         restart_max=spec.restart_max, owner=spec.owner)
         click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}")
         return rec
 
@@ -1899,7 +1912,7 @@ def decide_start(identifier: str | None, port: int | None, profile: str | None, 
            "--concurrency", str(concurrency), "--cache", cache,
            *[tok for chunk in extra for tok in shlex.split(chunk)]]
     rec = proc.start(name=name, cmd=cmd, port=chosen_port, model_path=target.model_path,
-                     backend=backends.DECIDE,
+                     backend=backends.DECIDE, owner=target.owner,
                      group=f"{base}.decide" if (base := registry.group_of(
                          target.name, target.backend, target.model_path, target.group)) else "")
     click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  profile={profile}")
@@ -3060,7 +3073,7 @@ def _plan_apply(entries: list, prune: bool) -> tuple[list, list[str]]:
             action, why = "restart", "running without a launch record"
         elif spec.port != e.port or rec.port != e.port:
             action, why = "restart", f"port {rec.port} -> {e.port}"
-        elif spec.run_args != desired:
+        elif apply_mod.without_owner(spec.run_args) != apply_mod.without_owner(desired):
             action, why = "restart", apply_mod.diff_args(spec.run_args, desired)
         elif not _same_runtime(rec.runtime, desired_rt):
             action, why = "restart", "runtime or image changed"

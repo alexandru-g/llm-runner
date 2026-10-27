@@ -77,6 +77,7 @@ OPTIONS: dict[str, tuple[str, str]] = {
     "cache_ram": ("--cache-ram", "int"),
     "restart": ("--restart", "str"),
     "restart_max": ("--restart-max", "int"),
+    "owner": ("--owner", "str"),
 }
 SPECIAL = ("model", "port", "args", "env")
 KEYS = (*SPECIAL, *OPTIONS)
@@ -308,6 +309,19 @@ class Action:
         if self.argv:
             out["run"] = ["llmctl", "run", *self.argv]
         return out
+
+
+def without_owner(args: list[str]) -> list[str]:
+    """``args`` without ``--owner TAG``: a label, so a different one (another
+    session's $LLMCTL_OWNER) is no reason to restart a model."""
+    out, i = [], 0
+    while i < len(args):
+        if args[i] == "--owner" and i + 1 < len(args):
+            i += 2
+            continue
+        out.append(args[i])
+        i += 1
+    return out
 
 
 def diff_args(old: list[str], new: list[str]) -> str:

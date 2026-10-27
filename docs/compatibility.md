@@ -30,7 +30,8 @@ against it.
 
   `llmctl ps --json` prints `{"models": [...]}`, each with `name`, `pid`,
   `port`, `backend`, `started_at`, `group`, `model_path`, `runtime`,
-  `state`, `restarts`, `next_restart_in`, `last_error`.
+  `state`, `restarts`, `next_restart_in`, `last_error`, and (since 1.5)
+  `owner`.
 
 - `--json` output of `install`, `verify`, `cache export`, `apply`,
   `images`, `images load`, `images save` and (since 1.2) `ps`: the keys documented in the README keep their names, types and
@@ -72,7 +73,8 @@ against it.
   restarting, which used to get a 404 for a moment, and a local engine
   that answers its own 503 while it loads.
 - Since 1.3: `llmctl events --json` lines. Each has `ts`, `model`, `event`
-  and `detail`, and `pid`, `port`, `by`, `reason` and `log` when known.
+  and `detail`, and `pid`, `port`, `by`, `reason`, `log` and (since 1.5)
+  `owner` when known.
   The event names are those in the README table. New events and keys may
   be added in a minor release.
 - `X-Request-Id` on every reply (the client's, when valid, else a new one),

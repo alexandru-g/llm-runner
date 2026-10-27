@@ -20,6 +20,13 @@ All notable changes to llm-runner (`llmctl`). The format follows
   model (they used to apply to `--embeddings` only). For non-causal GGUFs
   (vllm-d3) both default to the context size, since each prompt has to fit
   one batch.
+- **Owner tags:** `llmctl run --owner TAG`, `$LLMCTL_OWNER`, or `owner:` in
+  serving files records who started a model. It shows in `ps` (an OWNER
+  column, and `owner` in `--json`), in events, and in `/v1/models`. Restarts,
+  `restore`, the supervisor and decision endpoints keep it, and `apply`
+  doesn't restart a model over a different tag. An unset owner writes no key,
+  so older llmctl versions can still read the state files. llmctl now also
+  ignores unknown keys in `running.json`.
 
 ### Fixed
 

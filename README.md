@@ -1294,7 +1294,7 @@ Keys: `model`, `port`, `args`, `env`, and the `run` options `backend`,
 `reasoning_parser`, `trust_remote_code`, `reasoning`, `embeddings`,
 `no_vision`, `draft`, `no_draft`, `spec_type`, `spec_n_max`,
 `n_gpu_layers`, `kv_unified`, `ctx_checkpoints`, `cache_ram`, `restart`,
-`restart_max`.
+`restart_max`, `owner`.
 
 ## Monitoring and operations
 
@@ -1387,6 +1387,14 @@ What clients see:
 `llmctl ps` shows each model's STATE and RESTARTS (`--json` for scripts),
 including down models the gateway is restarting; `/v1/models` lists down
 models with `status: restarting` or `crashed`.
+
+When several people or agent sessions share a machine, tag who started what:
+`llmctl run MODEL --owner A1` (or `LLMCTL_OWNER=A1` in that session's
+environment, or `owner:` in a serving file). The tag shows in `llmctl ps`
+(OWNER), in `llmctl events` and their `owner` key, and in the `llmctl`
+block of `/v1/models`. Restarts, `restore` and the supervisor keep it, and
+a decision endpoint takes its model's. It's only a label: it grants
+nothing, and a different tag is no reason for `apply` to restart a model.
 
 `llmctl events [-f] [--json]` lists what happened to models, one JSON line
 each in `<state>/events.jsonl`:

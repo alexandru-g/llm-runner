@@ -63,6 +63,8 @@ class RunningProcess:
     # containers). Else {"kind": "host"|"docker", "image", "digest", "gpus",
     # "network", "container", "cache_dir", "cache_rule"} (see containers.py).
     runtime: dict | None = None
+    # Who started it (`run --owner`, e.g. a session's name); None = not given.
+    owner: str | None = None
 
 
 @dataclass
@@ -88,6 +90,7 @@ class LaunchSpec:
     # What the gateway's supervisor does when it crashes (supervisor.py).
     restart: str = "on-failure"
     restart_max: int = 5
+    owner: str | None = None
 
     def run_cmd(self) -> list[str]:
         """The ``llmctl run …`` argv that reproduces this launch, port pinned."""
@@ -107,12 +110,21 @@ def _load() -> list[RunningProcess]:
         raw = json.loads(STATE_FILE.read_text())
     except json.JSONDecodeError:
         return []
-    return [RunningProcess(**r) for r in raw]
+    known = set(RunningProcess.__dataclass_fields__)
+    return [RunningProcess(**{k: v for k, v in r.items() if k in known}) for r in raw]
+
+
+def _record(obj) -> dict:
+    """``asdict`` without an unset owner: llmctl before 1.5 can't read the key."""
+    d = asdict(obj)
+    if d.get("owner") is None:
+        d.pop("owner", None)
+    return d
 
 
 def _save(procs: list[RunningProcess]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps([asdict(p) for p in procs], indent=2))
+    STATE_FILE.write_text(json.dumps([_record(p) for p in procs], indent=2))
 
 
 def _alive(pid: int) -> bool:
@@ -145,7 +157,7 @@ def _load_autostart() -> list[LaunchSpec]:
 
 def _save_autostart(specs: list[LaunchSpec]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    AUTOSTART_FILE.write_text(json.dumps([asdict(s) for s in specs], indent=2))
+    AUTOSTART_FILE.write_text(json.dumps([_record(s) for s in specs], indent=2))
 
 
 def autostart_list() -> list[LaunchSpec]:
@@ -157,7 +169,7 @@ def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
                   backend: str = "llama",
                   env: dict[str, str] | None = None, group: str | None = None,
                   runtime: dict | None = None, restart: str | None = None,
-                  restart_max: int | None = None) -> None:
+                  restart_max: int | None = None, owner: str | None = None) -> None:
     """Upsert a launch spec into the autostart manifest (keyed by name).
 
     Ports are pinned, so a port can only be restored to one model: entries
@@ -169,7 +181,8 @@ def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
                             model_path=model_path, run_args=list(run_args or []),
                             backend=backend, env=dict(env or {}), group=group,
                             runtime=chosen_runtime(runtime),
-                            restart=restart or "on-failure", restart_max=restart_max or 5))
+                            restart=restart or "on-failure", restart_max=restart_max or 5,
+                            owner=owner or None))
     _save_autostart(specs)
 
 
@@ -208,7 +221,8 @@ def autostart_sync() -> tuple[list[LaunchSpec], list[LaunchSpec]]:
                    backend=p.backend, env=dict(p.env), group=p.group,
                    runtime=chosen_runtime(p.runtime),
                    restart=old[p.name].restart if p.name in old else "on-failure",
-                   restart_max=old[p.name].restart_max if p.name in old else 5)
+                   restart_max=old[p.name].restart_max if p.name in old else 5,
+                   owner=p.owner)
         for p in list_running()
     ]
     live = {s.name for s in kept}
@@ -259,7 +273,7 @@ def restore(names: list[str] | None = None,
                         model_path=spec.model_path, run_args=spec.run_args,
                         backend=spec.backend, env=spec.env, group=spec.group,
                         runtime=spec.runtime, restart=spec.restart,
-                        restart_max=spec.restart_max)
+                        restart_max=spec.restart_max, owner=spec.owner)
             results.append((spec, f"started pid={rec.pid} port={rec.port}"))
         except Exception as e:  # never let one bad spec abort the rest
             results.append((spec, f"error: {e}"))
@@ -294,7 +308,7 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
           backend: str = "llama",
           env: dict[str, str] | None = None, group: str | None = None,
           runtime: dict | None = None, restart: str | None = None,
-          restart_max: int | None = None) -> RunningProcess:
+          restart_max: int | None = None, owner: str | None = None) -> RunningProcess:
     """Launch ``cmd`` detached. ``env`` is layered over the current environment
     (e.g. VLLM_* tuning knobs) and remembered so restore/restart reproduce it.
     Telemetry is always off, offline mode keeps backends off the hub, and
@@ -378,6 +392,7 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
         env=dict(env or {}),
         group=group,
         runtime=runtime,
+        owner=owner or None,
     )
     procs = reconcile()
     procs.append(rec)
@@ -385,7 +400,7 @@ def start(*, name: str, cmd: list[str], port: int, model_path: str,
     # Remember this launch so `restore` can bring it back after a reboot.
     autostart_add(name=name, cmd=cmd, port=port, model_path=model_path,
                   run_args=run_args, backend=backend, env=env, group=group,
-                  runtime=runtime, restart=restart, restart_max=restart_max)
+                  runtime=runtime, restart=restart, restart_max=restart_max, owner=owner)
     return rec
 
 
