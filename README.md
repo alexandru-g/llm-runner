@@ -767,7 +767,24 @@ curl -s localhost:8090/v1/systemone -H 'Content-Type: application/json' -d '{
 ```
 
 - **Supported:** Quyet-1.0-Large, Rune 26B-A4B v3, Xor 26B-A4B, Bobcat Flash
-  1.2 and H2O-Lightning-4B. The profile is picked from the GGUF's metadata.
+  1.2, H2O-Lightning-4B, Xevn-4B and iota-decide-4b v0.3. The profile is
+  picked from the GGUF's metadata.
+- **Served by llama-server itself:** since build b11361, llama-server
+  answers `/v1/systemone` for GGUFs that carry llama.cpp's decision metadata
+  (`<arch>.decision.*`), for example `ggml-org/vllm-d3-mini-GGUF` (b11572 and
+  later) and h2oai's own `h2o-lightning-4b-gguf` files (b11773 and later).
+  It then refuses plain completions, so no profile can read them. For these
+  models, `llmctl decide` starts the proxy in *native* mode: it forwards each
+  request and gives the same contract (validation, error codes, noul
+  confidence, `warnings`, `/v1/spec`), with llama-server's numbers. Text
+  only. vllm-d3 attends to the whole prompt at once, so `llmctl run` sets
+  `-b`/`-ub` to the context size for it (each prompt must fit one batch).
+  The h2o profile stays on the metadata-free GGUF, which reproduces h2o's
+  shim exactly, 0.801 noul floor included; native h2o skips the floor.
+- **iota-decide-4b v0.3** has no published GGUF (the iota GGUFs on the Hub
+  are v0.2, a different architecture). Convert the checkpoint with
+  llama.cpp's `convert_hf_to_gguf.py` after moving `joint_head_config.json`
+  aside, with `--no-mtp`; the profile's docstring has the steps.
 - **One contract:** `llmctl decide spec [MODEL] [--json]` prints the request
   and response format plus the model's specifics (label order, temperatures,
   limits, state truncation, extras). A running endpoint serves the same at

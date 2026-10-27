@@ -5,6 +5,22 @@ All notable changes to llm-runner (`llmctl`). The format follows
 [semantic versioning](https://semver.org); what the version protects is in
 [docs/compatibility.md](docs/compatibility.md).
 
+## [Unreleased]
+
+### Added
+
+- **Decision models:** Xevn-4B and iota-decide-4b v0.3 profiles in
+  systemone-proxy. Both are ported from the vendors' code with golden
+  prompt token ids; iota needs a locally converted GGUF.
+- **Natively served decision GGUFs** (llama.cpp b11361+, e.g. vllm-d3-mini):
+  `llmctl decide` runs the proxy in native mode, forwarding to llama-server's
+  own `/v1/systemone` under the same contract. `systemone-proxy detect`
+  prints `native` for such files.
+- `llmctl run --batch-size/--ubatch-size` now reach llama-server for every
+  model (they used to apply to `--embeddings` only). For non-causal GGUFs
+  (vllm-d3) both default to the context size, since each prompt has to fit
+  one batch.
+
 ## [1.4.0] - 2026-10-27
 
 ### Added
