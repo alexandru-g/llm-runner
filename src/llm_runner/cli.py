@@ -99,6 +99,11 @@ def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size:
     ]
     if n_parallel is not None:
         cmd.extend(["--parallel", str(n_parallel)])
+    # A non-causal model (vllm-d3) takes each prompt in one physical batch.
+    if batch_size is not None:
+        cmd.extend(["--batch-size", str(batch_size)])
+    if ubatch_size is not None:
+        cmd.extend(["--ubatch-size", str(ubatch_size)])
     # With an explicit --parallel N llama-server splits the context N ways per
     # slot (32k/4 = 8k each) and refuses a longer prompt. Unified KV lets the
     # slots share the whole buffer instead: N short requests batch together
@@ -1043,11 +1048,11 @@ def profile_rm(name: str) -> None:
               help="Pooling strategy for --embeddings mode (default: cls, which "
                    "bge-m3 expects). Ignored without --embeddings.")
 @click.option("--batch-size", "-b", type=int, default=None,
-              help="Logical batch size for --embeddings mode "
-                   "(default: the context size). Ignored without --embeddings.")
+              help="llama-server's logical batch size. Default: the context size for "
+                   "--embeddings and for non-causal models (vllm-d3), else llama-server's.")
 @click.option("--ubatch-size", "-ub", "ubatch_size", type=int, default=None,
-              help="Physical batch size for --embeddings mode "
-                   "(default: the context size). Ignored without --embeddings.")
+              help="llama-server's physical batch size. Default: the context size for "
+                   "--embeddings and for non-causal models (vllm-d3), else llama-server's.")
 @click.pass_context
 def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         ctx_size: int | None, ft_path: Path | None, ft_name: str | None,
@@ -1227,6 +1232,13 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
             n_parallel = 1
             click.echo("Using --n-parallel 1 (best for MTP acceptance + prompt-cache "
                        "reuse); pass --n-parallel N to override.")
+        # A non-causal model (vllm-d3) must take each prompt in one physical
+        # batch, or llama-server refuses it; let a prompt use the whole context.
+        if not embeddings and backends.gguf_is_noncausal(model_path):
+            batch_size = batch_size or ctx_size
+            ubatch_size = ubatch_size or batch_size
+            click.echo(f"Non-causal model: --batch-size {batch_size} --ubatch-size "
+                       f"{ubatch_size} (each prompt is processed in one batch).")
 
         cmd = _build_llama_cmd(model_path, mmproj, chosen_port, ctx_size, reasoning,
                                kv_quant=kv_quant, n_gpu_layers=n_gpu_layers,

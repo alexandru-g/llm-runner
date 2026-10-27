@@ -15,16 +15,22 @@ def _log(msg: str) -> None:
     print(f"systemone-proxy: {msg}", file=sys.stderr, flush=True)
 
 
-def _resolve_profile(args) -> type:
-    if args.profile:
+def _resolve_profile(args):
+    if args.profile and args.profile != NATIVE:
         return profiles.get(args.profile)
     if getattr(args, "gguf", None):
+        model = native.NativeModel.from_gguf(args.gguf, _model_id(args.gguf))
+        if model is not None:
+            return model
         found = profiles.detect(args.gguf)
         if found is None:
             raise SystemExit(f"no profile matches {args.gguf}; pass --profile "
                              f"({', '.join(profiles.all_profiles())})")
         return found
     raise SystemExit("pass --profile ID or --gguf PATH")
+
+
+NATIVE = "native"
 
 
 def _model_id(model_path: str) -> str:
@@ -42,7 +48,9 @@ def cmd_serve(args) -> None:
     backend = LlamaServer(args.backend, timeout=args.timeout)
     props = backend.wait_ready(args.wait_backend, log=_log)
     model_path = props.get("model_path") or ""
-    if not args.profile and native.detect(backend):
+    if native.detect(backend):
+        # llama-server then refuses the completions a profile reads, so
+        # native wins over a profile that also matches (h2o's own GGUFs).
         model = native.NativeModel.from_gguf(args.gguf or model_path, _model_id(model_path))
         if model is None:
             raise SystemExit(f"llama-server serves /v1/systemone, but {model_path!r} has no "
@@ -52,6 +60,9 @@ def cmd_serve(args) -> None:
         serve(native.NativeService(model, backend, timeout=args.timeout),
               build_spec(model, model), args.host, args.port)
         return
+    if args.profile == NATIVE:
+        raise SystemExit("llama-server doesn't answer /v1/systemone itself: this GGUF needs "
+                         "llama.cpp b11361 or newer (vllm-d3 b11572, h2o-lightning b11773)")
     if args.profile:
         cls = profiles.get(args.profile)
     else:
@@ -88,7 +99,7 @@ def cmd_serve(args) -> None:
 
 def cmd_spec(args) -> None:
     cls = _resolve_profile(args) if (args.profile or args.gguf) else None
-    spec = build_spec(cls)
+    spec = build_spec(cls, cls if isinstance(cls, native.NativeModel) else None)
     print(json.dumps(spec, indent=2, ensure_ascii=False) if args.json else render_text(spec))
 
 
@@ -98,6 +109,10 @@ def cmd_profiles(args) -> None:
 
 
 def cmd_detect(args) -> None:
+    """A GGUF with llama.cpp decision metadata is "native"; else its profile."""
+    if native.NativeModel.from_gguf(args.gguf, "x") is not None:
+        print(NATIVE)
+        return
     found = profiles.detect(args.gguf)
     if found is None:
         raise SystemExit(1)
@@ -111,7 +126,9 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("serve", help="serve /v1/systemone in front of a llama-server")
     s.add_argument("--backend", required=True, help="llama-server URL, e.g. http://127.0.0.1:8080")
-    s.add_argument("--profile", help="profile id (default: detect from the served GGUF)")
+    s.add_argument("--profile", help="profile id, or \"native\" (default: detect from the "
+                                     "served GGUF; native when llama-server answers "
+                                     "/v1/systemone itself)")
     s.add_argument("--gguf", help="GGUF path to detect the profile from (default: llama-server's)")
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=8090)

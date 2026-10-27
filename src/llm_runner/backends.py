@@ -424,6 +424,61 @@ def _gguf_general_tags(path: Path) -> list[str]:
     return []
 
 
+def gguf_metadata(path: Path, want) -> dict:
+    """Every GGUF header key ``want(key)`` accepts, reading the whole key-value
+    block. Arrays that aren't wanted are skipped, not decoded (the tokenizer
+    alone is ~10 MB on Qwen3.5, and llama.cpp's decision keys come after it)."""
+    import struct
+    scalar = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?",
+              10: "Q", 11: "q", 12: "d"}
+    size = {k: struct.calcsize("<" + v) for k, v in scalar.items()}
+    out: dict = {}
+    try:
+        with path.open("rb") as f:
+            def read(fmt: str):
+                return struct.unpack(fmt, f.read(struct.calcsize(fmt)))
+
+            def value(t: int, keep: bool):
+                if t == 8:
+                    (n,) = read("<Q")
+                    if keep:
+                        return f.read(n).decode("utf-8", "replace")
+                    f.seek(n, 1)
+                    return None
+                if t == 9:
+                    et, n = read("<IQ")
+                    if not keep and et in size:
+                        f.seek(size[et] * n, 1)
+                        return None
+                    items = [value(et, keep) for _ in range(n)]
+                    return items if keep else None
+                return read("<" + scalar[t])[0]
+
+            if f.read(4) != b"GGUF" or read("<I")[0] < 2:
+                return {}
+            _, n_kv = read("<QQ")
+            for _ in range(n_kv):
+                (n,) = read("<Q")
+                key = f.read(n).decode("utf-8", "replace")
+                (t,) = read("<I")
+                keep = want(key)
+                v = value(t, keep)
+                if keep:
+                    out[key] = v
+    except (OSError, struct.error, KeyError, ValueError):
+        pass
+    return out
+
+
+def gguf_is_noncausal(path: Path) -> bool:
+    """A model that attends to the whole prompt at once (``<arch>.attention.causal``
+    false, e.g. vllm-d3): llama-server must take each prompt in one batch."""
+    if path.suffix != ".gguf":
+        return False
+    meta = gguf_metadata(path, lambda k: k.endswith(".attention.causal"))
+    return any(v is False for v in meta.values())
+
+
 # Weights that are an ordinary LLM checkpoint but are meant to be read as a
 # calibrated decision (letter-logprob readout over a vendor-specific prompt,
 # e.g. Quyet), not chatted with.
@@ -435,7 +490,8 @@ _DECISION_TAGS = {"decision-model", "decision-making", "typed-decisions",
 # File names of known decision-model GGUFs, for headers without tags (e.g.
 # Livesport's rune-26b-a4b-v3-Q8_0.gguf carries neither tags nor a basename).
 _DECISION_FILENAMES = re.compile(
-    r"^(rune-26b-a4b|xor-26b-a4b|bobcat-flash|h2o-lightning|quyet-1\.0)", re.I)
+    r"^(rune-26b-a4b|xor-26b-a4b|bobcat-flash|h2o-lightning|quyet-1\.0|xevn-4b|"
+    r"iota-decide-4b-v0\.3|vllm-d3)", re.I)
 
 
 def is_decision_model(path: Path) -> bool:

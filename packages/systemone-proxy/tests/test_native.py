@@ -141,3 +141,12 @@ def test_spec(svc):
     assert spec["model"]["limits"]["max_score_levels"] == 10
     assert "normalized entropy" in spec["model"]["confidence"]["choice"]
     assert any("non-causal" in n for n in spec["model"]["notes"])
+
+
+def test_detect_and_spec_cli(d3_gguf, capsys):
+    from systemone_proxy import cli
+    cli.main(["detect", str(d3_gguf)])
+    assert capsys.readouterr().out.strip() == "native"
+    cli.main(["spec", "--gguf", str(d3_gguf), "--json"])
+    spec = json.loads(capsys.readouterr().out)
+    assert spec["model"]["id"] == "vllm-d3-mini" and "notes" in spec["model"]
