@@ -24,6 +24,7 @@ and ``--wait`` work exactly as for host processes.
 from __future__ import annotations
 
 import functools
+import ipaddress
 import json
 import os
 import re
@@ -210,6 +211,25 @@ def runtime_from_config(backend: str, cfg: dict) -> dict:
         out["image"] = entry.get("image") or default_image(backend)
         if entry.get("network"):
             out["network"] = entry["network"]
+        if entry.get("dns"):
+            out["dns"] = list(entry["dns"])
+    return out
+
+
+def parse_dns(text: str | list | None) -> list[str]:
+    """DNS servers for containers: ``IP[,IP…]`` or a list. Empty means none
+    (Docker's default resolver). ``127.0.0.1`` leaves a container on a
+    user-defined network only Docker's embedded DNS for container names, so
+    outside names don't resolve. Raises ValueError for a bad address."""
+    items = text if isinstance(text, list) else (text or "").split(",")
+    out = []
+    for item in (str(i).strip() for i in items):
+        if not item:
+            continue
+        try:
+            out.append(str(ipaddress.ip_address(item)))
+        except ValueError:
+            raise ValueError(f"{item!r} is not an IP address") from None
     return out
 
 
@@ -264,6 +284,7 @@ def docker_argv(*, name: str, cmd: list[str], port: int, backend: str,
             "--label", f"io.llmctl.port={port}",
             "--user", f"{os.getuid()}:{os.getgid()}",
             "--network", runtime.get("network") or "bridge",
+            *[a for ip in runtime.get("dns") or [] for a in ("--dns", ip)],
             "-p", f"{host}:{port}:{port}" if host not in ("0.0.0.0", "") else f"{port}:{port}",
             "-v", f"{model_dir}:{CONTAINER_MODEL}:ro"]
     if _mounts_models_dir(models_dir, model_dir):

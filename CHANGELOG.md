@@ -5,6 +5,19 @@ All notable changes to llm-runner (`llmctl`). The format follows
 [semantic versioning](https://semver.org); what the version protects is in
 [docs/compatibility.md](docs/compatibility.md).
 
+## [Unreleased]
+
+### Added
+
+- **DNS for containers.** `llmctl config runtime <backend> docker --dns
+  IP[,IP]`, `run --dns`, and `dns:` in serving files (a list or one string)
+  pass `--dns` to `docker run`. On a network without egress, `--dns
+  127.0.0.1` stops Docker's embedded resolver from answering outside names,
+  which would otherwise be a DNS channel out, while container names still
+  resolve. The default is unchanged (Docker's resolver). The list is kept
+  in each launch's spec, so restarts and `restore` keep it, and changing it
+  in a serving file restarts the model.
+
 ## [1.3.0] - 2026-10-25
 
 Planned restarts and model events, from the M0.4 runbook runs.

@@ -194,18 +194,24 @@ def _run_option_args(ctx: click.Context) -> list[str]:
 
 
 def _resolve_runtime(backend: str, kind: str | None, image: str | None,
-                     allow_tag: bool, gpu: str | None) -> dict:
+                     allow_tag: bool, gpu: str | None, dns: str | None = None) -> dict:
     """The runtime for one launch: the flags, else ``config runtime``."""
     try:
         gpus = containers.parse_gpus(gpu)
     except ValueError as e:
         raise click.BadOptionUsage("--gpu", str(e)) from None
+    try:
+        dns_ips = None if dns is None else containers.parse_dns(dns)
+    except ValueError as e:
+        raise click.BadOptionUsage("--dns", str(e)) from None
     configured = containers.runtime_from_config(backend, config_mod.load())
     if image and kind == containers.HOST:
         raise click.UsageError("--image needs --runtime docker.")
     kind = kind or (containers.DOCKER if image else configured["kind"])
     runtime: dict = {"kind": kind, "gpus": gpus}
     if kind != containers.DOCKER:
+        if dns_ips:
+            raise click.UsageError("--dns only applies to --runtime docker.")
         return runtime
     if backend not in containers.CONTAINER_BACKENDS:
         raise click.UsageError(f"{backend} has no container runtime; use --runtime host.")
@@ -226,6 +232,9 @@ def _resolve_runtime(backend: str, kind: str | None, image: str | None,
     runtime.update(image=ref, digest=digest)
     if configured.get("network"):
         runtime["network"] = configured["network"]
+    # --dns '' drops a configured list for this launch.
+    if dns_ips if dns_ips is not None else configured.get("dns"):
+        runtime["dns"] = dns_ips if dns_ips is not None else configured["dns"]
     expected = containers.expected_images().get(backend) or {}
     if expected.get("image") == ref and expected.get("engine_version"):
         runtime["engine_version"] = expected["engine_version"]
@@ -397,16 +406,21 @@ def config_show() -> None:
                    "one this llmctl was tested with (`llmctl images`).")
 @click.option("--network", default=None,
               help="Docker network the containers join (default: bridge).")
+@click.option("--dns", default=None, metavar="IP[,IP…]",
+              help="DNS servers for the containers (docker --dns; default: Docker's). "
+                   "On a network without egress, 127.0.0.1 keeps container names "
+                   "resolving and stops outside names.")
 @click.option("--allow-tag", is_flag=True, default=False,
               help="Accept an image by tag (development only).")
 def config_runtime(backend: str | None, kind: str | None, image: str | None,
-                   network: str | None, allow_tag: bool) -> None:
+                   network: str | None, dns: str | None, allow_tag: bool) -> None:
     """Run BACKEND's servers as host processes or Docker containers.
 
     \b
       llmctl config runtime                       # show
       llmctl config runtime vllm docker           # the tested image
       llmctl config runtime vllm docker --image vllm/vllm-openai@sha256:…
+      llmctl config runtime vllm docker --network ss6m --dns 127.0.0.1
       llmctl config runtime vllm host
 
     Applies to new starts; `run --runtime` overrides it per launch. Running
@@ -417,7 +431,8 @@ def config_runtime(backend: str | None, kind: str | None, image: str | None,
             rt = containers.runtime_from_config(b, cfg)
             click.echo(f"{b:<6} {rt['kind']}"
                        + (f"  {rt.get('image')}" if rt["kind"] == containers.DOCKER else "")
-                       + (f"  network={rt['network']}" if rt.get("network") else ""))
+                       + (f"  network={rt['network']}" if rt.get("network") else "")
+                       + (f"  dns={','.join(rt['dns'])}" if rt.get("dns") else ""))
         return
     if kind is None:
         raise click.UsageError("Give the runtime: host or docker.")
@@ -432,11 +447,16 @@ def config_runtime(backend: str | None, kind: str | None, image: str | None,
         entry["image"] = ref
         if network:
             entry["network"] = network
+        try:
+            if dns_ips := containers.parse_dns(dns):
+                entry["dns"] = dns_ips
+        except ValueError as e:
+            raise click.BadOptionUsage("--dns", str(e)) from None
         if containers.inspect_image(ref) is None:
             click.echo(f"note: {ref} is not on this host yet; `docker pull` or "
                        "`docker load` it before starting a model.", err=True)
-    elif image or network:
-        raise click.UsageError("--image and --network only apply to docker.")
+    elif image or network or dns:
+        raise click.UsageError("--image, --network and --dns only apply to docker.")
     runtimes = dict(cfg.get("runtime") or {})
     runtimes[backend] = entry
     config_mod.update(runtime=runtimes)
@@ -920,6 +940,10 @@ def profile_rm(name: str) -> None:
                    "llmctl was tested with (`llmctl config runtime`).")
 @click.option("--allow-tag", is_flag=True, default=False,
               help="Accept an image by tag instead of digest (development only).")
+@click.option("--dns", "dns", default=None, metavar="IP[,IP…]",
+              help="DNS servers for the container (docker --dns). Default: `llmctl "
+                   "config runtime <backend> --dns`, else Docker's. 127.0.0.1 stops "
+                   "outside names resolving; '' drops a configured list.")
 @click.option("--gpu", "gpu", default=None, metavar="all|N[,N…]",
               help="GPUs the server may use (default all). Containers get them "
                    "through CDI or --gpus; host processes through "
@@ -1028,7 +1052,7 @@ def profile_rm(name: str) -> None:
 def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         ctx_size: int | None, ft_path: Path | None, ft_name: str | None,
         group_name: str | None, wait: bool, menu: bool | None, profile: str | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
-        runtime_kind: str | None, image: str | None, allow_tag: bool, gpu: str | None,
+        runtime_kind: str | None, image: str | None, allow_tag: bool, dns: str | None, gpu: str | None,
         restart: str | None, restart_max: int | None,
         kv_cache_mem: str | None,
         reasoning: bool,
@@ -1098,7 +1122,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     elif backend == DECIDER and not backends.is_decider_model_dir(model_path):
         raise click.UsageError(
             f"'{model_path.name}' is not a decider checkpoint (no decider_config.json).")
-    runtime = _resolve_runtime(backend, runtime_kind, image, allow_tag, gpu)
+    runtime = _resolve_runtime(backend, runtime_kind, image, allow_tag, gpu, dns)
     # A container brings its own engine; the host needn't have one.
     binary = backend if runtime["kind"] == containers.DOCKER else _require_backend(backend)
     _warn_foreign_flags(ctx, backend)
@@ -3011,7 +3035,7 @@ def _plan_apply(entries: list, prune: bool) -> tuple[list, list[str]]:
                 backend = specs[key].backend
             desired_rt = _resolve_runtime(backend, ctx.params["runtime_kind"],
                                           ctx.params["image"], ctx.params["allow_tag"],
-                                          ctx.params["gpu"])
+                                          ctx.params["gpu"], ctx.params["dns"])
         except click.ClickException as err:
             problems.append(f"{e.where}: models.{e.name}: {err.format_message()}")
             continue

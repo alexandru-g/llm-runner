@@ -182,3 +182,17 @@ def test_apply_reports_unknown_models_and_bad_values(tmp_path, host):
     assert any(p.startswith(f"{f}:2: models.a.model 'nope'") for p in out["problems"])
     assert any(p.startswith(f"{f}:5: models.b:") and "q2" in p for p in out["problems"])
     assert host == []
+
+
+def test_dns_takes_a_list_or_a_string_and_checks_addresses(tmp_path):
+    f = _write(tmp_path, "a.yaml", "models:\n  q:\n    model: m\n    port: 1\n"
+               "    dns: [127.0.0.1, '::1']\n"
+               "  r:\n    model: m\n    port: 2\n    dns: 127.0.0.1\n")
+    q, r = apply_mod.load([f])
+    assert q.run_argv("m")[-2:] == ["--dns", "127.0.0.1,::1"]
+    assert r.options["dns"] == "127.0.0.1"
+    f = _write(tmp_path, "b.yaml", "models:\n  q:\n    model: m\n    port: 1\n"
+               "    dns: [dns.example]\n")
+    with pytest.raises(apply_mod.ApplyError) as e:
+        apply_mod.load([f])
+    assert "b.yaml:5: models.q.dns: 'dns.example' is not an IP address" in e.value.problems[0]

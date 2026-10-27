@@ -174,7 +174,8 @@ def autostart_add(*, name: str, cmd: list[str], port: int, model_path: str,
 
 
 # The runtime fields that describe the choice, not one start of it.
-_RUNTIME_CHOICE = ("kind", "image", "digest", "gpus", "network", "engine_version")
+_RUNTIME_CHOICE = ("kind", "image", "digest", "gpus", "network", "dns",
+                   "engine_version")
 
 
 def chosen_runtime(runtime: dict | None) -> dict | None:

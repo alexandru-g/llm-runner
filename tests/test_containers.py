@@ -349,3 +349,53 @@ def test_export_then_manifest_then_seed(tmp_path, monkeypatch):
         state_dir=tmp_path / "state2", name="qwen", model_path=str(tmp_path / "installed" / "qwen3-v2"),
         backend="vllm", runtime=rt)
     assert rule == "digest" and (d2 / "vllm" / "torch_compile_cache" / "graph").exists()
+
+
+# --------------------------------------------------------------------- dns --
+
+def test_dns_goes_to_docker_run_once_per_address(tmp_path):
+    models = tmp_path / "models"
+    model = models / "qwen3-0.6b"
+    model.mkdir(parents=True)
+    rt = {"kind": "docker", "image": IMAGE, "digest": DIGEST, "gpus": "all",
+          "container": "c", "network": "ss6m", "dns": ["127.0.0.1", "::1"]}
+    argv = containers.docker_argv(name="qwen", cmd=_vllm_cmd(model), port=8101, backend="vllm",
+                                  model_path=str(model), env={}, runtime=rt,
+                                  models_dir=models, cache_dir=None)
+    s = " ".join(argv)
+    assert "--network ss6m --dns 127.0.0.1 --dns ::1" in s
+    assert "--dns" not in " ".join(_argv(tmp_path)[0])           # default: Docker's resolver
+
+
+def test_parse_dns():
+    assert containers.parse_dns("127.0.0.1, 10.0.0.53") == ["127.0.0.1", "10.0.0.53"]
+    assert containers.parse_dns(["::1"]) == ["::1"] and containers.parse_dns("") == []
+    with pytest.raises(ValueError, match="dns.example"):
+        containers.parse_dns("dns.example")
+
+
+def test_dns_from_config_per_launch_and_kept_for_restore(fake_start, monkeypatch):
+    started, ckpt = fake_start
+    monkeypatch.setattr(containers, "inspect_image", lambda ref: {"RepoDigests": []})
+    r = CliRunner().invoke(cli.cli, ["config", "runtime", "vllm", "docker", "--image", IMAGE,
+                                     "--network", "ss6m", "--dns", "127.0.0.1"])
+    assert r.exit_code == 0, r.output
+    r = CliRunner().invoke(cli.cli, ["config", "runtime"])
+    assert "dns=127.0.0.1" in r.output
+    r = CliRunner().invoke(cli.cli, ["run", "--ft", str(ckpt)])
+    assert r.exit_code == 0, r.output
+    assert started["runtime"]["dns"] == ["127.0.0.1"]
+    assert proc.chosen_runtime(started["runtime"])["dns"] == ["127.0.0.1"]   # autostart keeps it
+    r = CliRunner().invoke(cli.cli, ["run", "--ft", str(ckpt), "--dns", "10.0.0.53"])
+    assert started["runtime"]["dns"] == ["10.0.0.53"]
+    assert "--dns 10.0.0.53" in " ".join(started["run_args"])
+    r = CliRunner().invoke(cli.cli, ["run", "--ft", str(ckpt), "--dns", ""])
+    assert r.exit_code == 0 and "dns" not in started["runtime"]
+    r = CliRunner().invoke(cli.cli, ["run", "--ft", str(ckpt), "--dns", "nope"])
+    assert r.exit_code != 0 and "not an IP address" in r.output
+    monkeypatch.setattr(backends, "find_engine", lambda backend: "/usr/bin/vllm")
+    r = CliRunner().invoke(cli.cli, ["run", "--ft", str(ckpt), "--runtime", "host",
+                                     "--dns", "127.0.0.1"])
+    assert r.exit_code != 0 and "only applies to --runtime docker" in r.output
+    r = CliRunner().invoke(cli.cli, ["config", "runtime", "vllm", "host", "--dns", "127.0.0.1"])
+    assert r.exit_code != 0

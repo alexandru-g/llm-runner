@@ -46,13 +46,15 @@ class ApplyError(Exception):
         self.problems = problems
 
 
-# key: (`run` option, kind). kind: str, int, float, bool, gpu (str or int).
+# key: (`run` option, kind). kind: str, int, float, bool, gpu (str or int),
+# dns (a list of addresses, or one "IP[,IP]" string).
 OPTIONS: dict[str, tuple[str, str]] = {
     "backend": ("--backend", "str"),
     "group": ("--group", "str"),
     "runtime": ("--runtime", "str"),
     "image": ("--image", "str"),
     "allow_tag": ("--allow-tag", "bool"),
+    "dns": ("--dns", "dns"),
     "gpu": ("--gpu", "gpu"),
     "ctx": ("--ctx-size", "int"),
     "n_parallel": ("--n-parallel", "int"),
@@ -197,6 +199,22 @@ def _entry(path: Path, name_node: yaml.ScalarNode, node: yaml.Node,
                                     "strings or numbers")
                     continue
                 entry.args.append(str(val))
+        elif key == "dns":
+            from llm_runner.containers import parse_dns
+            if isinstance(v, yaml.SequenceNode):
+                raw = [yaml.safe_load(yaml.serialize(i)) if isinstance(i, yaml.ScalarNode)
+                       else None for i in v.value]
+            else:
+                raw = _scalar(path, v, "str", f"{what}.dns", problems)
+            if raw is None:
+                continue                      # _scalar said why
+            if isinstance(raw, list) and None in raw:
+                problems.append(f"{_at(path, v)}: {what}.dns must be a list of IP addresses")
+                continue
+            try:
+                entry.options["dns"] = ",".join(parse_dns(raw))
+            except ValueError as err:
+                problems.append(f"{_at(path, v)}: {what}.dns: {err}")
         elif key == "env":
             env_pairs = _mapping(path, v, f"{what}.env", problems) or []
             for ek, ev in env_pairs:

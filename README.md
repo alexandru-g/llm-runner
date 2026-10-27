@@ -1089,6 +1089,15 @@ default. What a container start does:
   can't publish a port from a container with no network, so block egress on
   the host: a `DOCKER-USER` iptables rule that drops new outbound
   connections from the Docker bridge.
+- DNS: `config runtime … --dns IP[,IP]` (or `run --dns`, or `dns:` in a
+  serving file) passes `--dns` to `docker run`; the default is Docker's own.
+  On a user-defined network without egress, Docker's embedded resolver can
+  still answer outside names when it forwards from the host (typically when
+  the host's resolver is a local one, such as systemd-resolved), which
+  leaves a DNS channel out. `--dns 127.0.0.1` closes it: container names
+  still resolve, outside names don't. `run --dns ''` drops a configured list
+  for one launch. The setting is kept with the launch, so restarts and
+  `restore` keep it.
 - It runs as your user, with the offline and telemetry variables set and
   no host compiler: the image brings its own.
 - `docker run` stays attached, so `ps`, `logs`, `stop`, `--wait`, `restart`
@@ -1263,11 +1272,12 @@ name and group don't, and the old version's cache is already warm. On the
 4090 that took 38 s for Qwen3-0.6B in a container.
 
 Keys: `model`, `port`, `args`, `env`, and the `run` options `backend`,
-`group` (`null` for none), `runtime`, `image`, `allow_tag`, `gpu`, `ctx`,
+`group` (`null` for none), `runtime`, `image`, `allow_tag`, `dns` (a list), `gpu`, `ctx`,
 `n_parallel`, `gpu_mem`, `kv_cache_mem`, `kv_quant`, `tool_parser`,
 `reasoning_parser`, `trust_remote_code`, `reasoning`, `embeddings`,
 `no_vision`, `draft`, `no_draft`, `spec_type`, `spec_n_max`,
-`n_gpu_layers`, `kv_unified`, `ctx_checkpoints`, `cache_ram`.
+`n_gpu_layers`, `kv_unified`, `ctx_checkpoints`, `cache_ram`, `restart`,
+`restart_max`.
 
 ## Monitoring and operations
 
