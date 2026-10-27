@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+from pathlib import Path
 
-from systemone_proxy import __version__, profiles
+from systemone_proxy import __version__, native, profiles
 from systemone_proxy.spec import build_spec, render_text
 
 
@@ -25,6 +27,12 @@ def _resolve_profile(args) -> type:
     raise SystemExit("pass --profile ID or --gguf PATH")
 
 
+def _model_id(model_path: str) -> str:
+    """``vllm-d3-mini-Q8_0.gguf`` → ``vllm-d3-mini``."""
+    stem = Path(model_path).stem or "native"
+    return re.sub(r"[-.](?:i?q\d[\w]*|f16|bf16|f32)$", "", stem, flags=re.I).lower()
+
+
 def cmd_serve(args) -> None:
     from systemone_proxy import tokenizer
     from systemone_proxy.backend import LlamaServer
@@ -34,6 +42,16 @@ def cmd_serve(args) -> None:
     backend = LlamaServer(args.backend, timeout=args.timeout)
     props = backend.wait_ready(args.wait_backend, log=_log)
     model_path = props.get("model_path") or ""
+    if not args.profile and native.detect(backend):
+        model = native.NativeModel.from_gguf(args.gguf or model_path, _model_id(model_path))
+        if model is None:
+            raise SystemExit(f"llama-server serves /v1/systemone, but {model_path!r} has no "
+                             "decision metadata the proxy can read; pass --gguf PATH")
+        _log(f"{model.id}: served natively by llama-server (decision type "
+             f"{model.decision_type}); the proxy adapts the responses")
+        serve(native.NativeService(model, backend, timeout=args.timeout),
+              build_spec(model, model), args.host, args.port)
+        return
     if args.profile:
         cls = profiles.get(args.profile)
     else:
