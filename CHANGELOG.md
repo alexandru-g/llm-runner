@@ -5,7 +5,7 @@ All notable changes to llm-runner (`llmctl`). The format follows
 [semantic versioning](https://semver.org); what the version protects is in
 [docs/compatibility.md](docs/compatibility.md).
 
-## [Unreleased]
+## [1.4.1] - 2026-10-27
 
 ### Fixed
 
@@ -212,6 +212,7 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.4.1]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.4.1
 [1.4.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.4.0
 [1.3.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.3.0
 [1.2.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.2.0
