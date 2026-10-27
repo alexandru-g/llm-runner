@@ -34,6 +34,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from llm_runner import config as config_mod
 from llm_runner import logs
 from llm_runner import process as proc
 from llm_runner.backends import GATEWAY
@@ -55,7 +56,7 @@ def backoff(n: int) -> float:
 
 def healthy(port: int, timeout: float = 1.0) -> bool:
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=timeout) as r:
+        with urllib.request.urlopen(config_mod.local_url(port, "/health"), timeout=timeout) as r:
             return r.status == 200
     except (urllib.error.HTTPError, OSError, ValueError):
         return False

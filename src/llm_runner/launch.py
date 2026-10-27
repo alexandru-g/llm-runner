@@ -32,6 +32,7 @@ from typing import Any, Callable
 import click
 
 from llm_runner import backends
+from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner.backends import DECIDER, GATEWAY, HF_ENGINES, LLAMA
 from llm_runner.registry import ModelSpec, default_group, looks_like_embedding_model
@@ -102,7 +103,7 @@ def _cluster_groups() -> list[str]:
     if gw is None:
         return []
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{gw.port}/v1/models", timeout=1) as r:
+        with urllib.request.urlopen(config_mod.local_url(gw.port, "/v1/models"), timeout=1) as r:
             data = json.loads(r.read())["data"]
     except (OSError, ValueError, KeyError):
         return []

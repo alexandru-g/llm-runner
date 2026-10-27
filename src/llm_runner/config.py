@@ -146,6 +146,23 @@ def set_bind_host(host: str | None) -> None:
     update(bind_host=None if host in (None, DEFAULT_BIND_HOST) else host)
 
 
+def local_host(bind: str | None = None) -> str:
+    """The address that reaches, from this machine, a listener on ``bind``
+    (default: the configured bind address): loopback when it listens on every
+    interface, the address itself when it listens on one (172.19.0.1 doesn't
+    answer on 127.0.0.1)."""
+    bind = bind or get_bind_host()
+    if bind in ("0.0.0.0", "::", "", "localhost"):
+        return "127.0.0.1"
+    return bind
+
+
+def local_url(port: int, path: str = "", bind: str | None = None) -> str:
+    """``http://<local_host>:<port><path>``, with IPv6 addresses bracketed."""
+    host = local_host(bind)
+    return f"http://{f'[{host}]' if ':' in host else host}:{port}{path}"
+
+
 def get_upstream_key() -> str | None:
     """The API key this gateway sends when it relays a call through the
     registry's gateway (`llmctl gateway key set`)."""

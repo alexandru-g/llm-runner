@@ -250,7 +250,7 @@ class LocalModels:
                 return False
         try:
             if m.backend in _QUEUE_METRIC:
-                with urllib.request.urlopen(f"http://127.0.0.1:{m.port}/metrics",
+                with urllib.request.urlopen(config_mod.local_url(m.port, "/metrics"),
                                             timeout=0.5) as r:
                     for line in r.read().decode().splitlines():
                         if line.startswith(_QUEUE_METRIC[m.backend]):
@@ -258,7 +258,7 @@ class LocalModels:
                 return False
             if m.backend != "llama":
                 return False
-            with urllib.request.urlopen(f"http://127.0.0.1:{m.port}/slots", timeout=0.5) as r:
+            with urllib.request.urlopen(config_mod.local_url(m.port, "/slots"), timeout=0.5) as r:
                 slots = json.loads(r.read())
             if not isinstance(slots, list) or not slots:
                 return False
@@ -271,7 +271,7 @@ class LocalModels:
         if m.backend not in _METRICS_BACKENDS:
             return None
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{m.port}/metrics",
+            with urllib.request.urlopen(config_mod.local_url(m.port, "/metrics"),
                                         timeout=timeout) as r:
                 return r.read().decode(errors="replace")
         except (OSError, ValueError):
@@ -298,7 +298,7 @@ class LocalModels:
         if hit and now - hit[0] < HEALTH_TTL and not fresh:
             return hit[1]
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{m.port}/health", timeout=1) as r:
+            with urllib.request.urlopen(config_mod.local_url(m.port, "/health"), timeout=1) as r:
                 state = "ready" if r.status == 200 else "loading"
         except urllib.error.HTTPError:
             state = "loading"        # llama-server answers 503 while it loads
@@ -1140,7 +1140,7 @@ def make_handler(gw: Gateway):
             lbl = {"model": c.id, "node": c.node, "backend": c.info.get("backend") or ""}
             tls, relay = False, None
             if c.local:
-                host, port, extra = "127.0.0.1", c.info["port"], {}
+                host, port, extra = config_mod.local_host(), c.info["port"], {}
             elif relay := gw.relay_url(c):
                 # Through the registry's gateway as an ordinary client call (it
                 # routes it on): with this machine's key, not the cluster token.
