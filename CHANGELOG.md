@@ -28,6 +28,15 @@ All notable changes to llm-runner (`llmctl`). The format follows
   so older llmctl versions can still read the state files. llmctl now also
   ignores unknown keys in `running.json`.
 
+### Changed
+
+- **H2O-Lightning-4B profile follows v1.4.1:** a score's confidence is now
+  its most likely level's probability, as in the vendor's shim since v1.4.1.
+  The prompt, temperatures and yes/no floor are unchanged since v1.2.3. Use
+  v1.4.1 weights: mradermacher/h2o-lightning-4b-GGUF holds older ones, and
+  its answers differ by up to 0.6 from v1.4.1's. h2oai's own GGUF is served
+  natively (llama.cpp b11773+), which skips the 0.801 yes/no floor.
+
 ### Fixed
 
 - **Gateway auth with a single bind address:** the bind address now counts as

@@ -1,8 +1,11 @@
 """H2O-Lightning-4B (h2oai), Qwen3.5-4B fine-tune.
 
 Source: ``h2o_lightning_shim.py`` and ``serve_config.json`` of
-h2oai/h2o-lightning-4b (identical at v1.2.3 and main). There is one prompt per
-question:
+h2oai/h2o-lightning-4b v1.4.1 (cc18ee33). Since v1.2.3 the one-way prompt,
+temperatures and yes/no floor are unchanged; v1.4.1 reports a score's
+confidence as its most likely level's probability. The vendor's default
+two-way reading needs its own vLLM build and is not ported. There is one
+prompt per question:
 
     <|im_start|>system\\n{SYSTEM}<|im_end|>\\n<|im_start|>user\\n{USER}<|im_end|>\\n
     <|im_start|>assistant\\n<think>\\n\\n</think>\\n\\nAnswer:
@@ -58,7 +61,7 @@ LABELS = (
 )
 assert len(LABELS) == 255 and len(set(LABELS)) == 255
 
-# The model card says tokenizer.json is identical at main and v1.2.3; this is main.
+# tokenizer.json is identical at v1.2.3, this revision and v1.4.1 (cc18ee33).
 H2O_LIGHTNING_TOKENIZER = TokenizerSource(
     repo="h2oai/h2o-lightning-4b",
     revision="9030a28dac81fcffd328f927e41a5deb85a27e5f",
@@ -138,6 +141,7 @@ class H2OLightning4B(Profile):
     name = "H2O-Lightning-4B"
     upstream = ("https://huggingface.co/h2oai/h2o-lightning-4b (h2o_lightning_shim.py, "
                 "serve_config.json)")
+    # holds pre-v1.4.0 weights; v1.4.1's own GGUF (h2oai) is served natively
     gguf_repos = ("mradermacher/h2o-lightning-4b-GGUF",)
     tokenizer_source = H2O_LIGHTNING_TOKENIZER
     temperatures = {"choice": 0.75, "noul": 0.8, "score": 0.65}
@@ -231,8 +235,8 @@ class H2OLightning4B(Profile):
             return {"type": "choice", "choice": keys[i], "confidence": normalized_confidence(p),
                     "probabilities": dict(zip(keys, p))}
         if q.type == "score":
-            return {"type": "score", "score": expected_index(p),
-                    "confidence": normalized_confidence(p),
+            # shim.format_answer since v1.4.1: the most likely level's probability
+            return {"type": "score", "score": expected_index(p), "confidence": float(max(p)),
                     "legend": dict(zip(keys, option_texts(q))),
                     "probabilities": dict(zip(keys, p))}
         py = commit_noul(float(p[0]))
@@ -263,7 +267,7 @@ class H2OLightning4B(Profile):
     def spec(self) -> dict:
         return {
             "confidence": {"choice": "(max p - 1/n) / (1 - 1/n)",
-                           "score": "(max p - 1/n) / (1 - 1/n)",
+                           "score": "max p (the most likely level's probability)",
                            "noul": "max(p, 1 - p) of the reported (floored) P(true)"},
             "labels": ("A..Z, a..z, 23 Greek letters, then common English word pieces "
                        "(255 in all), one per option in the order given; read as the token "

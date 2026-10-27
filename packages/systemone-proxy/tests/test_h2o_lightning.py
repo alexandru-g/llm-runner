@@ -187,7 +187,7 @@ def test_choice_and_score(prof):
     ps = sm([-1.0, -0.5, -2.0], 0.65)
     assert s["score"] == pytest.approx(ps[1] + 2 * ps[2], abs=1e-12)
     assert s["legend"] == {"0": "Low", "1": "Medium", "2": "High"}
-    assert s["confidence"] == pytest.approx((max(ps) - 1 / 3) / (1 - 1 / 3))
+    assert s["confidence"] == pytest.approx(max(ps))           # v1.4.1
     assert set(s) == {"type", "score", "confidence", "legend", "probabilities"}
 
 
