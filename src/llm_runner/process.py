@@ -97,7 +97,7 @@ class LaunchSpec:
 def port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.2)
-        return s.connect_ex(("127.0.0.1", port)) == 0
+        return s.connect_ex((config_mod.local_host(), port)) == 0
 
 
 def _load() -> list[RunningProcess]:

@@ -5,6 +5,19 @@ All notable changes to llm-runner (`llmctl`). The format follows
 [semantic versioning](https://semver.org); what the version protects is in
 [docs/compatibility.md](docs/compatibility.md).
 
+## [Unreleased]
+
+### Fixed
+
+- **`llmctl config bind` to a single non-loopback address** (e.g. a Docker
+  bridge address, 172.19.0.1): llmctl dialled 127.0.0.1 to reach its own
+  listeners, which refuse it on such a bind. `llmctl gateway` reported "not
+  answering" and exited 1, and `gateway restart` failed. Worse, the gateway
+  couldn't reach local models, and health waits, the supervisor and port
+  checks failed too. They now dial the bind address. Loopback is still used
+  for 0.0.0.0, `::` and `localhost`. A decision endpoint restarted after a
+  bind change follows its llama-server to the new address.
+
 ## [1.4.0] - 2026-10-27
 
 ### Added

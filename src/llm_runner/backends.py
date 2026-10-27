@@ -40,6 +40,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from llm_runner import config
 
 LLAMA = "llama"
 VLLM = "vllm"
@@ -94,6 +97,12 @@ def with_bind_host(cmd: list[str], backend: str, host: str) -> list[str]:
     elif backend in (DECIDE, GATEWAY):
         # Recorded before llmctl passed --host; both default to 0.0.0.0.
         cmd += ["--host", host]
+    if backend == DECIDE and "--backend" in cmd[:-1]:
+        # The llama-server behind it moved to the same address.
+        i = cmd.index("--backend") + 1
+        port = urlsplit(cmd[i]).port
+        if port is not None:
+            cmd[i] = config.local_url(port, bind=host)
     return cmd
 
 
@@ -134,7 +143,6 @@ def find_engine(backend: str) -> str | None:
         p = Path(env).expanduser()
         return str(p) if p.is_file() else None
 
-    from llm_runner import config
     configured = config.get_engine_bin(backend)
     if configured and configured.is_file():
         return str(configured)

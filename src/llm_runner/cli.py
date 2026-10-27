@@ -299,7 +299,7 @@ def _log_tail(path: str, lines: int = 25) -> str:
 def _wait_healthy(rec: proc.RunningProcess, timeout: float) -> bool:
     """Poll ``/health`` until the server answers 200, the process dies, or
     ``timeout`` elapses. llama-server, vllm and sglang all expose it."""
-    url = f"http://127.0.0.1:{rec.port}/health"
+    url = config_mod.local_url(rec.port, "/health")
     deadline = time.time() + timeout
     spinner = "|/-\\"
     i = 0
@@ -1477,7 +1477,7 @@ def _echo_cluster_line(status: dict) -> None:
 
 def _gateway_get(port: int, path: str) -> dict:
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as r:
+        with urllib.request.urlopen(config_mod.local_url(port, path), timeout=5) as r:
             return json.loads(r.read())
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise click.ClickException(f"gateway on port {port} not answering: {e}") from None
@@ -1819,8 +1819,12 @@ def decide() -> None:
 
 
 def _proxy_attached_to(port: int) -> list[proc.RunningProcess]:
-    needle = f"http://127.0.0.1:{port}"
-    return [p for p in proc.list_running() if p.backend == backends.DECIDE and needle in p.cmd]
+    def backend_port(cmd: list[str]) -> int | None:
+        if "--backend" not in cmd[:-1]:
+            return None
+        return urllib.parse.urlsplit(cmd[cmd.index("--backend") + 1]).port
+    return [p for p in proc.list_running()
+            if p.backend == backends.DECIDE and backend_port(p.cmd) == port]
 
 
 @decide.command("start")
@@ -1882,7 +1886,7 @@ def decide_start(identifier: str | None, port: int | None, profile: str | None, 
         concurrency = (int(cmd[cmd.index("--parallel") + 1])
                        if "--parallel" in cmd[:-1] and cmd[cmd.index("--parallel") + 1].isdigit()
                        else 1)
-    cmd = [binary, "serve", "--backend", f"http://127.0.0.1:{target.port}",
+    cmd = [binary, "serve", "--backend", config_mod.local_url(target.port),
            "--host", config_mod.get_bind_host(),
            "--port", str(chosen_port), "--profile", profile,
            "--concurrency", str(concurrency), "--cache", cache,
@@ -1892,10 +1896,10 @@ def decide_start(identifier: str | None, port: int | None, profile: str | None, 
                      group=f"{base}.decide" if (base := registry.group_of(
                          target.name, target.backend, target.model_path, target.group)) else "")
     click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  profile={profile}")
-    click.echo(f"Endpoint: POST http://127.0.0.1:{rec.port}/v1/systemone  "
+    click.echo(f"Endpoint: POST {config_mod.local_url(rec.port)}/v1/systemone  "
                f"(→ llama-server :{target.port})")
     click.echo(f"Contract: llmctl decide spec {target.name}   "
-               f"or GET http://127.0.0.1:{rec.port}/v1/spec")
+               f"or GET {config_mod.local_url(rec.port)}/v1/spec")
     click.echo(f"Logs:     llmctl logs {rec.name}")
     _ensure_gateway()
     if wait and not _wait_healthy(rec, timeout=300):
@@ -2075,7 +2079,7 @@ def gateway_restart() -> None:
     rec = _bounce_gateway(gw)
     for _ in range(40):
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{rec.port}/healthz", timeout=1):
+            with urllib.request.urlopen(config_mod.local_url(rec.port, "/healthz"), timeout=1):
                 return
         except (OSError, ValueError):
             time.sleep(0.25)
