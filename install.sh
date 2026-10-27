@@ -53,10 +53,10 @@ install_with_venv() {
     say "Installing via python venv at $venv"
     python3 -m venv "$venv"
     if [[ -n "$OFFLINE_DIR" ]]; then
-        "$venv/bin/pip" install --quiet --no-index --find-links "$OFFLINE_DIR" llm-runner
+        "$venv/bin/pip" install --quiet --upgrade --no-index --find-links "$OFFLINE_DIR" llm-runner
     else
         "$venv/bin/pip" install --quiet --upgrade pip
-        "$venv/bin/pip" install --quiet "$REPO_DIR"
+        "$venv/bin/pip" install --quiet --upgrade "$REPO_DIR"
     fi
     mkdir -p "$HOME/.local/bin"
     ln -sf "$venv/bin/llmctl" "$HOME/.local/bin/llmctl"
@@ -96,7 +96,7 @@ else
     say "Installing systemone-proxy via python venv at $venv"
     python3 -m venv "$venv"
     "$venv/bin/pip" install --quiet --upgrade pip
-    "$venv/bin/pip" install --quiet "$PROXY_DIR"
+    "$venv/bin/pip" install --quiet --upgrade "$PROXY_DIR"
     ln -sf "$venv/bin/systemone-proxy" "$HOME/.local/bin/systemone-proxy"
 fi
 

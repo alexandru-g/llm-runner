@@ -1,6 +1,9 @@
 """API keys on the gateway, required of callers from outside the local
-networks. Loopback is always local (the CLI calls its own gateway); to want
-keys from the LAN too, narrow the local networks to loopback.
+networks. Loopback is always local (the CLI calls its own gateway), and so
+is the bind address when it is a single one (``llmctl config bind
+172.19.0.1``): the CLI's calls then come from it, and the kernel drops packets
+from outside that claim it. To want keys from the LAN too, narrow the local
+networks to loopback.
 
 Who the caller is: the peer address, except that a request from a reverse
 proxy is judged by the address the proxy forwarded (the last entry of
@@ -71,6 +74,8 @@ class Policy:
     # sha256 of the scrape-only token for /metrics*, or None: then scrapes
     # need an API key like any other call.
     metrics_token: str | None = None
+    # The configured bind address when it is one address: this machine's own.
+    own: tuple = ()
 
     def caller(self, peer: str, headers) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
         """The address a request is judged by; None means "unknown", i.e.
@@ -98,7 +103,7 @@ class Policy:
         return bool(forwarded) and self.is_local(ip)
 
     def is_local(self, ip) -> bool:
-        return ip is not None and (ip.is_loopback or any(
+        return ip is not None and (ip.is_loopback or ip in self.own or any(
             ip.version == n.version and ip in n for n in self.local))
 
     def needs_key(self, peer: str, headers) -> bool:
@@ -142,8 +147,15 @@ def policy_from(cfg: dict) -> Policy:
         # keep the mode and keys, use the defaults, and say so.
         print(f"auth: ignoring the networks in the config ({e}); using the defaults",
               flush=True)
-        return Policy(mode=mode, keys=dict(keys), metrics_token=mtok)
-    return Policy(mode=mode, keys=dict(keys), local=local, proxies=proxies, metrics_token=mtok)
+        return Policy(mode=mode, keys=dict(keys), metrics_token=mtok, own=_own(cfg))
+    return Policy(mode=mode, keys=dict(keys), local=local, proxies=proxies, metrics_token=mtok,
+                  own=_own(cfg))
+
+
+def _own(cfg: dict) -> tuple:
+    """The bind address, when it is one address rather than every interface."""
+    ip = _ip(cfg.get("bind_host") if isinstance(cfg.get("bind_host"), str) else None)
+    return () if ip is None or ip.is_unspecified else (ip,)
 
 
 class ConfigPolicy:

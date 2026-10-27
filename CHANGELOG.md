@@ -21,6 +21,17 @@ All notable changes to llm-runner (`llmctl`). The format follows
   (vllm-d3) both default to the context size, since each prompt has to fit
   one batch.
 
+### Fixed
+
+- **Gateway auth with a single bind address:** the bind address now counts as
+  local, like loopback, because llmctl's own calls come from it. Before, with
+  `gateway auth on`, local networks narrowed to loopback and `config bind
+  172.19.0.1`, `llmctl gateway` got 401. Containers on that bridge still need
+  a key.
+- `install.sh` without uv or pipx (plain venv) now upgrades an existing
+  install: offline installs from a newer wheelhouse used to keep the old
+  version.
+
 ## [1.4.1] - 2026-10-27
 
 ### Fixed

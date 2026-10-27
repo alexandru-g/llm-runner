@@ -70,6 +70,24 @@ def test_narrowing_local_to_loopback_wants_keys_from_the_lan():
     assert not p.needs_key("127.0.0.1", {}) and not p.needs_key("::1", {})
 
 
+@pytest.mark.parametrize("bind, own", [("172.19.0.1", True), ("fd00::1", True),
+                                       ("0.0.0.0", False), ("::", False), (None, False)])
+def test_a_single_bind_address_is_local(bind, own):
+    """The CLI's calls to a gateway on 172.19.0.1 come from 172.19.0.1, even
+    with the local networks narrowed to loopback."""
+    cfg = {"gateway_auth": "on", "gateway_local_networks": ["127.0.0.0/8"]}
+    if bind:
+        cfg["bind_host"] = bind
+    p = auth.policy_from(cfg)
+    if own:
+        assert not p.needs_key(bind, {})
+    assert p.needs_key("172.19.0.2", {}) and p.needs_key("fd00::2", {})   # its containers
+    assert not p.needs_key("127.0.0.1", {})
+    # It isn't a proxy: a forwarded outside address is still outside.
+    assert p.needs_key("172.19.0.1", {"X-Forwarded-For": "203.0.113.9"})
+    assert auth.policy_from({**cfg, "gateway_local_networks": ["nope"]}).own == p.own
+
+
 def test_keys_by_bearer_or_x_api_key():
     assert ON.key_name({"Authorization": f"Bearer {KEY}"}) == "laptop"
     assert ON.key_name({"Authorization": f"bearer {KEY}"}) == "laptop"

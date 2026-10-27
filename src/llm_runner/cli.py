@@ -2151,7 +2151,8 @@ def gateway_auth(state: str | None, local: tuple[str, ...], local_default: bool,
     OpenAI clients send for their api_key) or `X-Api-Key: <key>`; without
     one it gets 401. Callers on a local network (default: loopback, the
     private ranges, Tailscale's 100.64.0.0/10, IPv6 ULA and link-local) need
-    none. A request that a proxy on a local network forwards is judged by
+    none. Loopback and a single bind address (`llmctl config bind`) are
+    always local: llmctl's own calls come from them. A request that a proxy on a local network forwards is judged by
     the client address in its X-Forwarded-For, so a reverse proxy in front
     of the gateway (nginx, Caddy, Traefik) does not make the internet local.
     Health checks (/health, /healthz, /readyz), cluster hops and the
@@ -2176,7 +2177,8 @@ def gateway_auth(state: str | None, local: tuple[str, ...], local_default: bool,
     click.echo(f"Auth:     {policy.mode}" + ("  (every caller is let in)"
                                              if policy.mode == auth.OFF else
                                              "  (outside callers need a key)"))
-    click.echo("Local:    " + ", ".join(map(str, policy.local)) + "  (+ loopback)")
+    click.echo("Local:    " + ", ".join(map(str, policy.local)) + "  (+ loopback"
+               + "".join(f", {ip}" for ip in policy.own) + ")")
     click.echo("Proxies:  " + (", ".join(map(str, policy.proxies)) or
                                "(none listed; any local peer's X-Forwarded-For is used)"))
     click.echo("Keys:     " + (", ".join(sorted(policy.keys)) or "(none)"))
