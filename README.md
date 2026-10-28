@@ -651,6 +651,10 @@ llmctl stop 12345                  # by PID
 ```
 
 Sends `SIGTERM` to the process group; escalates to `SIGKILL` after 10 s.
+A stopped model leaves autostart. So does a model that isn't running (it
+crashed, or the supervisor is between restarts): `llmctl stop NAME` takes it
+out of autostart, so it isn't restarted or brought back at boot, and stops
+a decision endpoint still attached to it.
 
 ### Re-run a model with its last arguments
 

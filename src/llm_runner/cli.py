@@ -1606,7 +1606,7 @@ def stop(identifier: str | None) -> None:
         identifier = str(target.pid)
     rec = proc.stop(identifier)
     if rec is None:
-        raise click.UsageError(f"No running model matches '{identifier}'.")
+        return _forget_down(identifier)
     click.echo(f"Stopped {rec.name}  pid={rec.pid}  port={rec.port}")
     stopped = [rec]
     # A decision endpoint is useless without its model: take it down too.
@@ -1626,6 +1626,27 @@ def stop(identifier: str | None) -> None:
             and not config_mod.get_cluster().enabled:
         proc.stop(str(gw.pid))
         click.echo(f"Stopped gateway  pid={gw.pid}  port={gw.port}  (no models left)")
+
+
+def _forget_down(name: str) -> None:
+    """`stop` for a model that isn't running (it crashed, or failed to
+    start): take it out of autostart so the supervisor stops restarting it
+    and a reboot doesn't bring it back, with any decision endpoint still
+    attached to its port."""
+    from llm_runner import supervisor
+    spec = proc.autostart_find(name)
+    if spec is None or spec.backend == GATEWAY:
+        raise click.UsageError(f"No running model matches '{name}'.")
+    state = (supervisor.read_states().get(name) or {}).get("state") or "not running"
+    proc.autostart_remove(name)
+    click.echo(f"Removed {name} from autostart (it was {state}; port {spec.port})")
+    proc.record_event(name, "stopped", f"by stop; was {state}", port=spec.port, by="stop",
+                      owner=spec.owner)
+    for p in _proxy_attached_to(spec.port):
+        proc.stop(str(p.pid))
+        click.echo(f"Stopped {p.name}  pid={p.pid}  port={p.port}")
+        proc.record_event(p.name, "stopped", f"by stop; pid {p.pid}", pid=p.pid,
+                          port=p.port, by="stop", owner=p.owner)
 
 
 def _resolve_running_target(identifier: str | None) -> proc.RunningProcess:

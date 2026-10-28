@@ -7,6 +7,13 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `llmctl stop NAME` on a model that crashed or failed to start used to say
+  "No running model" and leave it in autostart, so the supervisor kept
+  restarting it and a reboot brought it back. It now removes it from
+  autostart (and stops its decision endpoint), with a `stopped` event.
+
 ## [1.6.0] - 2026-10-28
 
 ### Added

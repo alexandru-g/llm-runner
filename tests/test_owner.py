@@ -92,3 +92,28 @@ def test_the_gateway_lists_the_owner(tmp_path, host):  # noqa: F811
     models = gw.LocalModels(proc.STATE_FILE)
     [m] = models.models()
     assert models.describe(m)["llmctl"]["owner"] == "A1"
+
+
+def test_stop_forgets_a_crashed_model(tmp_path, host):  # noqa: F811
+    """A model that died (and that the supervisor keeps restarting) is
+    taken out of autostart by `stop`, instead of 'No running model'."""
+    import os
+    import signal
+    import time
+    assert _run("--owner", "A1").exit_code == 0
+    [rec] = proc.list_running()
+    os.killpg(rec.pid, signal.SIGKILL)
+    for _ in range(40):
+        if not proc.list_running():
+            break
+        time.sleep(0.05)
+    (proc.STATE_DIR / "supervisor.json").write_text(json.dumps(
+        {"models": {rec.name: {"state": "crashed", "restarts": 5}}}))
+    r = CliRunner().invoke(cli.cli, ["stop", rec.name])
+    assert r.exit_code == 0, r.output
+    assert "Removed" in r.output and "crashed" in r.output
+    assert proc.autostart_find(rec.name) is None
+    [ev] = [e for e in _events(tmp_path) if e["event"] == "stopped"]
+    assert ev["owner"] == "A1" and "was crashed" in ev["detail"]
+    r = CliRunner().invoke(cli.cli, ["stop", rec.name])          # nothing left to stop
+    assert r.exit_code != 0 and "No running model" in r.output
