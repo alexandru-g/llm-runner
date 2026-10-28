@@ -7,6 +7,8 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-28
+
 ### Added
 
 - **Decision models:** Xevn-4B and iota-decide-4b v0.3 profiles in
@@ -255,6 +257,7 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.5.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.5.0
 [1.4.1]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.4.1
 [1.4.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.4.0
 [1.3.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.3.0

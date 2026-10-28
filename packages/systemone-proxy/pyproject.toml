@@ -1,6 +1,6 @@
 [project]
 name = "systemone-proxy"
-version = "0.2.2"
+version = "0.3.0"
 description = "Serve calibrated decision models (Quyet, Rune, Xor, Bobcat, h2o-lightning, Xevn, iota-decide, and llama-server's native ones such as vllm-d3) behind one /v1/systemone API on top of llama-server."
 readme = "README.md"
 requires-python = ">=3.11"
