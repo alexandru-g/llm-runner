@@ -889,8 +889,11 @@ fraction of **total** GPU memory up front (all of it, as KV cache — even for
 a tiny model) and refuses to start if it isn't free. SGLang's fraction covers
 weights and the KV pool; its activations and CUDA graphs come out of the
 rest. When omitted, llmctl computes it from the VRAM free at launch (minus
-~0.75 GB headroom capped at 0.9 for vllm, ~3 GB capped at 0.88 for sglang)
-and prints the value it chose. So:
+1.5 GB headroom capped at 0.9 for vllm, which holds up to ~0.85 GB more than
+its share; ~3 GB capped at 0.88 for sglang) and prints the value it chose.
+Free memory changes between launches, and so does the KV cache: a benchmark
+that needs the same cache every run should pin `--gpu-mem` or
+`--kv-cache-mem`. So:
 
 - vllm/sglang alone → it takes ~everything. Fine.
 - llama model already running → the default fits in what's left. Fine.

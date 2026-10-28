@@ -550,12 +550,18 @@ def gpu_memory_mib(device: int = 0) -> tuple[int, int] | None:
 # version). It checks the fraction against *total* VRAM at startup and aborts
 # if that much isn't free, so we never ask for more than is actually free.
 VLLM_DEFAULT_GPU_MEM = 0.9
-# (headroom MiB, cap) per engine. vLLM's fraction covers everything it
-# allocates, so the headroom is just the CUDA context, torch.compile workspace
-# and other tenants. SGLang's --mem-fraction-static covers only weights + KV
-# pool; activations and CUDA graphs come out of what is left, so it needs
-# more of it. Its cap leaves the same share free on an idle card.
-_GPU_MEM_POLICY = {VLLM: (768, VLLM_DEFAULT_GPU_MEM), SGLANG: (3072, 0.88)}
+# (headroom MiB, cap) per engine. vLLM's fraction is meant to cover all it
+# allocates, but it overshoots: ministral-3-14b FP8 on a 24 GB card (vLLM
+# 0.2x, CUDA graph profiling on) asked for 0.79 = 18.64 GiB and held 19.48
+# GiB when it died, 0.84 GiB over (non-torch memory and CUDA graph
+# estimates). With 768 MiB of headroom that start ran out of memory, so the
+# headroom is that overshoot plus ~0.7 GiB for other tenants (a desktop)
+# growing between this reading and vLLM's own. Free memory moves with them,
+# so the share still varies between launches: pin --gpu-mem or --kv-cache-mem
+# where a run must be repeatable. SGLang's --mem-fraction-static covers only
+# weights + KV pool; activations and CUDA graphs come out of what is left,
+# so it needs more. Its cap leaves the same share free on an idle card.
+_GPU_MEM_POLICY = {VLLM: (1536, VLLM_DEFAULT_GPU_MEM), SGLANG: (3072, 0.88)}
 
 
 def default_gpu_mem(backend: str = VLLM) -> tuple[float, str] | None:

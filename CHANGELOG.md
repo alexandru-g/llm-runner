@@ -13,6 +13,12 @@ All notable changes to llm-runner (`llmctl`). The format follows
   "No running model" and leave it in autostart, so the supervisor kept
   restarting it and a reboot brought it back. It now removes it from
   autostart (and stops its decision endpoint), with a `stopped` event.
+- vLLM's default `--gpu-mem` (from free VRAM) now leaves 1.5 GiB instead of
+  768 MiB. vLLM holds up to ~0.85 GiB more than its share (non-torch memory
+  and CUDA graphs), so on a busy 24 GB desktop card a start could run out of
+  memory. For a 14B FP8 model on ws, 0.79 becomes 0.75. The share still
+  follows free memory, so pin `--gpu-mem` or `--kv-cache-mem` for repeatable
+  runs.
 
 ## [1.6.0] - 2026-10-28
 

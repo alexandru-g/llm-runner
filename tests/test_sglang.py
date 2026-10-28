@@ -155,6 +155,16 @@ def test_gpu_mem_default_leaves_sglang_more_headroom(monkeypatch):
     assert backends.default_gpu_mem(backends.SGLANG)[0] == 0.2
 
 
+def test_vllm_share_leaves_room_for_its_overshoot(monkeypatch):
+    """ws, 2026-10-28: 19.4 GiB of 23.59 free; 0.79 ran out of memory (vLLM
+    held 0.84 GiB more than it asked for)."""
+    total = 24156
+    monkeypatch.setattr(backends, "gpu_memory_mib", lambda device=0: (19866, total))
+    share, _ = backends.default_gpu_mem(backends.VLLM)
+    assert share == 0.75
+    assert 19866 - share * total >= 0.84 * 1024 + 512
+
+
 # ------------------------------------------------------------- discovery --
 
 def _exe(path: Path) -> Path:
