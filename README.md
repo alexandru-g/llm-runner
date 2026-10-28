@@ -1018,9 +1018,14 @@ any$  llmctl ps --all                           # every model, and where calls g
   its own exact name. A prefix that matches several quants of one group
   (`"gemma-4-26b"`) means the group. `llmctl run MODEL --group NAME` puts a
   model in another group (e.g. two different models you treat as
-  interchangeable), `--group none` in none. `/v1/models` lists a group as a
-  model of its own once it has two members (`llmctl.members`), and every
-  model shows its `llmctl.group`. Exact ids still mean exactly that model.
+  interchangeable), `--group none` in none. Several names, comma-separated,
+  put it in each: `--group assistant,gemma-4-26b-a4b-it` (or `group:
+  [assistant, gemma-4-26b-a4b-it]` in a serving file) lets one stable name
+  reach whichever machine's model is up while the model keeps its usual
+  group. `/v1/models` lists a group as a model of its own once it has two
+  members (`llmctl.members`), and every model shows its `llmctl.group` (the
+  first) and, with several, `llmctl.groups`. Exact ids still mean exactly
+  that model. Nodes before 1.6 route by the first group only.
 - **Spill-over.** Priority decides who gets a call, unless that instance is
   full. When every slot of the preferred instance is busy (llama-server's
   `/slots`; waiting requests on vLLM and SGLang; a decision endpoint counts as busy as
@@ -1421,6 +1426,20 @@ llmctl config gateway-otlp http://lab:4318     # export spans (off by default)
 llmctl gateway restart                         # both take effect at a restart
 ```
 
+Straight to [Phoenix](https://phoenix.arize.com), which takes OTLP protobuf
+only, with a Phoenix project per API key:
+
+```bash
+llmctl config gateway-otlp http://lab:6006 --protocol protobuf \
+    --header "Authorization=Bearer <phoenix api key>"   # when Phoenix has auth on
+llmctl config gateway-otlp-project pa personal-assistant   # calls with key "pa"
+llmctl config gateway-otlp-project '*' none                # export no other call
+llmctl gateway restart
+```
+
+A project per key needs the client to send its key (`llmctl gateway key add
+pa`), even from the LAN where the gateway doesn't ask for one.
+
 - JSON lines have `ts`, `level`, `node`, `event` and `msg`. Each call
   logs `event: "request"` with `request_id`, `trace_id`, `method`, `path`,
   `model`, `backend`, `served_by`, `status`, `code`, `duration_ms`,
@@ -1437,11 +1456,27 @@ llmctl gateway restart                         # both take effect at a restart
   and sends each engine a `traceparent` for its upstream attempt. With an
   OTLP endpoint it exports a server span per call and a client span per
   attempt, from a background queue that drops spans rather than slowing
-  calls. vLLM exports its own spans when started with
-  `args: ["--otlp-traces-endpoint", "http://lab:4317"]`; the pinned image
-  includes the OpenTelemetry SDK.
-- `LLM_RUNNER_GATEWAY_LOG` and `LLM_RUNNER_GATEWAY_OTLP` override the two
-  settings.
+  calls. Failover attempts, `/v1/systemone` and `/v1/embeddings` are
+  covered the same way; `tracestate` passes through. vLLM exports its own
+  spans when started with `args: ["--otlp-traces-endpoint",
+  "http://lab:4317"]`; the pinned image includes the OpenTelemetry SDK.
+- Spans carry metadata only, never prompts, replies, tool calls, decision
+  state or questions, or embedding inputs. Resource: `service.name`
+  (`llmctl-gateway`), `service.version`, `host.name`, and with a project
+  `openinference.project.name`. The server span (`POST /v1/...`):
+  `http.request.method`, `url.path` (no query), `llmctl.request_id`,
+  `llmctl.node`, `llmctl.key_name` (the API key's name, when projects are
+  set), `http.response.status_code`, `error.type`, `llmctl.model`,
+  `llmctl.backend`, `llmctl.served_by`, `llmctl.ttft_ms`,
+  `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`,
+  `llmctl.failovers`, and from llama-server's `timings`
+  `llmctl.prefill_ms`, `llmctl.prefill_tokens`, `llmctl.cached_tokens`,
+  `llmctl.decode_ms`, `llmctl.decode_tokens_per_s`. Each attempt span
+  (`upstream <model>`): `llmctl.model`, `llmctl.node`, `server.address`,
+  `server.port`, `http.response.status_code`, `error.type`.
+- `LLM_RUNNER_GATEWAY_LOG`, `LLM_RUNNER_GATEWAY_OTLP`,
+  `LLM_RUNNER_GATEWAY_OTLP_PROTOCOL` and `LLM_RUNNER_GATEWAY_OTLP_HEADERS`
+  (`Name=value,Name2=value2`) override the settings.
 
 ## Configuration
 

@@ -74,6 +74,15 @@ class Instance:
     def group(self) -> str:
         return self.info.get("group") or ""
 
+    @property
+    def groups(self) -> list[str]:
+        """Every group name it answers to; ``group`` is the first (and the
+        only one llmctl before 1.6 sends)."""
+        return self.info.get("groups") or ([self.group] if self.group else [])
+
+    def answers_to(self, name: str) -> bool:
+        return name == self.id or name in self.groups
+
 
 def order(cands: list[Instance]) -> list[Instance]:
     """Best first: ready, then lowest priority number, then local, then name."""
@@ -96,10 +105,11 @@ def pick(instances: list[Instance], requested: object, api: str,
     pool = [i for i in instances if i.api == api]
     kind = "decision endpoint" if api == SYSTEMONE else "model"
     ids = sorted({i.id for i in pool})
-    groups = {i.group: [] for i in pool if i.group and i.group not in ids}
+    groups = {g: [] for i in pool for g in i.groups if g not in ids}
     for i in pool:
-        if i.group in groups:
-            groups[i.group].append(i.id)
+        for g in i.groups:
+            if g in groups:
+                groups[g].append(i.id)
     listing = ", ".join(ids) or "(none running)"
     if requested is not None and not isinstance(requested, str):
         raise Unroutable(400, "invalid_model", "\"model\" must be a string.")
@@ -133,7 +143,7 @@ def pick(instances: list[Instance], requested: object, api: str,
             raise Unroutable(404, "model_not_found",
                              f"No running {kind} named \"{name}\". Running: {listing}")
 
-    cands = [i for i in pool if chosen in (i.id, i.group)]
+    cands = [i for i in pool if i.answers_to(chosen)]
     if node is not None:
         where = ", ".join(sorted({i.node for i in cands}))
         cands = [i for i in cands if i.node == node]

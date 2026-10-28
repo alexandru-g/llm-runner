@@ -93,6 +93,10 @@ class Model:
     def api(self) -> str:
         return SYSTEMONE if self.backend in (DECIDE, DECIDER) else OPENAI
 
+    @property
+    def groups(self) -> list[str]:
+        return _groups(self.group)
+
 
 def _flag(cmd: tuple[str, ...], *names: str) -> str | None:
     for i, a in enumerate(cmd[:-1]):
@@ -182,6 +186,11 @@ def _group_of(rec: dict) -> str:
     from llm_runner.registry import group_of
     return group_of(rec["name"], rec.get("backend", "llama"), rec.get("model_path", ""),
                     rec.get("group"))
+
+
+def _groups(group: str | None) -> list[str]:
+    from llm_runner.registry import split_groups
+    return split_groups(group)
 
 
 class LocalModels:
@@ -328,9 +337,12 @@ class LocalModels:
     def describe(self, m: Model, models: list[Model] | None = None) -> dict:
         info: dict = {"backend": m.backend, "api": m.api, "port": m.port,
                       "path_prefix": f"/m/{m.name}", "status": self.status(m),
-                      "group": m.group or None, "owner": m.owner, "model_path": m.model_path,
+                      "group": (m.groups or [None])[0], "owner": m.owner,
+                      "model_path": m.model_path,
                       "runtime": m.runtime[0], "image": m.runtime[1],
                       "image_digest": m.runtime[2], "image_id": m.runtime[3]}
+        if len(m.groups) > 1:
+            info["groups"] = m.groups
         if m.backend == DECIDE:
             # It reads images when the llama-server behind it has an mmproj.
             upstream = urlsplit(_flag(m.cmd, "--backend") or "").port
@@ -471,8 +483,10 @@ class Gateway:
             else None
         self._last_log: tuple | None = None
         self.metrics = GatewayMetrics(self)
-        # OTLP span export, when configured (serve() sets it up).
+        # OTLP span export, when configured (serve() sets it up), and the
+        # Phoenix project for each API key name ("*": everything else).
         self.exporter: tracing.Exporter | None = None
+        self.trace_projects: dict[str, str] = {}
         # Restarts crashed models; its loop runs in serve().
         self.supervisor = sup_mod.Supervisor(
             on_restart=lambda name: self.metrics.restarts.inc(model=name, node=self.node))
@@ -548,14 +562,15 @@ class Gateway:
         # member is reachable by its group name too, but needn't be listed twice).
         by_group: dict[str, list[Instance]] = {}
         for i in insts:
-            if i.group:
-                by_group.setdefault(i.group, []).append(i)
+            for g in i.groups:
+                by_group.setdefault(g, []).append(i)
         for name, members in by_group.items():
             ids = sorted({i.id for i in members})
             if len(ids) > 1 and name not in by_id:
                 e = self.entry(order(members))
                 e["id"] = name
                 e["llmctl"].update(group=name, members=ids, path_prefix=f"/m/{name}")
+                e["llmctl"].pop("groups", None)          # the first member's, not this one's
                 for n, c in zip(e["llmctl"]["nodes"], order(members)):
                     n["model"] = c.id
                 out.append(e)
@@ -681,31 +696,47 @@ class Gateway:
                           for n in self.view.nodes()]}
 
 
-def _usage_and_code(body: bytes, stream: bool) -> tuple[dict | None, str | None]:
-    """``usage`` and ``error.code`` from a reply body (JSON), or from the
-    last SSE event that carries a usage."""
+# llama-server's `timings` → span attributes (llmctl.<name>): numbers only.
+_TIMINGS = {"prompt_ms": "prefill_ms", "prompt_n": "prefill_tokens", "cache_n": "cached_tokens",
+            "predicted_ms": "decode_ms", "predicted_per_second": "decode_tokens_per_s"}
+
+
+def _last_event(body: bytes, key: bytes) -> dict:
+    """The last SSE event whose data names ``key``."""
+    for line in reversed(body.split(b"\n")):
+        if line.startswith(b"data:") and key in line:
+            try:
+                doc = json.loads(line[5:])
+            except ValueError:
+                continue
+            return doc if isinstance(doc, dict) else {}
+    return {}
+
+
+def _reply_meta(body: bytes, stream: bool) -> tuple[dict | None, str | None, dict | None]:
+    """``usage``, ``error.code`` and llama-server's ``timings`` (renamed, see
+    _TIMINGS) from a reply body (JSON), or from the last SSE events that
+    carry them. Nothing else of a reply is kept."""
     if not body:
-        return None, None
-    docs: list = []
+        return None, None, None
     if stream:
-        for line in reversed(body.split(b"\n")):
-            if line.startswith(b"data:") and b'"usage"' in line:
-                try:
-                    docs = [json.loads(line[5:])]
-                except ValueError:
-                    continue
-                break
+        doc, timed = _last_event(body, b'"usage"'), _last_event(body, b'"timings"')
     else:
         try:
-            docs = [json.loads(body)]
+            doc = json.loads(body)
         except ValueError:
-            return None, None
-    doc = docs[0] if docs and isinstance(docs[0], dict) else {}
+            return None, None, None
+        doc = doc if isinstance(doc, dict) else {}
+        timed = doc
     usage = doc.get("usage") if isinstance(doc.get("usage"), dict) else None
     err = doc.get("error")
     code = err.get("code") if isinstance(err, dict) and isinstance(err.get("code"), str) \
         else None
-    return usage, code
+    t = timed.get("timings") if isinstance(timed.get("timings"), dict) else {}
+    timings = {name: round(t[k], 1) if isinstance(t[k], float) else t[k]
+               for k, name in _TIMINGS.items()
+               if isinstance(t.get(k), (int, float)) and not isinstance(t.get(k), bool)}
+    return usage, code, timings or None
 
 
 def make_handler(gw: Gateway):
@@ -759,7 +790,8 @@ def make_handler(gw: Gateway):
             if held := self._held(name):
                 return held
             for spec in proc.autostart_list():
-                if spec.backend != GATEWAY and name in (spec.name, spec.group):
+                if spec.backend != GATEWAY and (
+                        name == spec.name or name in _groups(spec.group)):
                     t = gw.supervisor.state(spec.name)
                     return (f"it is {t.state}" if t else "it is not running",
                             gw.supervisor.retry_after(spec.name))
@@ -773,7 +805,7 @@ def make_handler(gw: Gateway):
         @staticmethod
         def _held(name: str) -> tuple[str, int] | None:
             for held, h in proc.holds().items():
-                if name in (held, h.get("group")):
+                if name == held or name in _groups(h.get("group")):
                     return f"it is being restarted ({h.get('reason')})", HELD_RETRY_AFTER
             return None
 
@@ -824,13 +856,20 @@ def make_handler(gw: Gateway):
             self._obs = {"t0": time.monotonic(), "count": False, "inst": None,
                          "status": None, "code": None, "ttft": None, "usage": None,
                          "rid": sent_id if _REQUEST_ID.fullmatch(sent_id) else uuid.uuid4().hex,
-                         "failovers": 0, "bytes": 0, "trace": None}
+                         "failovers": 0, "bytes": 0, "trace": None, "timings": None}
             self._trace = tracing.Context.from_headers(self.headers)
             path = self.path.partition("?")[0]
+            key = None
+            if gw.exporter is not None and gw.trace_projects:
+                key = gw.access().key_name(self.headers)
+                project = gw.trace_projects.get(key or "")
+                self._trace.project = project if project is not None else \
+                    gw.trace_projects.get("*")
             self._span = self._trace.span(
                 f"{self.command} {path}", tracing.SERVER, **{
                     "http.request.method": self.command, "url.path": path,
-                    "llmctl.request_id": self._obs["rid"], "llmctl.node": gw.node})
+                    "llmctl.request_id": self._obs["rid"], "llmctl.node": gw.node,
+                    "llmctl.key_name": key})
             self._obs["trace"] = {"trace_id": self._trace.trace_id}
             try:
                 self._route()
@@ -868,7 +907,7 @@ def make_handler(gw: Gateway):
 
         def _export_span(self) -> None:
             path = self.path.partition("?")[0]
-            if gw.exporter is None or not self._trace.sampled or path in OPEN_PATHS \
+            if gw.exporter is None or not self._trace.exported or path in OPEN_PATHS \
                     or path.startswith("/metrics"):
                 return
             o, c = self._obs, self._obs["inst"]
@@ -882,7 +921,8 @@ def make_handler(gw: Gateway):
                 "llmctl.ttft_ms": None if o["ttft"] is None else round(o["ttft"] * 1000, 1),
                 "gen_ai.usage.input_tokens": usage.get("prompt_tokens"),
                 "gen_ai.usage.output_tokens": usage.get("completion_tokens"),
-                "llmctl.failovers": o["failovers"] or None})
+                "llmctl.failovers": o["failovers"] or None,
+                **{f"llmctl.{k}": v for k, v in (o["timings"] or {}).items()}})
             gw.exporter.submit(self._span)
 
         def _log_request(self) -> None:
@@ -984,7 +1024,7 @@ def make_handler(gw: Gateway):
                 name, _, rest = path[3:].partition("/")
                 name, node = split_pin(unquote(name))
                 insts = gw.instances(local_only=hop)
-                cands = order([i for i in insts if name in (i.id, i.group)
+                cands = order([i for i in insts if i.answers_to(name)
                                and (node is None or i.node == node)])
                 if not cands and node is None and (down := self._configured_down(name)):
                     return self._unavailable(name, down)
@@ -1256,7 +1296,7 @@ def make_handler(gw: Gateway):
             finally:
                 gw.metrics.in_flight.add(-1, **lbl)
                 conn.close()
-                if gw.exporter is not None and self._trace.sampled:
+                if gw.exporter is not None and self._trace.exported:
                     status = attempt.attrs.get("http.response.status_code") or 0
                     attempt.error = outcome != "done" or status >= 500
                     attempt.end()
@@ -1336,7 +1376,7 @@ def make_handler(gw: Gateway):
                         pass
                 self.close_connection = True
             finally:
-                self._obs["usage"], code = _usage_and_code(bytes(keep), stream)
+                self._obs["usage"], code, self._obs["timings"] = _reply_meta(bytes(keep), stream)
                 if resp.status >= 400 and code and not self._obs["code"]:
                     self._obs["code"] = code
 
@@ -1360,6 +1400,12 @@ def make_server(port: int, host: str = "0.0.0.0", gw: Gateway | None = None) -> 
     return httpd
 
 
+def otlp_headers(text: str | None) -> dict[str, str]:
+    """``"Name=value,Name2=value2"`` (as OTEL_EXPORTER_OTLP_HEADERS) to a dict."""
+    pairs = [p.partition("=") for p in (text or "").split(",") if p.strip()]
+    return {k.strip(): v.strip() for k, eq, v in pairs if eq and k.strip()}
+
+
 def serve(port: int = DEFAULT_PORT, host: str = "0.0.0.0") -> None:
     cluster = config_mod.get_cluster()
     gw = Gateway(LocalModels(), cluster, port)
@@ -1369,10 +1415,18 @@ def serve(port: int = DEFAULT_PORT, host: str = "0.0.0.0") -> None:
                    gw.node)
     endpoint = os.environ.get("LLM_RUNNER_GATEWAY_OTLP") or cfg.get("gateway_otlp_endpoint")
     if endpoint:
-        gw.exporter = tracing.Exporter(endpoint, {"service.name": "llmctl-gateway",
-                                                  "service.version": __version__,
-                                                  "host.name": gw.node})
-        logs.emit(f"otlp: exporting gateway spans to {gw.exporter.url}", event="otlp")
+        gw.exporter = tracing.Exporter(
+            endpoint, {"service.name": "llmctl-gateway", "service.version": __version__,
+                       "host.name": gw.node},
+            protocol=os.environ.get("LLM_RUNNER_GATEWAY_OTLP_PROTOCOL")
+            or cfg.get("gateway_otlp_protocol") or tracing.JSON,
+            headers=otlp_headers(os.environ.get("LLM_RUNNER_GATEWAY_OTLP_HEADERS"))
+            or cfg.get("gateway_otlp_headers"))
+        gw.trace_projects = dict(cfg.get("gateway_otlp_projects") or {})
+        logs.emit(f"otlp: exporting gateway spans to {gw.exporter.url} "
+                  f"({gw.exporter.protocol})" + (
+                      "; projects: " + ", ".join(f"{k}={v}" for k, v in gw.trace_projects.items())
+                      if gw.trace_projects else ""), event="otlp")
     logs.emit(f"llmctl gateway {__version__} on http://{host}:{port}/v1  "
               f"(node {gw.node}, state: {proc.STATE_FILE})", event="start",
               version=__version__, port=port)

@@ -7,6 +7,29 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-28
+
+### Added
+
+- **Several groups per model:** `llmctl run --group assistant,gemma-4-26b-a4b-it`
+  (or `group: [assistant, gemma-4-26b-a4b-it]` in a serving file) makes one
+  running model answer to each name. Routing, `/m/<group>/`, `/v1/models`
+  group entries and spill-over work for every one. `group` stays the first
+  name in `ps --json` and `/v1/models`, and `groups` lists them all. Nodes
+  before 1.6 route by the first only.
+- **Gateway traces into Phoenix:** `llmctl config gateway-otlp URL
+  --protocol protobuf` exports OTLP/HTTP protobuf (hand-encoded, standard
+  library only), and `--header` adds headers such as Phoenix's API key.
+  `llmctl config gateway-otlp-project KEY PROJECT` puts the spans of calls
+  made with an API key in a Phoenix project (`openinference.project.name`).
+  `'*'` covers every other call, and the project `none` exports none of
+  them.
+- Gateway spans now carry llama-server's prefill and decode timings
+  (`llmctl.prefill_ms`, `prefill_tokens`, `cached_tokens`, `decode_ms`,
+  `decode_tokens_per_s`). The README lists every span attribute; there is
+  still no content. A test checks that across chat, streams, tools,
+  embeddings, `/v1/systemone` and failover.
+
 ## [1.5.0] - 2026-10-28
 
 ### Added
@@ -257,6 +280,7 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.6.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.6.0
 [1.5.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.5.0
 [1.4.1]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.4.1
 [1.4.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.4.0

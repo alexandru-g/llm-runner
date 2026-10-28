@@ -107,8 +107,8 @@ def _cluster_groups() -> list[str]:
             data = json.loads(r.read())["data"]
     except (OSError, ValueError, KeyError):
         return []
-    return sorted({m["llmctl"]["group"] for m in data
-                   if m.get("llmctl", {}).get("group") and "members" not in m["llmctl"]})
+    return sorted({g for m in data if "members" not in m.get("llmctl", {"members": 1})
+                   for g in m["llmctl"].get("groups") or [m["llmctl"].get("group")] if g})
 
 
 def _group_values(t: Target) -> list[tuple[Any, str]]:

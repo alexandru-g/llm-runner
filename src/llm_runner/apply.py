@@ -6,6 +6,7 @@ A serving file says which models run on this host and how::
       qwen35-9b:                          # the name clients call (--name)
         model: qwen3.5-9b-2026.10.1       # a model key or folder under MODELS_DIR
         group: qwen3.5-9b                 # a stable route name across versions
+                                          # (or a list: [assistant, qwen3.5-9b])
         backend: vllm
         runtime: docker
         port: 8101
@@ -200,6 +201,15 @@ def _entry(path: Path, name_node: yaml.ScalarNode, node: yaml.Node,
                                     "strings or numbers")
                     continue
                 entry.args.append(str(val))
+        elif key == "group" and isinstance(v, yaml.SequenceNode):
+            names = [yaml.safe_load(yaml.serialize(i)) if isinstance(i, yaml.ScalarNode)
+                     else None for i in v.value]
+            if not names or not all(isinstance(n, str) and re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9_.-]*", n) for n in names):
+                problems.append(f"{_at(path, v)}: {what}.group must be a name or a list of "
+                                "names (letters, digits, '.', '_' and '-')")
+                continue
+            entry.options["group"] = ",".join(dict.fromkeys(names))
         elif key == "dns":
             from llm_runner.containers import parse_dns
             if isinstance(v, yaml.SequenceNode):

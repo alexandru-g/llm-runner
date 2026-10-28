@@ -694,26 +694,96 @@ def config_gateway_log(fmt: str | None) -> None:
 
 @config.command("gateway-otlp")
 @click.argument("endpoint", required=False)
+@click.option("--protocol", type=click.Choice(["json", "protobuf"]), default=None,
+              help="OTLP/HTTP encoding. Default json; Phoenix takes protobuf only.")
+@click.option("--header", "headers", multiple=True, metavar="NAME=VALUE",
+              help="A header on every export, e.g. 'Authorization=Bearer <key>' for a "
+                   "Phoenix with auth on. Repeatable; replaces the saved ones.")
 @click.option("--clear", is_flag=True, help="Stop exporting spans.")
-def config_gateway_otlp(endpoint: str | None, clear: bool) -> None:
-    """Export the gateway's trace spans to an OpenTelemetry collector over
-    OTLP/HTTP, e.g. http://lab:4318. Off by default: nothing leaves this
-    machine. Trace context (traceparent) reaches the models either way.
-    Takes effect at `llmctl gateway restart`; LLM_RUNNER_GATEWAY_OTLP
-    overrides it. With no ENDPOINT, print the setting."""
+def config_gateway_otlp(endpoint: str | None, protocol: str | None, headers: tuple[str, ...],
+                        clear: bool) -> None:
+    """Export the gateway's trace spans over OTLP/HTTP to a collector, e.g.
+    http://lab:4318, or straight to Phoenix (http://lab:6006, --protocol
+    protobuf). Off by default: nothing leaves this machine. Trace context
+    (traceparent) reaches the models either way. Spans carry no prompts or
+    replies (README: Traces). Takes effect at `llmctl gateway restart`;
+    LLM_RUNNER_GATEWAY_OTLP, _OTLP_PROTOCOL and _OTLP_HEADERS override it.
+    With no arguments, print the setting (header values hidden)."""
     if clear:
-        config_mod.update(gateway_otlp_endpoint=None)
+        config_mod.update(gateway_otlp_endpoint=None, gateway_otlp_protocol=None,
+                          gateway_otlp_headers=None)
         click.echo("gateway span export: off (from the next `llmctl gateway restart`)")
         return
-    if endpoint is None:
-        click.echo(config_mod.load().get("gateway_otlp_endpoint") or "off")
+    if endpoint is None and protocol is None and not headers:
+        cfg = config_mod.load()
+        url = cfg.get("gateway_otlp_endpoint")
+        if not url:
+            click.echo("off")
+            return
+        click.echo(f"{url}  ({cfg.get('gateway_otlp_protocol') or 'json'})"
+                   + "".join(f"\n  header {k}: (set)" for k in cfg.get("gateway_otlp_headers") or {}))
+        for key, project in (cfg.get("gateway_otlp_projects") or {}).items():
+            click.echo(f"  project {project or '(not exported)'}: "
+                       f"{'every other call' if key == '*' else 'key ' + key}")
         return
-    u = urllib.parse.urlsplit(endpoint)
-    if u.scheme not in ("http", "https") or not u.hostname:
-        raise click.BadParameter("an http(s):// URL, e.g. http://collector:4318",
-                                 param_hint="ENDPOINT")
-    config_mod.update(gateway_otlp_endpoint=endpoint.rstrip("/"))
-    click.echo(f"gateway spans go to {endpoint.rstrip('/')}/v1/traces "
+    if endpoint is None and not config_mod.load().get("gateway_otlp_endpoint"):
+        raise click.UsageError("Give the ENDPOINT first, e.g. http://lab:6006.")
+    changes: dict = {}
+    if endpoint is not None:
+        u = urllib.parse.urlsplit(endpoint)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            raise click.BadParameter("an http(s):// URL, e.g. http://collector:4318",
+                                     param_hint="ENDPOINT")
+        changes["gateway_otlp_endpoint"] = endpoint.rstrip("/")
+    if protocol is not None:
+        changes["gateway_otlp_protocol"] = None if protocol == "json" else protocol
+    if headers:
+        parsed = {}
+        for h in headers:
+            name, eq, value = h.partition("=")
+            if not eq or not re.fullmatch(r"[A-Za-z0-9-]+", name.strip()):
+                raise click.BadParameter(f"{name.strip() or h!r}: NAME=VALUE",
+                                         param_hint="--header")
+            parsed[name.strip()] = value.strip()
+        changes["gateway_otlp_headers"] = parsed
+    config_mod.update(**changes)
+    cfg = config_mod.load()
+    url = cfg["gateway_otlp_endpoint"]
+    click.echo(f"gateway spans go to {url}{'' if url.endswith('/v1/traces') else '/v1/traces'} "
+               f"as {cfg.get('gateway_otlp_protocol') or 'json'} "
+               "(from the next `llmctl gateway restart`)")
+
+
+@config.command("gateway-otlp-project")
+@click.argument("key", required=False)
+@click.argument("project", required=False)
+@click.option("--remove", is_flag=True, help="Forget KEY's project.")
+def config_gateway_otlp_project(key: str | None, project: str | None, remove: bool) -> None:
+    """Send the spans of calls made with API key KEY (its name, from
+    `llmctl gateway key`) to Phoenix project PROJECT, as the resource
+    attribute openinference.project.name. KEY '*' is every other call
+    (no key, or one without a project); without it those carry no project
+    (Phoenix's default). PROJECT 'none' exports no spans for those calls.
+    Takes effect at `llmctl gateway restart`. With no arguments, list them."""
+    projects = dict(config_mod.load().get("gateway_otlp_projects") or {})
+    if key is None:
+        for k, v in projects.items():
+            click.echo(f"{k}\t{v or '(not exported)'}")
+        if not projects:
+            click.echo("(none: spans carry no project)")
+        return
+    if remove:
+        if projects.pop(key, None) is None:
+            raise click.UsageError(f"No project is set for {key!r}.")
+    elif not project:
+        raise click.UsageError("Give a PROJECT, or --remove.")
+    else:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.:/-]{0,127}", project):
+            raise click.BadParameter("letters, digits, spaces and '_.:/-', up to 128",
+                                     param_hint="PROJECT")
+        projects[key] = "" if project == "none" else project
+    config_mod.update(gateway_otlp_projects=projects or None)
+    click.echo(f"{key}: {'removed' if remove else project if project != 'none' else 'not exported'} "
                "(from the next `llmctl gateway restart`)")
 
 
@@ -918,7 +988,9 @@ def profile_rm(name: str) -> None:
 @click.option("--group", "group_name", default=None,
               help="Second name the gateway routes by, shared by interchangeable "
                    "models (e.g. every quant of one model, across machines). Default: "
-                   "the model's folder, e.g. gemma-4-26b-a4b-it. 'none' for no group.")
+                   "the model's folder, e.g. gemma-4-26b-a4b-it. 'none' for no group. "
+                   "Several, comma-separated, answer to each (assistant,gemma-4-26b-a4b-it); "
+                   "the first is the one shown.")
 @click.option("--owner", "owner", default=None, envvar="LLMCTL_OWNER", metavar="TAG",
               help="Who is starting it, e.g. a session's name (A1). Shown in `llmctl ps` "
                    "and `llmctl events`, and kept across restarts. Default: "
@@ -1272,9 +1344,10 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     # Remember the llmctl-level invocation (with the interactively-picked model
     # made explicit) so `restart`/`autostart list` can show and re-issue it.
     run_args = ([] if ft_path else [model]) + _run_option_args(ctx)
-    if group_name is not None and group_name.lower() != "none" and \
-            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", group_name):
-        raise click.UsageError("A group name is letters, digits, '.', '_' and '-'.")
+    if group_name is not None and group_name.lower() != "none" and not all(
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", g) for g in group_name.split(",")):
+        raise click.UsageError("A group name is letters, digits, '.', '_' and '-' "
+                               "(several: comma-separated).")
     if owner is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.:@/-]{0,63}", owner):
         raise click.UsageError("An owner tag is up to 64 letters, digits, spaces and "
                                "'_.:@/-', starting with a letter or digit.")
@@ -1283,8 +1356,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         group = "" if ft_path else registry.default_group(model_path)
     else:
         group = "" if group_name.lower() == "none" else group_name
-    if group == name:
-        group = ""
+    group = ",".join(dict.fromkeys(g for g in registry.split_groups(group) if g != name))
     rec = proc.start(name=name, cmd=cmd, port=chosen_port,
                      model_path=str(model_path), run_args=run_args,
                      backend=backend, env=env, group=group, runtime=runtime,
@@ -1355,7 +1427,7 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
     states = supervisor.read_states()
     live = {p.name for p in procs}
     rows = [{"name": p.name, "pid": p.pid, "port": p.port, "backend": p.backend,
-             "started_at": p.started_at, "group": p.group or None, "owner": p.owner,
+             "started_at": p.started_at, **_group_fields(p.group), "owner": p.owner,
              "model_path": p.model_path, "runtime": p.runtime,
              **_ps_state(states.get(p.name), alive=True)} for p in procs]
     specs = {s.name: s for s in proc.autostart_list()}
@@ -1363,7 +1435,7 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
         if name not in live and st.get("state") in supervisor.DOWN_STATES and name in specs:
             sp = specs[name]
             rows.append({"name": name, "pid": None, "port": sp.port, "backend": sp.backend,
-                         "started_at": None, "group": sp.group or None, "owner": sp.owner,
+                         "started_at": None, **_group_fields(sp.group), "owner": sp.owner,
                          "model_path": sp.model_path, "runtime": sp.runtime,
                          **_ps_state(st, alive=False)})
     if as_json:
@@ -1387,6 +1459,13 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
     gw = _gateway_record()
     if gw:
         click.echo(f"\nAll models: {_gateway_url(gw.port)}  (GET /v1/models lists them)")
+
+
+def _group_fields(group: str | None) -> dict:
+    """``group`` (the first) and, with several, ``groups``: the shape of the
+    gateway's /v1/models, so a reader of one group keeps working."""
+    names = registry.split_groups(group)
+    return {"group": names[0] if names else None, **({"groups": names} if len(names) > 1 else {})}
 
 
 def _ps_state(st: dict | None, alive: bool) -> dict:
@@ -1467,12 +1546,15 @@ def _ps_cluster() -> None:
         click.echo("(no models running in the cluster)")
     else:
         w = max(len(m["id"]) for m in models)
-        gw_ = max([len(m["llmctl"].get("group") or "") for m in models] + [5])
+        def groups(m: dict) -> str:
+            return ",".join(m["llmctl"].get("groups") or [m["llmctl"].get("group") or ""])
+
+        gw_ = max([len(groups(m)) for m in models] + [5])
         click.echo(f"  {'MODEL':<{w}}  {'GROUP':<{gw_}}  {'NODE':<12} {'PRIO':<5} "
                    f"{'STATUS':<8} {'PORT':<6} CTX")
         click.echo("-" * (w + gw_ + 50))
         for m in sorted(models, key=lambda m: (m["llmctl"].get("group") or m["id"], m["id"])):
-            group = m["llmctl"].get("group") or ""
+            group = groups(m)
             for n, inst in enumerate(m["llmctl"]["nodes"]):
                 first = n == 0
                 node = inst["node"] + (" (here)" if inst["local"] else "")
@@ -1913,8 +1995,8 @@ def decide_start(identifier: str | None, port: int | None, profile: str | None, 
            *[tok for chunk in extra for tok in shlex.split(chunk)]]
     rec = proc.start(name=name, cmd=cmd, port=chosen_port, model_path=target.model_path,
                      backend=backends.DECIDE, owner=target.owner,
-                     group=f"{base}.decide" if (base := registry.group_of(
-                         target.name, target.backend, target.model_path, target.group)) else "")
+                     group=",".join(f"{g}.decide" for g in registry.split_groups(registry.group_of(
+                         target.name, target.backend, target.model_path, target.group))))
     click.echo(f"Started {rec.name}  pid={rec.pid}  port={rec.port}  profile={profile}")
     click.echo(f"Endpoint: POST {config_mod.local_url(rec.port)}/v1/systemone  "
                f"(→ llama-server :{target.port})")

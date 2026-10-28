@@ -30,8 +30,9 @@ against it.
 
   `llmctl ps --json` prints `{"models": [...]}`, each with `name`, `pid`,
   `port`, `backend`, `started_at`, `group`, `model_path`, `runtime`,
-  `state`, `restarts`, `next_restart_in`, `last_error`, and (since 1.5)
-  `owner`.
+  `state`, `restarts`, `next_restart_in`, `last_error`, (since 1.5)
+  `owner`, and (since 1.6) `groups` for a model with several groups
+  (`group` is then the first).
 
 - `--json` output of `install`, `verify`, `cache export`, `apply`,
   `images`, `images load`, `images save` and (since 1.2) `ps`: the keys documented in the README keep their names, types and
@@ -89,7 +90,8 @@ against it.
   `image`, `image_digest`, `context`, `vision`, `embeddings`, `decision`,
   `parallel`, `node`, `local`, and `nodes` (each with `node`, `priority`,
   `local`, `status`, `port`, `context`, `vision`, `runtime`, `image`,
-  `image_digest`), and since 1.1 `image_id` (in both).
+  `image_digest`), and since 1.1 `image_id` (in both). Since 1.6 a model in
+  several groups also has `groups` (all of them; `group` stays the first).
 - API keys: `Authorization: Bearer <key>` as configured with `llmctl
   gateway auth`.
 

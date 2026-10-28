@@ -212,6 +212,13 @@ def default_group(model_path: Path, models_dir: Path | None = None) -> str:
     return folder.name.lower()
 
 
+def split_groups(group: str | None) -> list[str]:
+    """The names in a recorded group: ``run --group a --group b`` records
+    ``"a,b"`` (a comma is not allowed in a name), the first being the one
+    shown and the one older llmctl routes by."""
+    return [g for g in (group or "").split(",") if g]
+
+
 def group_of(name: str, backend: str, model_path: str, group: str | None) -> str:
     """An instance's group: the recorded one, else (launched before groups
     were recorded) the default its launch would have given it."""
