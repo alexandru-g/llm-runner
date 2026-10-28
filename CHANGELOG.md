@@ -7,6 +7,14 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Decision endpoints in serving files:** a model entry's `decide:` (with
+  `port`, and optional `profile`, `cache`, `concurrency`, `args`) makes
+  `llmctl apply` start `<name>.decide` with its model. It restarts when the
+  model restarts or its own keys change, and `--prune` also stops a pruned
+  model's endpoint. One file now holds a setup like PA's.
+
 ### Fixed
 
 - `llmctl stop NAME` on a model that crashed or failed to start used to say

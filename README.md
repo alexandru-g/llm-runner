@@ -1278,6 +1278,16 @@ models:
     restart: on-failure               # or never; restart_max: 5 (in 10 min)
     args: ["--max-num-batched-tokens", "8192"]
     env: {VLLM_LOGGING_LEVEL: INFO}
+  h2o:
+    model: h2o-lightning-4b-q8_0      # a llama-server decision model
+    port: 8102
+    group: [decider, h2o-lightning-4b]  # one name or several
+    decide:                           # its decision endpoint, h2o.decide
+      port: 8192                      # required
+      profile: h2o-lightning-4b       # default: detected from the GGUF
+      cache: off                      # or request
+      concurrency: 4                  # default: the model's n_parallel
+      args: []                        # more `systemone-proxy serve` flags
 ```
 
 ```bash
@@ -1307,6 +1317,12 @@ Keys: `model`, `port`, `args`, `env`, and the `run` options `backend`,
 `no_vision`, `draft`, `no_draft`, `spec_type`, `spec_n_max`,
 `n_gpu_layers`, `kv_unified`, `ctx_checkpoints`, `cache_ram`, `restart`,
 `restart_max`, `owner`.
+
+`decide:` starts the entry's decision endpoint (`<name>.decide`) as
+`llmctl decide start <name> --port …` would, right after its model. It is
+restarted whenever its model is, or when its own keys change; a key left
+out accepts whatever runs. `--prune` stops a pruned model's endpoint too.
+An endpoint started by hand for an entry without `decide:` is left alone.
 
 ## Monitoring and operations
 

@@ -45,7 +45,8 @@ against it.
   schema gets a new name; 1.x keeps reading `/1`.
 - **Serving files** for `llmctl apply`, `version: 1` (README, "Serving
   files"). New keys may be added; existing keys keep their meaning
-  (`restart` and `restart_max` since 1.2).
+  (`restart` and `restart_max` since 1.2, a list for `group` since 1.6,
+  `decide` since 1.7).
 - **`images.json`**, schema `llmctl-images/1`: per backend, `image` (pinned
   by digest), `tag`, `engine_version`, `entrypoint`, `platforms`, `license`,
   and (since 1.1) `by_platform` (per platform, `manifest` and `config`

@@ -16,6 +16,13 @@ A serving file says which models run on this host and how::
         kv_cache_mem: 6G
         args: ["--max-num-batched-tokens", "8192"]
         env: {VLLM_LOGGING_LEVEL: INFO}
+      h2o:
+        model: h2o-lightning-4b-q8_0      # a llama-server decision model
+        port: 8102
+        group: decider
+        decide:                           # its decision endpoint (`llmctl decide start`)
+          port: 8192
+          profile: h2o-lightning-4b       # default: detected from the GGUF
 
 Several files merge (a bundle ships a fragment per model, a host file lists
 the rest); the same model name in two of them is an error. Each entry becomes
@@ -80,7 +87,15 @@ OPTIONS: dict[str, tuple[str, str]] = {
     "restart_max": ("--restart-max", "int"),
     "owner": ("--owner", "str"),
 }
-SPECIAL = ("model", "port", "args", "env")
+SPECIAL = ("model", "port", "args", "env", "decide")
+# `decide:` keys: (`decide start` option, kind). `port` is required (pinned).
+DECIDE_OPTIONS: dict[str, tuple[str, str]] = {
+    "port": ("--port", "int"),
+    "profile": ("--profile", "str"),
+    "cache": ("--cache", "str"),
+    "concurrency": ("--concurrency", "int"),
+}
+DECIDE_KEYS = (*DECIDE_OPTIONS, "args")
 KEYS = (*SPECIAL, *OPTIONS)
 
 
@@ -93,6 +108,23 @@ class Entry:
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     where: str = ""                 # "file:line" of the entry
+    # The decision endpoint: DECIDE_OPTIONS values plus "args" (a list), or None.
+    decide: dict | None = None
+
+    @property
+    def decide_name(self) -> str:
+        return f"{self.name}.decide"
+
+    def decide_argv(self) -> list[str]:
+        """The ``llmctl decide start`` arguments for this entry's endpoint."""
+        d = self.decide or {}
+        argv = [self.name]
+        for key, (opt, _) in DECIDE_OPTIONS.items():
+            if d.get(key) is not None:
+                argv += [opt, str(d[key])]
+        if d.get("args"):
+            argv += ["--extra", shlex.join(d["args"])]
+        return argv
 
     def run_argv(self, model_key: str) -> list[str]:
         """The ``llmctl run`` arguments that start this entry (port included)."""
@@ -226,6 +258,8 @@ def _entry(path: Path, name_node: yaml.ScalarNode, node: yaml.Node,
                 entry.options["dns"] = ",".join(parse_dns(raw))
             except ValueError as err:
                 problems.append(f"{_at(path, v)}: {what}.dns: {err}")
+        elif key == "decide":
+            entry.decide = _decide(path, v, f"{what}.decide", problems)
         elif key == "env":
             env_pairs = _mapping(path, v, f"{what}.env", problems) or []
             for ek, ev in env_pairs:
@@ -248,6 +282,59 @@ def _entry(path: Path, name_node: yaml.ScalarNode, node: yaml.Node,
     if not entry.port:
         problems.append(f"{entry.where}: {what}.port is required (ports are pinned)")
     return entry if len(problems) == before else None
+
+
+def _decide(path: Path, node: yaml.Node, what: str, problems: list[str]) -> dict | None:
+    pairs = _mapping(path, node, what, problems)
+    if pairs is None:
+        return None
+    out: dict = {}
+    for k, v in pairs:
+        if k.value not in DECIDE_KEYS:
+            problems.append(f"{_at(path, k)}: {what}.{k.value} is not a known setting "
+                            f"(known: {', '.join(DECIDE_KEYS)})")
+        elif k.value == "args":
+            items = [yaml.safe_load(yaml.serialize(i)) if isinstance(i, yaml.ScalarNode)
+                     else None for i in getattr(v, "value", [])]
+            if not isinstance(v, yaml.SequenceNode) or not all(
+                    isinstance(i, (str, int, float)) and not isinstance(i, bool) for i in items):
+                problems.append(f"{_at(path, v)}: {what}.args must be a list of strings")
+                continue
+            out["args"] = [str(i) for i in items]
+        else:
+            val = _scalar(path, v, DECIDE_OPTIONS[k.value][1], f"{what}.{k.value}", problems)
+            if val is None:
+                continue
+            if k.value == "port" and not 1 <= val <= 65535:
+                problems.append(f"{_at(path, v)}: {what}.port must be 1-65535")
+            elif k.value == "cache" and val not in ("off", "request"):
+                problems.append(f"{_at(path, v)}: {what}.cache must be off or request")
+            elif k.value == "concurrency" and val < 1:
+                problems.append(f"{_at(path, v)}: {what}.concurrency must be 1 or more")
+            else:
+                out[k.value] = val
+    if "port" not in out:
+        problems.append(f"{_at(path, node)}: {what}.port is required (ports are pinned)")
+    return out
+
+
+def decide_differs(d: dict, cmd: list[str], model_port: int) -> str:
+    """Why a running endpoint's ``systemone-proxy serve`` argv isn't what
+    ``decide:`` asks for ("" when it is). Unset keys accept whatever runs."""
+    def val(flag: str) -> str | None:
+        return cmd[cmd.index(flag) + 1] if flag in cmd[:-1] else None
+    backend = val("--backend") or ""
+    if not backend.rstrip("/").endswith(f":{model_port}"):
+        return f"backend {backend} -> port {model_port}"
+    for key in ("port", "profile", "concurrency"):
+        if d.get(key) is not None and val(f"--{key}") != str(d[key]):
+            return f"{key} {val(f'--{key}')} -> {d[key]}"
+    if (val("--cache") or "off") != (d.get("cache") or "off"):
+        return f"cache {val('--cache')} -> {d.get('cache') or 'off'}"
+    extra = cmd[cmd.index("--cache") + 2:] if "--cache" in cmd[:-1] else []
+    if extra != list(d.get("args") or []):
+        return f"args {shlex.join(extra) or '(none)'} -> {shlex.join(d.get('args') or []) or '(none)'}"
+    return ""
 
 
 def load(paths: list[Path]) -> list[Entry]:
@@ -291,12 +378,17 @@ def load(paths: list[Path]) -> list[Entry]:
                 problems.append(f"{entry.where}: model {entry.name!r} is also defined at "
                                 f"{entries[entry.name].where}")
                 continue
-            if entry.port in ports:
-                problems.append(f"{entry.where}: port {entry.port} is also used by "
-                                f"{ports[entry.port].name!r} ({ports[entry.port].where})")
+            dport = (entry.decide or {}).get("port")
+            clash = next((p for p in (entry.port, dport) if p in ports), None)
+            if clash is not None or (dport is not None and dport == entry.port):
+                other = ports.get(clash) or entry
+                problems.append(f"{entry.where}: port {clash or dport} is also used by "
+                                f"{other.name!r} ({other.where})")
                 continue
             entries[entry.name] = entry
             ports[entry.port] = entry
+            if dport is not None:
+                ports[dport] = entry
     if problems:
         raise ApplyError(problems)
     return list(entries.values())
@@ -311,13 +403,19 @@ class Action:
     port: int | None = None
     reason: str = ""
     argv: list[str] = field(default_factory=list)
+    kind: str = "run"               # run, or decide (argv is `decide start`'s)
+
+    @property
+    def command(self) -> list[str]:
+        return ["llmctl", *(["decide", "start"] if self.kind == "decide" else ["run"]),
+                *self.argv]
 
     def to_json(self) -> dict:
         out = {"name": self.name, "action": self.action, "port": self.port}
         if self.reason:
             out["reason"] = self.reason
         if self.argv:
-            out["run"] = ["llmctl", "run", *self.argv]
+            out["run"] = self.command
         return out
 
 

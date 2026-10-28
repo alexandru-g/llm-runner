@@ -3145,7 +3145,9 @@ def _plan_apply(entries: list, prune: bool) -> tuple[list, list[str]]:
     from llm_runner import apply as apply_mod
     specs = discover_models()
     problems: list[str] = []
-    running = {p.name: p for p in proc.list_running() if p.backend in backends.BACKENDS}
+    live = proc.list_running()
+    running = {p.name: p for p in live if p.backend in backends.BACKENDS}
+    decides = {p.name: p for p in live if p.backend == backends.DECIDE}
     autostart = {s.name: s for s in proc.autostart_list()}
     wanted = {e.name for e in entries}
     actions: list = []
@@ -3190,10 +3192,44 @@ def _plan_apply(entries: list, prune: bool) -> tuple[list, list[str]]:
                                 f"{other.name!r} (stop it, or apply with --prune)")
                 continue
         actions.append(apply_mod.Action(e.name, action, e.port, why, argv))
+        if e.decide is not None:
+            if backend != LLAMA:
+                problems.append(f"{e.where}: models.{e.name}.decide needs a llama-server "
+                                f"model, not {backend}")
+                continue
+            actions.append(_plan_decide(e, action, decides, live, stopping, problems))
     for name in sorted(stopping):
         actions.append(apply_mod.Action(name, "stop", running[name].port,
                                         "not in the serving files (--prune)"))
+        for d in _proxy_attached_to(running[name].port):
+            actions.append(apply_mod.Action(d.name, "stop", d.port,
+                                            f"its model {name} is pruned"))
     return actions, problems
+
+
+def _plan_decide(e, model_action: str, decides: dict, live: list, stopping: set,
+                 problems: list[str]):
+    """The action for entry ``e``'s ``decide:`` endpoint, which follows its model."""
+    from llm_runner import apply as apply_mod
+    name, port = e.decide_name, e.decide["port"]
+    rec = decides.get(name)
+    if rec is None:
+        action, why = "start", "not running"
+    elif model_action != "unchanged":
+        action, why = "restart", f"{e.name}: {model_action}"
+    elif rec.port != port:
+        action, why = "restart", f"port {rec.port} -> {port}"
+    elif why := apply_mod.decide_differs(e.decide, rec.cmd, e.port):
+        action = "restart"
+    else:
+        action, why = "unchanged", ""
+    if action != "unchanged":
+        other = next((p for p in live if p.port == port and p.name != name
+                      and p.name not in stopping), None)
+        if other is not None:
+            problems.append(f"{e.where}: models.{e.name}.decide port {port} is in use by "
+                            f"{other.name!r}")
+    return apply_mod.Action(name, action, port, why, e.decide_argv(), kind="decide")
 
 
 @cli.command("apply")
@@ -3253,11 +3289,18 @@ def apply_cmd(files: tuple[Path, ...], dry_run: bool, prune: bool, wait: bool,
                                   f"pid {rec.pid}", pid=rec.pid, port=rec.port, by="apply",
                                   reason=f"{a.action}: {a.reason}")
         for a in [a for a in actions if a.action in ("start", "restart")]:
-            say(f"\n==> llmctl run {shlex.join(a.argv)}")
+            say(f"\n==> {shlex.join(a.command)}")
+            if a.kind == "decide" and any(m.name == a.name.removesuffix(".decide")
+                                          and m.action == "error" for m in actions):
+                a.action, a.reason, failed = "error", "its model did not start", True
+                say(f"error: {a.name}: {a.reason}")
+                continue
+            cmd, prog = (decide_start, "llmctl decide start") if a.kind == "decide" \
+                else (run, "llmctl run")
             try:
                 with contextlib.redirect_stdout(out):
-                    run.main(args=[*a.argv, "--wait" if wait else "--no-wait"],
-                             prog_name="llmctl run", standalone_mode=False,
+                    cmd.main(args=[*a.argv, "--wait" if wait else "--no-wait"],
+                             prog_name=prog, standalone_mode=False,
                              obj={"by": "apply", "reason": f"{a.action}: {a.reason}"})
             except SystemExit as ex:
                 if ex.code:
