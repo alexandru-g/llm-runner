@@ -7,6 +7,8 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-28
+
 ### Added
 
 - **Decision endpoints in serving files:** a model entry's `decide:` (with
@@ -301,6 +303,7 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.7.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.7.0
 [1.6.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.6.0
 [1.5.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.5.0
 [1.4.1]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.4.1
