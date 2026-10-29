@@ -107,3 +107,17 @@ def test_only_llama_models_take_an_endpoint(tmp_path, gguf):
                                        "    decide:\n      port: 8192\n")
     r, out = _apply(f)
     assert r.exit_code == 3 and "needs a llama-server model" in r.output
+
+
+def test_batch_sizes_reach_the_run(tmp_path, gguf):
+    f = _write(tmp_path, "serve.yaml", H2O.replace("    n_parallel: 4\n",
+                                                   "    n_parallel: 4\n    batch_size: 2048\n"
+                                                   "    ubatch_size: 2048\n"))
+    r, out = _apply(f)
+    assert r.exit_code == 0, r.output
+    run = out["actions"][0]["run"]
+    assert run[run.index("--batch-size") + 1] == "2048"
+    assert run[run.index("--ubatch-size") + 1] == "2048"
+    cmd = proc.find("h2o").cmd
+    assert cmd[cmd.index("--batch-size") + 1] == "2048"
+    assert cmd[cmd.index("--ubatch-size") + 1] == "2048"

@@ -1315,8 +1315,8 @@ Keys: `model`, `port`, `args`, `env`, and the `run` options `backend`,
 `n_parallel`, `gpu_mem`, `kv_cache_mem`, `kv_quant`, `tool_parser`,
 `reasoning_parser`, `trust_remote_code`, `reasoning`, `embeddings`,
 `no_vision`, `draft`, `no_draft`, `spec_type`, `spec_n_max`,
-`n_gpu_layers`, `kv_unified`, `ctx_checkpoints`, `cache_ram`, `restart`,
-`restart_max`, `owner`.
+`n_gpu_layers`, `kv_unified`, `ctx_checkpoints`, `cache_ram`, `batch_size`,
+`ubatch_size`, `restart`, `restart_max`, `owner`.
 
 `decide:` starts the entry's decision endpoint (`<name>.decide`) as
 `llmctl decide start <name> --port …` would, right after its model. It is

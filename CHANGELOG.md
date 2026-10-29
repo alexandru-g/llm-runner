@@ -7,6 +7,11 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Serving files take `batch_size` and `ubatch_size` (`run --batch-size/--ubatch-size`).
+  2048/2048 raised prefill 20–30% for Gemma 26B-A4B on orin.
+
 ## [1.7.0] - 2026-10-28
 
 ### Added
