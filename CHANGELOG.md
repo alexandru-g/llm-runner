@@ -7,6 +7,8 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-10-29
+
 ### Added
 
 - Serving files take `batch_size` and `ubatch_size` (`run --batch-size/--ubatch-size`).
@@ -308,6 +310,7 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.7.1]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.7.1
 [1.7.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.7.0
 [1.6.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.6.0
 [1.5.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.5.0
