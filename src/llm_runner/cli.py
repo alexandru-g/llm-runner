@@ -37,8 +37,10 @@ _port_in_use = proc.port_in_use
 
 
 def _next_free_port(start: int = 8080) -> int:
+    # A paused model keeps its port for `resume`.
+    paused = {s.port for s in proc.paused_list()}
     p = start
-    while _port_in_use(p):
+    while p in paused or _port_in_use(p):
         p += 1
     return p
 
@@ -337,7 +339,16 @@ def _wait_healthy(rec: proc.RunningProcess, timeout: float) -> bool:
     return False
 
 
-@click.group()
+class _AliasGroup(click.Group):
+    """Commands under a second name, left out of --help."""
+
+    ALIASES = {"ls": "list", "start": "run"}
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        return super().get_command(ctx, self.ALIASES.get(cmd_name, cmd_name))
+
+
+@click.group(cls=_AliasGroup)
 @click.version_option(__version__, "--version", "-V", prog_name="llmctl")
 def cli() -> None:
     """Manage local model servers (llama-server for GGUF, vllm for HF
@@ -876,7 +887,7 @@ def config_models_dir(path: Path | None, create: bool) -> None:
 
 @cli.command("list")
 def list_cmd() -> None:
-    """List models discovered on disk under MODELS_DIR.
+    """List models discovered on disk under MODELS_DIR (also `llmctl ls`).
 
     GGUF files are served by llama-server; Hugging Face checkpoint
     directories (config.json + safetensors) by vllm, or by decider.serve when
@@ -1148,7 +1159,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         ubatch_size: int | None, draft_spec: str | None, no_draft: bool,
         spec_type: str, spec_n_max: int, n_parallel: int | None,
         cache_ram: int, kv_unified: bool | None, ctx_checkpoints: int | None) -> None:
-    """Start MODEL in the background.
+    """Start MODEL in the background (also `llmctl start`).
 
     GGUF models run on llama-server; Hugging Face checkpoint directories run
     on vllm (or sglang with --backend sglang), or on decider.serve when they
@@ -1239,6 +1250,10 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
 
     if port is not None and _port_in_use(port):
         raise click.UsageError(f"Port {port} is already in use.")
+    for s in proc.paused_list():
+        if port is not None and s.port == port and s.name != name:
+            click.echo(f"note: {s.name} was paused on port {port}; it is forgotten "
+                       "(no longer resumable).", err=True)
     chosen_port = port or _next_free_port()
 
     # Context defaults differ by mode: embedding models run a short context.
@@ -1415,11 +1430,13 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
               help="Every model in the cluster, with the node calls go to (needs the gateway).")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON.")
 def ps_cmd(show_all: bool, as_json: bool) -> None:
-    """List running models, and crashed ones the gateway is restarting.
+    """List running models, crashed ones the gateway is restarting, and
+    paused ones.
 
     STATE comes from the gateway's supervisor: starting, ready, restarting
     (down, a restart is due) or crashed (down, given up). RESTARTS counts its
-    restarts since the gateway started. `llmctl events -f` follows them."""
+    restarts since the gateway started. `llmctl events -f` follows them.
+    STATE paused is `llmctl pause` (`llmctl resume` starts it again)."""
     if show_all:
         return _ps_cluster()
     from llm_runner import supervisor
@@ -1430,7 +1447,7 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
              "started_at": p.started_at, **_group_fields(p.group), "owner": p.owner,
              "model_path": p.model_path, "runtime": p.runtime,
              **_ps_state(states.get(p.name), alive=True)} for p in procs]
-    specs = {s.name: s for s in proc.autostart_list()}
+    specs = {s.name: s for s in proc.autostart_list() if not s.paused}
     for name, st in states.items():
         if name not in live and st.get("state") in supervisor.DOWN_STATES and name in specs:
             sp = specs[name]
@@ -1438,6 +1455,12 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
                          "started_at": None, **_group_fields(sp.group), "owner": sp.owner,
                          "model_path": sp.model_path, "runtime": sp.runtime,
                          **_ps_state(st, alive=False)})
+    for sp in proc.paused_list():
+        if sp.name not in live:
+            rows.append({"name": sp.name, "pid": None, "port": sp.port, "backend": sp.backend,
+                         "started_at": None, **_group_fields(sp.group), "owner": sp.owner,
+                         "model_path": sp.model_path, "runtime": sp.runtime,
+                         **_ps_state(None, alive=False), "state": "paused"})
     if as_json:
         click.echo(json.dumps({"models": rows}, indent=2))
         return
@@ -1619,11 +1642,15 @@ def stop(identifier: str | None) -> None:
         if p.backend != GATEWAY:
             proc.record_event(p.name, "stopped", f"by stop; pid {p.pid}", pid=p.pid,
                               port=p.port, by="stop", owner=p.owner)
-    # The gateway came up with the first model and goes down with the last,
-    # unless this machine is in a cluster (it still routes to the others).
+    if rec.backend != GATEWAY:
+        _stop_idle_gateway()
+
+
+def _stop_idle_gateway() -> None:
+    """The gateway came up with the first model and goes down with the last,
+    unless this machine is in a cluster (it still routes to the others)."""
     gw = _gateway_record()
-    if gw and rec.backend != GATEWAY and not _models_running() \
-            and not config_mod.get_cluster().enabled:
+    if gw and not _models_running() and not config_mod.get_cluster().enabled:
         proc.stop(str(gw.pid))
         click.echo(f"Stopped gateway  pid={gw.pid}  port={gw.port}  (no models left)")
 
@@ -1637,7 +1664,8 @@ def _forget_down(name: str) -> None:
     spec = proc.autostart_find(name)
     if spec is None or spec.backend == GATEWAY:
         raise click.UsageError(f"No running model matches '{name}'.")
-    state = (supervisor.read_states().get(name) or {}).get("state") or "not running"
+    state = ("paused" if spec.paused else
+             (supervisor.read_states().get(name) or {}).get("state") or "not running")
     proc.autostart_remove(name)
     click.echo(f"Removed {name} from autostart (it was {state}; port {spec.port})")
     proc.record_event(name, "stopped", f"by stop; was {state}", port=spec.port, by="stop",
@@ -1647,6 +1675,98 @@ def _forget_down(name: str) -> None:
         click.echo(f"Stopped {p.name}  pid={p.pid}  port={p.port}")
         proc.record_event(p.name, "stopped", f"by stop; pid {p.pid}", pid=p.pid,
                           port=p.port, by="stop", owner=p.owner)
+    for s in _paused_endpoints_of(spec):
+        proc.autostart_remove(s.name)
+        click.echo(f"Removed {s.name} from autostart (it was paused; port {s.port})")
+
+
+@cli.command()
+@click.argument("identifier", required=False)
+def pause(identifier: str | None) -> None:
+    """Stop a running model by NAME or PID, but remember how it was started.
+
+    A paused model stays in the autostart manifest and shows in `llmctl ps`
+    as paused, but nothing starts it: not the gateway's supervisor, not
+    `llmctl restore` at boot. The gateway answers 503 for it. `llmctl
+    resume` starts it again with the same args and port; `llmctl stop`
+    forgets it. A decision endpoint attached to it is paused with it.
+
+    With no IDENTIFIER: if exactly one model is running, pause it;
+    otherwise show an interactive picker.
+    """
+    if identifier is not None and proc.find(identifier) is None:
+        spec = proc.autostart_find(identifier)
+        if spec is not None and spec.paused:
+            click.echo(f"{identifier} is already paused (`llmctl resume {identifier}`).")
+            return
+    target = _resolve_running_target(identifier)
+    if target.backend == GATEWAY:
+        raise click.UsageError("The gateway can't be paused (`llmctl gateway stop`).")
+    if proc.autostart_find(target.name) is None:
+        raise click.UsageError(f"{target.name} is not in the autostart manifest, so it "
+                               "couldn't be resumed; use `llmctl stop`.")
+    paused = [target]
+    if target.backend != backends.DECIDE:
+        paused += _proxy_attached_to(target.port)
+    # Marked first, so the supervisor never takes the dying process for a crash.
+    for p in paused:
+        proc.autostart_pause(p.name)
+    for p in paused:
+        proc.stop(str(p.pid), keep_autostart=True)
+        click.echo(f"Paused {p.name}  pid={p.pid}  port={p.port}")
+        proc.record_event(p.name, "paused", f"by pause; pid {p.pid}", pid=p.pid,
+                          port=p.port, by="pause", owner=p.owner)
+    _stop_idle_gateway()
+    click.echo(f"Resume with: llmctl resume {target.name}")
+
+
+@cli.command()
+@click.argument("identifier", required=False)
+@click.pass_context
+def resume(ctx: click.Context, identifier: str | None) -> None:
+    """Start a paused model again, with the args and port it ran with.
+
+    A decision endpoint paused with it comes back too. With no IDENTIFIER:
+    if exactly one model is paused, resume it; otherwise show an
+    interactive picker.
+    """
+    paused = proc.paused_list()
+    if identifier is None:
+        if not paused:
+            raise click.UsageError("No paused models.")
+        # An endpoint paused with its model comes back with it, so the
+        # picker offers the model alone.
+        under = {e.name for s in paused for e in _paused_endpoints_of(s)}
+        models = [s for s in paused if s.name not in under]
+        spec = models[0] if len(models) == 1 else _pick_paused_interactively(models)
+    else:
+        spec = next((s for s in paused if s.name == identifier), None)
+        if spec is None:
+            if proc.find(identifier):
+                raise click.UsageError(f"{identifier} is running, not paused.")
+            raise click.UsageError(f"No paused model matches '{identifier}' (see `llmctl ps`).")
+    todo = [spec, *_paused_endpoints_of(spec)]
+    for s in todo:
+        if _port_in_use(s.port):
+            raise click.UsageError(
+                f"Port {s.port} ({s.name}'s) is in use. Free it, or move it with "
+                f"`llmctl restart {s.name} --port N`.")
+    ctx.obj = {**(ctx.obj or {}), "by": "resume"}
+    for s in todo:
+        rec = _restart_one(ctx, s.name, ())
+        if rec is not None and not s.run_args:
+            proc.record_event(rec.name, "started", f"by resume; pid {rec.pid} port "
+                              f"{rec.port}", pid=rec.pid, port=rec.port, by="resume",
+                              log=rec.log_file, owner=rec.owner)
+    _ensure_gateway()
+
+
+def _paused_endpoints_of(spec: proc.LaunchSpec) -> list[proc.LaunchSpec]:
+    """Paused decision endpoints in front of ``spec``'s port."""
+    if spec.backend == backends.DECIDE:
+        return []
+    return [s for s in proc.paused_list()
+            if s.backend == backends.DECIDE and _backend_port(s.cmd) == spec.port]
 
 
 def _resolve_running_target(identifier: str | None) -> proc.RunningProcess:
@@ -1796,7 +1916,8 @@ def restore(names: tuple[str, ...]) -> None:
     """
     # Only demand the binaries the manifest actually needs. A vllm/sglang
     # entry records an absolute binary path, so it doesn't depend on PATH.
-    specs = [s for s in proc.autostart_list() if not names or s.name in names]
+    specs = [s for s in proc.autostart_list()
+             if (not names or s.name in names) and not s.paused]
     in_docker = [s for s in specs if (s.runtime or {}).get("kind") == containers.DOCKER]
     wanted = {s.backend for s in specs if s not in in_docker}
     for backend in sorted(wanted):
@@ -1946,13 +2067,16 @@ def decide() -> None:
     """
 
 
+def _backend_port(cmd: list[str]) -> int | None:
+    """The model port a decision endpoint's command points at."""
+    if "--backend" not in cmd[:-1]:
+        return None
+    return urllib.parse.urlsplit(cmd[cmd.index("--backend") + 1]).port
+
+
 def _proxy_attached_to(port: int) -> list[proc.RunningProcess]:
-    def backend_port(cmd: list[str]) -> int | None:
-        if "--backend" not in cmd[:-1]:
-            return None
-        return urllib.parse.urlsplit(cmd[cmd.index("--backend") + 1]).port
     return [p for p in proc.list_running()
-            if p.backend == backends.DECIDE and backend_port(p.cmd) == port]
+            if p.backend == backends.DECIDE and _backend_port(p.cmd) == port]
 
 
 @decide.command("start")
@@ -2615,7 +2739,8 @@ def autostart_list_cmd() -> None:
         click.echo("(autostart manifest empty — start a model to populate it)")
         return
     for s in specs:
-        click.echo(f"{s.name:<24}  port={s.port}  backend={s.backend}  {s.model_path}")
+        click.echo(f"{s.name:<24}  port={s.port}  backend={s.backend}  {s.model_path}"
+                   + ("  (paused)" if s.paused else ""))
         click.echo(f"{'':<24}  {_fmt_run_line(s)}")
 
 
@@ -2727,6 +2852,31 @@ def _pick_instance_interactively(running: list[proc.RunningProcess]) -> proc.Run
     ]
     selected = questionary.select(
         "Select a running instance:",
+        choices=choices,
+        use_shortcuts=False,
+    ).ask()
+    if selected is None:
+        raise click.Abort()
+    return selected
+
+
+def _pick_paused_interactively(paused: list[proc.LaunchSpec]) -> proc.LaunchSpec:
+    try:
+        import questionary
+    except ImportError as e:
+        raise click.UsageError(
+            "questionary not installed. Pass a NAME explicitly."
+        ) from e
+    name_w = max(len(s.name) for s in paused)
+    choices = [
+        questionary.Choice(
+            title=f"{s.name:<{name_w}}  port={s.port:<6}  backend={s.backend}",
+            value=s,
+        )
+        for s in paused
+    ]
+    selected = questionary.select(
+        "Select a paused model:",
         choices=choices,
         use_shortcuts=False,
     ).ask()

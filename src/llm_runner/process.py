@@ -91,6 +91,9 @@ class LaunchSpec:
     restart: str = "on-failure"
     restart_max: int = 5
     owner: str | None = None
+    # `llmctl pause`: stopped, but kept here to `resume` with the same launch.
+    # Restore, the supervisor and the gateway's routing leave it down.
+    paused: bool = False
 
     def run_cmd(self) -> list[str]:
         """The ``llmctl run …`` argv that reproduces this launch, port pinned."""
@@ -115,10 +118,13 @@ def _load() -> list[RunningProcess]:
 
 
 def _record(obj) -> dict:
-    """``asdict`` without an unset owner: llmctl before 1.5 can't read the key."""
+    """``asdict`` without an unset owner: llmctl before 1.5 can't read the key.
+    ``paused`` is written only when set, the same way."""
     d = asdict(obj)
     if d.get("owner") is None:
         d.pop("owner", None)
+    if not d.get("paused"):
+        d.pop("paused", None)
     return d
 
 
@@ -201,6 +207,20 @@ def autostart_find(name: str) -> LaunchSpec | None:
     return next((s for s in _load_autostart() if s.name == name), None)
 
 
+def autostart_pause(name: str, paused: bool = True) -> LaunchSpec | None:
+    """Mark ``name``'s manifest entry paused (or not). Returns the entry."""
+    specs = _load_autostart()
+    spec = next((s for s in specs if s.name == name), None)
+    if spec is not None and spec.paused != paused:
+        spec.paused = paused
+        _save_autostart(specs)
+    return spec
+
+
+def paused_list() -> list[LaunchSpec]:
+    return [s for s in _load_autostart() if s.paused]
+
+
 def autostart_remove(name: str) -> None:
     specs = _load_autostart()
     kept = [s for s in specs if s.name != name]
@@ -212,7 +232,8 @@ def autostart_sync() -> tuple[list[LaunchSpec], list[LaunchSpec]]:
     """Rewrite the manifest to exactly the live models. Returns ``(kept,
     dropped)``. A live model's existing entry keeps its ``run_args`` (port
     and launch details refreshed from the live record); one without an entry
-    gets a legacy-style spec from its resolved argv."""
+    gets a legacy-style spec from its resolved argv. Paused entries are
+    kept: they are down on purpose."""
     old = {s.name: s for s in _load_autostart()}
     kept = [
         LaunchSpec(name=p.name, cmd=list(p.cmd), port=p.port,
@@ -226,7 +247,8 @@ def autostart_sync() -> tuple[list[LaunchSpec], list[LaunchSpec]]:
         for p in list_running()
     ]
     live = {s.name for s in kept}
-    dropped = [s for s in old.values() if s.name not in live]
+    kept += [s for s in old.values() if s.paused and s.name not in live]
+    dropped = [s for s in old.values() if s.name not in live and not s.paused]
     _save_autostart(kept)
     return kept, dropped
 
@@ -240,7 +262,8 @@ def restore(names: list[str] | None = None,
     Idempotent: a model whose name is already live is left alone. Ports are
     pinned — an entry whose port is taken is reported, not moved. Returns
     ``(spec, status)`` pairs for reporting, where status is ``"started …"``,
-    ``"already running"``, or ``"error: …"``.
+    ``"already running"``, ``"paused"`` (left down: ``llmctl resume`` starts
+    it), or ``"error: …"``.
     """
     live = {p.name for p in list_running()}
     specs = _load_autostart()
@@ -262,6 +285,9 @@ def restore(names: list[str] | None = None,
             continue
         if spec.name in live:
             results.append((spec, "already running"))
+            continue
+        if spec.paused:
+            results.append((spec, "paused"))
             continue
         if spec.port in claimed or port_in_use(spec.port):
             results.append((spec, f"error: port {spec.port} is in use"))

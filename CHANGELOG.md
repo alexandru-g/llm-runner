@@ -7,6 +7,17 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`llmctl pause` / `llmctl resume`:** `pause` stops a model but keeps its
+  autostart entry, marked paused, and `resume` starts it again with the same
+  args and port. `llmctl ps` shows it with STATE `paused`. The supervisor and
+  `restore` leave it down, `run` doesn't give its port to another model, and the
+  gateway answers 503 for it. Its decision endpoint is paused and resumed with
+  it. With no name, both pick the only candidate or show a picker. `llmctl stop`
+  forgets a paused model.
+- `llmctl ls` is an alias for `llmctl list`, and `llmctl start` for `llmctl run`.
+
 ## [1.7.1] - 2026-10-29
 
 ### Added

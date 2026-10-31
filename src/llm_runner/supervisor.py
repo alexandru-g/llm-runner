@@ -7,7 +7,8 @@ before it was ever ready is a failed start, not a crash: it gets a
 ``start_failed`` event naming its log and is left alone, as are manifest
 entries at boot, which ``llmctl restore`` starts. A model held for a planned
 restart (``process.hold``, by ``llmctl apply``) is not watched until the
-hold ends, and is then new: it must get ready again to be supervised.
+hold ends, and is then new: it must get ready again to be supervised. A
+paused model (``llmctl pause``) stays in the manifest but is not watched.
 
 Policy per model (``run --restart``, ``--restart-max``, the same keys in
 serving files): ``on-failure`` (the default) restarts with exponential
@@ -137,7 +138,7 @@ class Supervisor:
         live = {p.name: p for p in proc.list_running()
                 if p.backend != GATEWAY and p.name not in held}
         specs = {s.name: s for s in proc.autostart_list()
-                 if s.backend != GATEWAY and s.name not in held}
+                 if s.backend != GATEWAY and s.name not in held and not s.paused}
         due: list[str] = []
         with self._lock:
             for name in held:

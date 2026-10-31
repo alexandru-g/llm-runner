@@ -656,6 +656,23 @@ crashed, or the supervisor is between restarts): `llmctl stop NAME` takes it
 out of autostart, so it isn't restarted or brought back at boot, and stops
 a decision endpoint still attached to it.
 
+### Pause and resume a model
+
+```bash
+llmctl pause                        # auto-pick if 1 running; picker if many
+llmctl pause gemma-4-e4b-it-q4_k_m  # by name (or PID)
+llmctl resume                       # auto-pick if 1 paused; picker if many
+llmctl resume gemma-4-e4b-it-q4_k_m
+```
+
+`pause` stops the model but keeps its autostart entry, marked paused:
+`llmctl ps` lists it with STATE `paused`, and `resume` starts it again with
+the same `run` args on the same port. A paused model is not restarted by the
+supervisor or brought back at boot, its port isn't handed to another `run`,
+and the gateway answers 503 `model_unavailable` for it. A decision endpoint
+attached to it is paused and resumed with it. `llmctl stop NAME` forgets a
+paused model.
+
 ### Re-run a model with its last arguments
 
 Every `llmctl run` records the exact invocation (model, flags, and the port it

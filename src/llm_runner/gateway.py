@@ -792,6 +792,8 @@ def make_handler(gw: Gateway):
             for spec in proc.autostart_list():
                 if spec.backend != GATEWAY and (
                         name == spec.name or name in _groups(spec.group)):
+                    if spec.paused:
+                        return "it is paused (`llmctl resume`)", None
                     t = gw.supervisor.state(spec.name)
                     return (f"it is {t.state}" if t else "it is not running",
                             gw.supervisor.retry_after(spec.name))
