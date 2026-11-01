@@ -17,6 +17,24 @@ All notable changes to llm-runner (`llmctl`). The format follows
   it. With no name, both pick the only candidate or show a picker. `llmctl stop`
   forgets a paused model.
 - `llmctl ls` is an alias for `llmctl list`, and `llmctl start` for `llmctl run`.
+- **Image generation (backend `omni`):** diffusers pipelines such as FLUX.1-dev
+  and FLUX.1-schnell run on vLLM-Omni (`vllm serve --omni`) and answer
+  `POST /v1/images/generations`. A folder with `model_index.json` is listed as
+  one model; its `transformer/`, `vae/`, ... folders are no longer listed as
+  vllm models of their own. `run` keeps the pipeline on the GPU when it fits
+  and otherwise streams the DiT from CPU a block at a time; an offload flag in
+  `-X` replaces that. vLLM-Omni lives in its own venv (`~/.venvs/vllm-omni`,
+  or `llmctl config omni-bin`); the `vllm` on `PATH` is never used for it.
+- `llmctl download` of a diffusers repo skips the single-file weights at its top
+  (`flux1-dev.safetensors`, `ae.safetensors`), ~24 GB that the pipeline never reads.
+- The gateway routes `/v1/images/*` to image models only (`llmctl.api` `images`
+  in `/v1/models`), so a chat call without `"model"` still finds the one chat
+  model when an image model runs beside it.
+
+### Fixed
+
+- `llmctl update` of a decider checkpoint looked for its recorded source in the
+  parent folder.
 
 ## [1.7.1] - 2026-10-29
 

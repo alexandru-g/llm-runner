@@ -55,10 +55,10 @@ from llm_runner import metrics as metrics_mod
 from llm_runner import process as proc
 from llm_runner import supervisor as sup_mod
 from llm_runner import tracing
-from llm_runner.backends import (DECIDE, DECIDER, GATEWAY, SGLANG, VLLM, hf_has_vision,
+from llm_runner.backends import (DECIDE, DECIDER, GATEWAY, OMNI, SGLANG, VLLM, hf_has_vision,
                                  is_decision_model)
-from llm_runner.cluster import (BUSY_HEADER, HEARTBEAT_EVERY, HOP_HEADER, OPENAI, PROTOCOL,
-                                SPILL_HEADER, SYSTEMONE, TOKEN_HEADER, ClusterView,
+from llm_runner.cluster import (BUSY_HEADER, HEARTBEAT_EVERY, HOP_HEADER, IMAGES, OPENAI,
+                                PROTOCOL, SPILL_HEADER, SYSTEMONE, TOKEN_HEADER, ClusterView,
                                 Instance, RegistryTable,
                                 Unroutable, has_images, is_context_error, order, pick,
                                 split_pin, token_ok)
@@ -91,6 +91,8 @@ class Model:
 
     @property
     def api(self) -> str:
+        if self.backend == OMNI:
+            return IMAGES
         return SYSTEMONE if self.backend in (DECIDE, DECIDER) else OPENAI
 
     @property
@@ -352,6 +354,9 @@ class LocalModels:
         elif m.backend == DECIDER:
             info["vision"] = False
             info["decision"] = True
+        elif m.backend == OMNI:
+            info["vision"] = False
+            info["decision"] = False
         if m.api == OPENAI:
             ctx = _flag(m.cmd, *_CTX_FLAGS.get(m.backend, ("--ctx-size", "-c")))
             info["context"] = int(ctx) if ctx and ctx.isdigit() else None
@@ -1057,7 +1062,8 @@ def make_handler(gw: Gateway):
                 return self._json(200, m)
 
             api = SYSTEMONE if path.rstrip("/") in ("/v1/systemone", "/v1/decisions",
-                                                    "/v1/spec") else OPENAI
+                                                    "/v1/spec") else \
+                IMAGES if path.startswith("/v1/images/") else OPENAI
             self._obs["count"] = not hop
             payload = None
             ctype = self.headers.get("Content-Type", "")
@@ -1071,8 +1077,9 @@ def make_handler(gw: Gateway):
             by_header = not isinstance(payload, dict)
             requested = self.headers.get("X-Model") if by_header else payload.get("model")
             try:
+                # An image pipeline takes its input images itself (edits).
                 cands = pick(gw.instances(local_only=hop), requested, api,
-                             needs_vision=has_images(payload))
+                             needs_vision=api != IMAGES and has_images(payload))
             except Unroutable as e:
                 name, pin = split_pin(requested) if isinstance(requested, str) else (None, None)
                 if e.code == "model_not_found" and pin is None and \

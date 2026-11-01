@@ -1,6 +1,6 @@
 """Serving backends: how to find each server binary and build its argv.
 
-Four backends are supported:
+Five backends are supported:
 
 ``llama``
     llama.cpp's ``llama-server`` serving a single GGUF. The argv builder for
@@ -29,6 +29,15 @@ Four backends are supported:
     ``$LLM_RUNNER_DECIDER_DIR``. The default launch profile is sized for a
     GPU shared with a llama-server (graphs ≤ 8 × 1024 tokens, batch ≤ 8,
     fp8 linears, raw model temperature) — see :func:`build_decider_cmd`.
+
+``omni``
+    vLLM-Omni's ``vllm serve --omni`` on a diffusers pipeline directory
+    (``model_index.json`` + one subfolder per component, e.g. FLUX.1), which
+    answers ``POST /v1/images/generations``. vLLM-Omni is a plugin for a
+    matching vLLM release and its CLI is ``vllm`` too, so it gets a venv of
+    its own (``~/.venvs/vllm-omni``) rather than sharing the ``vllm`` tool;
+    ``vllm`` on PATH is never taken for it. Pin another location with
+    ``llmctl config omni-bin`` or ``$LLM_RUNNER_OMNI_BIN``.
 """
 from __future__ import annotations
 
@@ -48,16 +57,19 @@ LLAMA = "llama"
 VLLM = "vllm"
 SGLANG = "sglang"
 DECIDER = "decider"
+OMNI = "omni"
 # Not a model server: the systemone-proxy started by `llmctl decide` in front
 # of a running llama-server.
 DECIDE = "decide"
 # Not a model server either: the `llmctl gateway` router that puts every
 # running model behind one port. Started with the first model.
 GATEWAY = "gateway"
-BACKENDS = (LLAMA, VLLM, SGLANG, DECIDER)
+BACKENDS = (LLAMA, VLLM, SGLANG, DECIDER, OMNI)
 # Engines that serve a Hugging Face checkpoint dir behind an OpenAI /v1 API.
 # They take the same llmctl options and are interchangeable for a model.
 HF_ENGINES = (VLLM, SGLANG)
+# Python-packaged engines found by find_engine (and `llmctl config <x>-bin`).
+PY_ENGINES = (*HF_ENGINES, OMNI)
 
 
 # Set for every process llmctl starts. vLLM sends usage stats home unless told
@@ -83,7 +95,7 @@ def launch_env(offline: bool, backend: str | None = None) -> dict[str, str]:
     telemetry, offline mode, and for vllm/sglang the CUDA toolchain their
     kernel JIT compiles with (:func:`toolchain_env`)."""
     return {**NO_TELEMETRY_ENV, **(OFFLINE_ENV if offline else {}),
-            **(toolchain_env() if backend in HF_ENGINES else {}),
+            **(toolchain_env() if backend in PY_ENGINES else {}),
             **(SGLANG_ENV if backend == SGLANG else {})}
 
 
@@ -113,7 +125,11 @@ def find_llama_server() -> str | None:
 
 
 # $LLM_RUNNER_<X>_BIN overrides discovery of each Python-packaged engine.
-_BIN_ENV = {VLLM: "LLM_RUNNER_VLLM_BIN", SGLANG: "LLM_RUNNER_SGLANG_BIN"}
+_BIN_ENV = {VLLM: "LLM_RUNNER_VLLM_BIN", SGLANG: "LLM_RUNNER_SGLANG_BIN",
+            OMNI: "LLM_RUNNER_OMNI_BIN"}
+# (venv / uv tool name, executable) where they differ from the backend name.
+# vLLM-Omni's CLI is `vllm` from a venv that also holds vllm-omni.
+_ENGINE_DIST = {OMNI: ("vllm-omni", "vllm")}
 
 
 def bin_env_var(backend: str) -> str:
@@ -130,13 +146,14 @@ def _uv_tool_dir() -> Path:
 
 
 def find_engine(backend: str) -> str | None:
-    """Locate the ``vllm`` / ``sglang`` CLI.
+    """Locate the ``vllm`` / ``sglang`` CLI, or vLLM-Omni's ``vllm``.
 
     Order: ``$LLM_RUNNER_<X>_BIN`` → ``config.json`` ``<x>_bin`` → PATH → the
     venv ``uv tool install <x>`` made → a venv at ``~/.venvs/<x>``,
     ``~/venvs/<x>`` or ``~/<x>/.venv``. Returns an absolute path (or None)
     so the recorded launch argv keeps working from a systemd unit whose PATH
-    lacks ``~/.local/bin``.
+    lacks ``~/.local/bin``. For omni, ``<x>`` is ``vllm-omni`` and PATH is
+    skipped: the ``vllm`` there is plain vLLM.
     """
     env = os.environ.get(_BIN_ENV[backend])
     if env:
@@ -147,15 +164,17 @@ def find_engine(backend: str) -> str | None:
     if configured and configured.is_file():
         return str(configured)
 
-    on_path = shutil.which(backend)
-    if on_path:
-        return str(Path(on_path).absolute())
+    dist, exe = _ENGINE_DIST.get(backend, (backend, backend))
+    if backend not in _ENGINE_DIST:
+        on_path = shutil.which(exe)
+        if on_path:
+            return str(Path(on_path).absolute())
 
     home = Path.home()
-    for c in (_uv_tool_dir() / backend / "bin" / backend,
-              home / ".venvs" / backend / "bin" / backend,
-              home / "venvs" / backend / "bin" / backend,
-              home / backend / ".venv" / "bin" / backend):
+    for c in (_uv_tool_dir() / dist / "bin" / exe,
+              home / ".venvs" / dist / "bin" / exe,
+              home / "venvs" / dist / "bin" / exe,
+              home / dist / ".venv" / "bin" / exe):
         if c.is_file() and os.access(c, os.X_OK):
             return str(c)
     return None
@@ -232,6 +251,12 @@ def missing_hint(backend: str) -> str:
                 "create its venv (`uv venv --python 3.12 .venv312 && uv pip install "
                 "-p .venv312/bin/python -e \".[serve]\"`) and point llmctl at it with "
                 "`llmctl config decider-dir /path/to/decider` (or $LLM_RUNNER_DECIDER_DIR).")
+    if backend == OMNI:
+        return ("vLLM-Omni not found. It needs a venv of its own with the matching vLLM "
+                "release: `uv venv --python 3.12 ~/.venvs/vllm-omni && uv pip install "
+                "-p ~/.venvs/vllm-omni --torch-backend auto vllm==0.30.0 vllm-omni==0.30.0` "
+                "(llmctl finds it there), or point at another one with `llmctl config "
+                "omni-bin /path/to/venv/bin/vllm` (or $LLM_RUNNER_OMNI_BIN).")
     return (f"`{backend}` CLI not found. Install it in its own venv with "
             f"`uv tool install --torch-backend auto {backend}` (llmctl finds it "
             f"there), or point at another one with `llmctl config {backend}-bin "
@@ -349,6 +374,39 @@ def is_hf_model_dir(path: Path) -> bool:
     if not (path.is_dir() and (path / "config.json").is_file()):
         return False
     return any(next(path.glob(g), None) is not None for g in _HF_WEIGHT_GLOBS)
+
+
+def _weights_size(folder: Path) -> int:
+    return sum(f.stat().st_size for g in _HF_WEIGHT_GLOBS for f in folder.glob(g)
+               if f.is_file())
+
+
+def diffusers_components(path: Path) -> dict[str, int]:
+    """``{component: weight bytes}`` for each component ``model_index.json``
+    names that has a subfolder of weights (transformer, text_encoder_2, vae,
+    ...); {} if ``path`` is not a diffusers pipeline. Components without
+    weights (scheduler, tokenizers) are left out."""
+    try:
+        index = json.loads((path / "model_index.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(index, dict):
+        return {}
+    out = {}
+    for name in index:
+        sub = path / name
+        if not name.startswith("_") and sub.is_dir():
+            size = _weights_size(sub)
+            if size:
+                out[name] = size
+    return out
+
+
+def is_diffusers_dir(path: Path) -> bool:
+    """A diffusers pipeline (e.g. FLUX.1): ``model_index.json`` at the top
+    and the weights in one subfolder per component. Its subfolders carry
+    their own ``config.json`` + weights but are parts, not models."""
+    return path.is_dir() and bool(diffusers_components(path))
 
 
 def hf_dir_size(path: Path) -> int:
@@ -523,9 +581,12 @@ def is_decider_model_dir(path: Path) -> bool:
 
 
 def infer_backend(path: Path) -> str:
-    """``decider`` for a decider checkpoint dir, ``vllm`` for any other HF
-    checkpoint dir, ``llama`` for anything else (GGUF)."""
+    """``omni`` for a diffusers pipeline dir, ``decider`` for a decider
+    checkpoint dir, ``vllm`` for any other HF checkpoint dir, ``llama`` for
+    anything else (GGUF)."""
     if path.is_dir():
+        if is_diffusers_dir(path):
+            return OMNI
         return DECIDER if is_decider_model_dir(path) else VLLM
     return LLAMA
 
@@ -786,3 +847,58 @@ def build_decider_cmd(uvicorn_bin: str, decider_dir: Path, model_path: Path, *,
         env["DECIDER_MAX_BATCH"] = str(n_parallel)
         env["DECIDER_WARMUP_MAX_B"] = str(n_parallel)
     return cmd, env
+
+
+# -------------------------------------------------------------- omni argv --
+
+# vLLM-Omni flags that choose how weights move between CPU and GPU. One in -X
+# replaces llmctl's pick.
+OMNI_OFFLOAD_FLAGS = ("--diffusion-offload-config", "--enable-cpu-offload",
+                      "--enable-layerwise-offload", "--enable-distributed-layerwise-offload")
+# Denoiser components (the bulk of a pipeline, run once per step) and the
+# text encoders (run once per prompt), by diffusers component name.
+_DIT_COMPONENTS = ("transformer", "transformer_2", "unet")
+# Activations, the VAE decode and CUDA context on top of resident weights. A
+# 1024² FLUX.1 image peaked at 15.5 GB with 13.3 GB of non-DiT weights
+# resident (vLLM-Omni 0.30, RTX 4090).
+_OMNI_HEADROOM_MIB = 4096
+
+
+def default_omni_offload(model_path: Path) -> tuple[list[str], str]:
+    """``(args, reason)``: the offload a diffusers pipeline needs to fit the
+    VRAM free now. Everything on the GPU when it fits; otherwise the DiT
+    streams from CPU a block at a time (``mode: layer``), plus the text
+    encoders when even the rest doesn't fit. Weights only move when
+    unquantized: vLLM-Omni 0.30 builds a quantized pipeline on the GPU
+    whatever the offload, so fp8 doesn't help on a 24 GB card."""
+    comps = diffusers_components(model_path)
+    mib = 1024 * 1024
+    total = sum(comps.values()) // mib
+    dit = sum(s for c, s in comps.items() if c in _DIT_COMPONENTS) // mib
+    encoders = sum(s for c, s in comps.items() if c.startswith("text_encoder")) // mib
+    mem = gpu_memory_mib()
+    if mem is not None and mem[0] >= total + _OMNI_HEADROOM_MIB:
+        return [], f"{total} MiB of weights fit in {mem[0]} MiB free"
+    components = ["dit"]
+    if mem is not None and mem[0] < total - dit + _OMNI_HEADROOM_MIB and encoders:
+        components.append("text_encoder")
+    why = (f"{total} MiB of weights, {mem[0]} MiB free" if mem is not None
+           else "free VRAM unknown")
+    cfg = json.dumps({"mode": "layer", "components": components}, separators=(",", ":"))
+    return ["--diffusion-offload-config", cfg], why
+
+
+def build_omni_cmd(vllm_bin: str, model_path: Path, *, name: str, port: int,
+                   offload: list[str] | None = None, host: str = "0.0.0.0",
+                   extra: list[str] | None = None) -> list[str]:
+    """``vllm serve --omni`` on a diffusers pipeline. ``offload`` is
+    :func:`default_omni_offload`'s args, dropped when ``extra`` picks an
+    offload mode itself."""
+    cmd = [vllm_bin, "serve", str(model_path), "--omni",
+           "--host", host, "--port", str(port),
+           "--served-model-name", name]
+    if offload and not any(a.split("=")[0] in OMNI_OFFLOAD_FLAGS for a in extra or []):
+        cmd += offload
+    if extra:
+        cmd += extra
+    return cmd

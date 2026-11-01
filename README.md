@@ -7,7 +7,8 @@ CLI (`llmctl`) to download, list, start, stop, and tail models served via
 files) or [vLLM](https://docs.vllm.ai) / [SGLang](https://docs.sglang.io)
 (Hugging Face safetensors checkpoints). Works with any GGUF or HF checkpoint (Gemma, Llama, Qwen,
 Mistral, etc.) and arbitrary local files/dirs via `--ft`. Embedding models
-(e.g. bge-m3) are supported too via `--embeddings`.
+(e.g. bge-m3) are supported too via `--embeddings`, and image generation with
+diffusers pipelines (FLUX.1) on [vLLM-Omni](https://github.com/vllm-project/vllm-omni).
 
 The backend is picked from the model format: a `.gguf` runs on
 `llama-server`, a checkpoint directory (`config.json` + `*.safetensors`) runs
@@ -257,6 +258,24 @@ throughput without torch.compile), `-X` appends uvicorn flags. The graph-capture
 patch kept in enersec-agentic (`benchmark/decisions/serving-decider-footprint.patch`)
 until it is upstream; without it they are ignored and the server captures
 its default 72 graphs (~20 GB peak for the 2B).
+
+### 5. vLLM-Omni (optional, for image generation)
+
+[vLLM-Omni](https://github.com/vllm-project/vllm-omni) serves diffusers
+pipelines such as FLUX.1 behind `POST /v1/images/generations`. It is a
+plugin for one vLLM release (same major.minor), and its CLI is `vllm` too, so
+it gets a venv of its own instead of going into the `vllm` tool:
+
+```bash
+uv venv --python 3.12 ~/.venvs/vllm-omni
+uv pip install -p ~/.venvs/vllm-omni --torch-backend auto vllm==0.30.0 vllm-omni==0.30.0
+~/.venvs/vllm-omni/bin/python -c 'import vllm, vllm_omni; print(vllm.__version__, vllm_omni.__version__)'
+```
+
+llmctl looks for it in `$LLM_RUNNER_OMNI_BIN`, the persisted `omni_bin`
+setting, `~/.venvs/vllm-omni/bin/vllm`, `~/venvs/vllm-omni/bin/vllm` and a uv
+tool named `vllm-omni`. It never takes the `vllm` on `PATH`, which is plain
+vLLM. Elsewhere: `llmctl config omni-bin /path/to/venv/bin/vllm`.
 
 ## Models
 
@@ -609,6 +628,54 @@ llama-server -m bge-m3-Q8_0.gguf --embeddings --pooling cls -c 8192 -b 8192 -ub 
 - Port auto-selection still applies: with a chat model already on `8080`, the
   embedding server lands on `8081`. Query it at the OpenAI-compatible
   `http://localhost:<port>/v1/embeddings`.
+
+### Image generation (FLUX.1 and other diffusers pipelines)
+
+A diffusers pipeline is a folder with `model_index.json` at the top and one
+subfolder of weights per component (`transformer/`, `text_encoder_2/`,
+`vae/`, ...). `llmctl list` shows it as one model with backend `omni`, and
+`run` starts it on [vLLM-Omni](#5-vllm-omni-optional-for-image-generation):
+
+```bash
+hf auth login                                   # FLUX.1 repos are gated: accept the license first
+llmctl download black-forest-labs/FLUX.1-schnell
+llmctl run flux.1-schnell --wait
+curl -s localhost:9000/v1/images/generations -H 'content-type: application/json' -d '{
+  "model": "flux.1-schnell", "prompt": "A red fox reading a newspaper in the snow",
+  "size": "1024x1024", "num_inference_steps": 4, "guidance_scale": 0.0, "seed": 42,
+  "response_format": "b64_json"}' | jq -r '.data[0].b64_json' | base64 -d > fox.png
+```
+
+`download` skips the single-file copies at the top of the repo
+(`flux1-schnell.safetensors`, `ae.safetensors`, for ComfyUI) since the
+pipeline loads from its subfolders; that is ~24 GB less for FLUX.1.
+
+Steps, guidance and seed travel per request, so dev and schnell need nothing
+model-specific: schnell wants ~4 steps and `guidance_scale` 0, dev ~28 steps
+and 3.5. Text-model options (`--ctx-size`, `--kv-quant`, `--n-parallel`,
+`--draft`, ...) don't apply and are ignored with a warning.
+
+**Memory.** `run` keeps the whole pipeline on the GPU when its weights plus
+4 GB fit the free VRAM. Otherwise the DiT streams from CPU a block at a time
+(`--diffusion-offload-config '{"mode":"layer","components":["dit"]}'`), and
+the text encoders too when even the rest doesn't fit. Pass any offload flag
+with `-X` to choose yourself. On an RTX 4090 (24 GB), with vLLM-Omni 0.30 in
+bf16:
+
+| Model | Steps | 1024² image | Peak VRAM | Ready after |
+|---|---|---|---|---|
+| FLUX.1-schnell | 4 | 3.7 s | 16 GB | 55 s |
+| FLUX.1-dev | 28 | 25 s | 15.5 GB | 46 s |
+
+fp8 doesn't fit FLUX.1 into 24 GB with vLLM-Omni 0.30, either converted at
+load (`-X '--quantization fp8'`) or from a torchao fp8 checkpoint: with any
+quantization it builds the whole pipeline on the GPU before offloading, and
+its FLUX T5 encoder (~9.5 GB) stays bf16. Use bf16 with offload there; fp8
+helps on a card with room for the bf16 build.
+
+Through the gateway, `/v1/images/*` goes only to image models and chat,
+completions and embeddings never do, so a chat call without `"model"` still
+finds the one chat model when FLUX runs beside it.
 
 ### Fitting large models into limited VRAM
 

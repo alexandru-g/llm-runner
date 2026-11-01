@@ -11,7 +11,10 @@ A "model" is either
 * any directory under ``MODELS_DIR`` holding a Hugging Face checkpoint
   (``config.json`` + safetensors/bin weights) — served by ``vllm``
   (``backend="vllm"``), or by ``decider.serve`` when the directory also
-  carries ``decider_config.json`` (``backend="decider"``).
+  carries ``decider_config.json`` (``backend="decider"``), or
+* any directory holding a diffusers pipeline (``model_index.json`` + a
+  subfolder of weights per component, e.g. FLUX.1) — served by vLLM-Omni
+  (``backend="omni"``) for image generation.
 
 The friendly key for a GGUF is its filename stem, lowercased; for an HF dir
 it is the directory name, lowercased. If two models share a key (across
@@ -136,17 +139,21 @@ def _find_draft(folder: Path) -> Path | None:
 
 def _find_hf_dirs(base: Path) -> list[Path]:
     """Checkpoint directories under ``base`` (outermost only — a nested
-    ``vision_tower/config.json`` inside a checkpoint is not its own model)."""
+    ``vision_tower/config.json`` inside a checkpoint is not its own model),
+    and diffusers pipelines, whose ``transformer/``, ``vae/``, ... each look
+    like a checkpoint but are components of the one model."""
     found: list[Path] = []
-    for cfg in sorted(base.rglob("config.json")):
-        d = cfg.parent
-        if any(part.startswith(".") for part in d.relative_to(base).parts):
-            continue  # .cache/ etc.
-        if any(d.is_relative_to(f) for f in found):
-            continue
-        if backends.is_hf_model_dir(d):
-            found.append(d)
-    return found
+    for marker, is_model in (("model_index.json", backends.is_diffusers_dir),
+                             ("config.json", backends.is_hf_model_dir)):
+        for f in sorted(base.rglob(marker)):
+            d = f.parent
+            if any(part.startswith(".") for part in d.relative_to(base).parts):
+                continue  # .cache/ etc.
+            if any(d.is_relative_to(x) for x in found):
+                continue
+            if is_model(d):
+                found.append(d)
+    return sorted(found)
 
 
 def discover_models(models_dir: Path | None = None) -> dict[str, ModelSpec]:

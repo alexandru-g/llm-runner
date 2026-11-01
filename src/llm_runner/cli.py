@@ -29,7 +29,7 @@ from llm_runner import images
 from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner import registry
-from llm_runner.backends import DECIDER, GATEWAY, HF_ENGINES, LLAMA, SGLANG, VLLM
+from llm_runner.backends import DECIDER, GATEWAY, HF_ENGINES, LLAMA, OMNI, PY_ENGINES, SGLANG, VLLM
 from llm_runner.registry import MODELS_DIR, ModelSpec, discover_models
 
 
@@ -278,6 +278,13 @@ _HF_ENGINE_PARAMS = {
 }
 
 
+# Text-model options an image pipeline has no use for.
+_TEXT_MODEL_PARAMS = {
+    "ctx_size": "--ctx-size", "kv_quant": "--kv-quant", "n_parallel": "--n-parallel",
+    "embeddings": "--embeddings/--no-embeddings", "draft_spec": "--draft",
+}
+
+
 def _warn_foreign_flags(ctx: click.Context, backend: str) -> None:
     src = click.core.ParameterSource.COMMANDLINE
     hf = "vllm/sglang"
@@ -285,6 +292,11 @@ def _warn_foreign_flags(ctx: click.Context, backend: str) -> None:
         # decider takes only --port / --n-parallel / -X / -E; everything
         # engine-specific is meaningless there.
         groups = {LLAMA: _LLAMA_ONLY_PARAMS, hf: _HF_ENGINE_PARAMS}
+    elif backend == OMNI:
+        # An image pipeline takes --port / --name / -X / -E and the runtime
+        # flags; sampling knobs (steps, guidance, seed) travel per request.
+        groups = {LLAMA: _LLAMA_ONLY_PARAMS, hf: _HF_ENGINE_PARAMS,
+                  "text-model": _TEXT_MODEL_PARAMS}
     else:
         groups = {hf: _HF_ENGINE_PARAMS} if backend == LLAMA else {LLAMA: _LLAMA_ONLY_PARAMS}
     for other, foreign in groups.items():
@@ -391,7 +403,7 @@ def config_show() -> None:
     for backend in backends.BACKENDS:
         found = backends.find(backend)
         click.echo(f"  {backend:<6} {found or '(not found)'}")
-    for engine in HF_ENGINES:
+    for engine in PY_ENGINES:
         var = backends.bin_env_var(engine)
         if os.environ.get(var):
             click.echo(f"  ({engine} overridden by ${var})")
@@ -625,6 +637,14 @@ def _engine_bin_command(engine: str) -> None:
         if os.environ.get(var):
             click.echo(f"note: ${var} is set and overrides this.", err=True)
 
+    if engine == OMNI:
+        command.help = (
+            "Persist the path to vLLM-Omni's `vllm` CLI, or print it when PATH is "
+            "omitted.\n\nOnly needed when it lives somewhere llmctl doesn't look: "
+            "~/.venvs/vllm-omni, or a uv tool named vllm-omni (`vllm` on PATH is "
+            "plain vLLM and never used for it). Example:\n\n"
+            "\b\n  llmctl config omni-bin ~/envs/vllm-omni/bin/vllm")
+        return
     command.help = (
         f"Persist the path to the `{engine}` CLI, or print it when PATH is omitted.\n\n"
         f"Only needed when {engine} lives somewhere llmctl doesn't look: PATH, the "
@@ -632,7 +652,7 @@ def _engine_bin_command(engine: str) -> None:
         f"\b\n  llmctl config {engine}-bin ~/envs/{engine}/bin/{engine}")
 
 
-for _engine in HF_ENGINES:
+for _engine in PY_ENGINES:
     _engine_bin_command(_engine)
 
 
@@ -891,7 +911,8 @@ def list_cmd() -> None:
 
     GGUF files are served by llama-server; Hugging Face checkpoint
     directories (config.json + safetensors) by vllm, or by decider.serve when
-    they carry a decider_config.json.
+    they carry a decider_config.json; diffusers pipelines (model_index.json,
+    e.g. FLUX.1) by vLLM-Omni (backend omni) for image generation.
     """
     click.echo(f"Models dir: {MODELS_DIR}")
     specs = discover_models()
@@ -979,11 +1000,12 @@ def profile_rm(name: str) -> None:
 
 @cli.command()
 @click.argument("model", required=False)
-@click.option("--backend", type=click.Choice(["auto", LLAMA, VLLM, SGLANG, DECIDER]),
+@click.option("--backend", type=click.Choice(["auto", LLAMA, VLLM, SGLANG, DECIDER, OMNI]),
               default="auto", show_default=True,
               help="Serving engine. auto = llama-server for a GGUF, vllm for a "
-                   "Hugging Face checkpoint directory. sglang serves the same "
-                   "checkpoints and is only used when asked for.")
+                   "Hugging Face checkpoint directory, omni (vLLM-Omni) for a "
+                   "diffusers pipeline. sglang serves the same checkpoints as vllm "
+                   "and is only used when asked for.")
 @click.option("--port", "-p", type=int, default=None,
               help="Listen port. Auto-selected starting at 8080 if omitted or taken.")
 @click.option("--ctx-size", "-c", type=int, default=None,
@@ -1163,7 +1185,9 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
 
     GGUF models run on llama-server; Hugging Face checkpoint directories run
     on vllm (or sglang with --backend sglang), or on decider.serve when they
-    carry a decider_config.json. Use --ft <path> to bypass the registry.
+    carry a decider_config.json; diffusers pipelines (e.g. FLUX.1) run on
+    vLLM-Omni and answer /v1/images/generations. Use --ft <path> to bypass the
+    registry.
     """
     spec: ModelSpec | None = None
     if ft_path:
@@ -1211,6 +1235,9 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     # tokenizer via -X) but an HF directory can never run on llama-server.
     if backend == "auto":
         backend = detected
+    elif backend != OMNI and detected == OMNI:
+        raise click.UsageError(
+            f"'{model_path.name}' is a diffusers pipeline; only --backend omni serves it.")
     elif backend == LLAMA and model_path.is_dir():
         raise click.UsageError(
             f"'{model_path.name}' is a Hugging Face checkpoint directory; "
@@ -1218,6 +1245,10 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     elif backend == DECIDER and not backends.is_decider_model_dir(model_path):
         raise click.UsageError(
             f"'{model_path.name}' is not a decider checkpoint (no decider_config.json).")
+    elif backend == OMNI and not backends.is_diffusers_dir(model_path):
+        raise click.UsageError(
+            f"'{model_path.name}' is not a diffusers pipeline (no model_index.json); "
+            "the omni backend serves image-generation pipelines.")
     runtime = _resolve_runtime(backend, runtime_kind, image, allow_tag, gpu, dns)
     # A container brings its own engine; the host needn't have one.
     binary = backend if runtime["kind"] == containers.DOCKER else _require_backend(backend)
@@ -1233,8 +1264,8 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                                "--kv-quant q8_0 (→ fp8) or f16.")
     # decider.serve speaks the decision protocol itself; on the other engines a
     # decision model only serves raw completions.
-    decision = backend != DECIDER and (spec.decision if spec
-                                         else backends.is_decision_model(model_path))
+    decision = backend not in (DECIDER, OMNI) and (
+        spec.decision if spec else backends.is_decision_model(model_path))
     if decision:
         click.echo(f"note: '{model_path.name}' is a decision model — its answers are "
                    "letter logprobs over a vendor-specific prompt, read by its own "
@@ -1242,7 +1273,9 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
 
     # Default embeddings mode by filename when the user didn't force it.
     stem = model_path.stem if model_path.is_file() else model_path.name
-    if embeddings is None:
+    if backend == OMNI:
+        embeddings = False
+    elif embeddings is None:
         embeddings = registry.looks_like_embedding_model(stem, model_path)
         if embeddings:
             click.echo(f"Detected embedding model '{stem}' — starting "
@@ -1266,7 +1299,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         if draft_spec:
             click.echo("Ignoring --draft: speculative decoding doesn't apply to "
                        "embedding servers.", err=True)
-    elif not no_draft:
+    elif not no_draft and backend != OMNI:
         draft_path = _resolve_draft(draft_spec, spec, backend)
 
     extra_args = [tok for chunk in extra for tok in shlex.split(chunk)]
@@ -1284,6 +1317,15 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
             binary, decider_dir, model_path, port=chosen_port,
             n_parallel=n_parallel, host=config_mod.get_bind_host(), extra=extra_args)
         env = {**launch_env, **env}      # -E overrides the profile defaults
+    elif backend == OMNI:
+        offload: list[str] = []
+        if not any(a.split("=")[0] in backends.OMNI_OFFLOAD_FLAGS for a in extra_args):
+            offload, why = backends.default_omni_offload(model_path)
+            click.echo(f"Offload: {' '.join(offload) or 'none'} ({why}); pass an offload "
+                       "flag with -X to override.")
+        cmd = backends.build_omni_cmd(binary, model_path, name=name, port=chosen_port,
+                                      offload=offload, host=config_mod.get_bind_host(),
+                                      extra=extra_args)
     elif backend in HF_ENGINES:
         if gpu_mem is None:
             picked = backends.default_gpu_mem(backend)
@@ -1404,7 +1446,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     if wait:
         # vllm/sglang load weights, profile memory and capture CUDA graphs
         # before they listen; llama-server is usually up in seconds.
-        timeout = 600 if backend in (*HF_ENGINES, DECIDER) else 120
+        timeout = 600 if backend in (*PY_ENGINES, DECIDER) else 120
         t0 = time.time()
         if _wait_healthy(rec, timeout=timeout):
             proc.record_event(rec.name, "ready", f"pid {rec.pid} port {rec.port} after "
@@ -1423,6 +1465,11 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     elif backend == DECIDER:
         click.echo("Note: decider loads the weights and captures its CUDA graphs "
                    "before it listens (~30 s); use --wait to block on /health.")
+    elif backend == OMNI:
+        click.echo("Note: vLLM-Omni loads the pipeline before it listens (~1 min); use "
+                   "--wait to block on /health. Generate with POST /v1/images/generations "
+                   f"(model \"{name}\"; num_inference_steps, guidance_scale and seed per "
+                   "request).")
 
 
 @cli.command("ps")
@@ -1986,7 +2033,7 @@ def _restart_all(ctx: click.Context) -> None:
             click.echo(f"skipped: {e.format_message()}", err=True)
             failed.append(p.name)
             continue
-        slow = rec is not None and rec.backend in (*HF_ENGINES, DECIDER)
+        slow = rec is not None and rec.backend in (*PY_ENGINES, DECIDER)
         if rec is None or not _wait_healthy(rec, timeout=600 if slow else 300):
             failed.append(p.name)
     if failed:
@@ -2951,6 +2998,7 @@ def _write_source(folder: Path, repo_id: str, rfilenames: list[str],
 _HF_IGNORE_ALWAYS = ("*.gguf", "*.msgpack", "*.h5", "*.ot", "*.onnx", "onnx/*",
                      "original/*", "consolidated*", ".gitattributes")
 _HF_IGNORE_IF_SAFETENSORS = ("*.bin", "*.pt", "*.pth")
+_HF_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt")
 
 
 def _snapshot_hf(repo_id: str, info, target_dir: Path, *, revalidate: bool) -> None:
@@ -2971,15 +3019,25 @@ def _snapshot_hf(repo_id: str, info, target_dir: Path, *, revalidate: bool) -> N
     from fnmatch import fnmatch
     wanted = [s for s in info.siblings
               if not any(fnmatch(s.rfilename, pat) for pat in ignore)]
+    # A diffusers pipeline (FLUX.1, ...) loads each component from its
+    # subfolder; weights at the top are single-file copies for other tools
+    # (ComfyUI's flux1-dev.safetensors, ae.safetensors): ~24 GB never read.
+    diffusers = "model_index.json" in names
+    if diffusers:
+        wanted = [s for s in wanted
+                  if "/" in s.rfilename or not s.rfilename.endswith(_HF_WEIGHT_SUFFIXES)]
     total = sum(getattr(s, "size", None) or 0 for s in wanted)
     target_dir.mkdir(parents=True, exist_ok=True)
-    click.echo(f"Target: {target_dir}  (vllm / Hugging Face checkpoint)")
+    kind = "vLLM-Omni / diffusers pipeline" if diffusers else "vllm / Hugging Face checkpoint"
+    click.echo(f"Target: {target_dir}  ({kind})")
     verb = "Revalidating" if revalidate else "Downloading"
     click.echo(f"  ↓ {verb} {len(wanted)} files ({_fmt_size(total).strip()}) "
                f"from {repo_id} ...")
     try:
+        # Diffusers: exact names, as a pattern can't say "only at the top".
         snapshot_download(repo_id=repo_id, local_dir=str(target_dir),
-                          ignore_patterns=ignore)
+                          **({"allow_patterns": [s.rfilename for s in wanted]} if diffusers
+                             else {"ignore_patterns": ignore}))
     except Exception as e:
         raise click.UsageError(
             f"Download failed: {e}\n(Gated repo? Accept the license on "
@@ -2990,9 +3048,13 @@ def _snapshot_hf(repo_id: str, info, target_dir: Path, *, revalidate: bool) -> N
     for p in sorted(target_dir.iterdir()):
         if p.is_file() and p.name != _SOURCE_FILE:
             click.echo(f"  {p.name}  ({_fmt_size(p.stat().st_size)})")
-    if not backends.is_hf_model_dir(target_dir):
+        elif diffusers and p.is_dir() and not p.name.startswith("."):
+            # A pipeline's components: one folder each.
+            click.echo(f"  {p.name}/  ({_fmt_size(backends.hf_dir_size(p))})")
+    if not (backends.is_hf_model_dir(target_dir) or backends.is_diffusers_dir(target_dir)):
         click.echo("warning: folder doesn't look like a servable checkpoint "
-                   "(no config.json + weights).", err=True)
+                   "(no config.json + weights, nor model_index.json + components).",
+                   err=True)
 
 
 def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
@@ -3216,13 +3278,13 @@ def _resolve_update_target(target: str | None) -> tuple[str, Path, str | None]:
     for key, spec in specs.items():
         # GGUF: the folder holding the file. vllm: the checkpoint dir itself,
         # which is re-snapshotted whole (no single file to name).
-        folder = spec.model_path if spec.backend == VLLM else spec.model_path.parent
+        folder = spec.model_path if spec.model_path.is_dir() else spec.model_path.parent
         if _read_source(folder).get("source") == "install":
             installed.add(key)
             continue
         repo = _read_source(folder).get("repo_id")
         if repo:
-            known = None if spec.backend == VLLM else spec.model_path.name
+            known = None if spec.model_path.is_dir() else spec.model_path.name
             updatable[key] = (repo, folder, known)
 
     if target is None:
