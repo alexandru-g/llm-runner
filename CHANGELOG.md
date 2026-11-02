@@ -7,6 +7,8 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-11-02
+
 ### Added
 
 - **`llmctl setup`:** with no argument, one row per backend with the version
@@ -401,6 +403,7 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.10.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.10.0
 [1.9.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.9.0
 [1.8.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.8.0
 [1.7.1]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.7.1
