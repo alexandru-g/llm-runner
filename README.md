@@ -809,6 +809,59 @@ llmctl logs 12345 -n 200
 llmctl logs gemma-4-e4b-it-q4_k_m -f   # follow (like `tail -f`); Ctrl-C to stop
 ```
 
+### Measure a running model's speed
+
+```bash
+llmctl speedtest                   # tick models (space), then an options menu (like run's)
+llmctl speedtest gemma-4-26b-a4b-it-ud-q4_k_m --profile quick
+llmctl speedtest gemma-4-26b-a4b-it-ud-q4_k_m qwen3.5-4b --gen 512   # compare
+llmctl speedtest qwen3.5-4b --prompt-tokens 2048,8192 --gen 512 --runs 5
+llmctl speedtest gemma-4-26b-a4b-it-ud-q4_k_m --profile load --json
+llmctl speedtest --list-profiles
+```
+
+`speedtest` sends requests straight to the model's port, so it measures the
+server exactly as it was launched: KV cache type, drafter, slots, host or
+container. What it reports depends on what the model serves:
+
+| model | measured |
+|---|---|
+| chat/completion (llama, vllm, sglang) | time to first token, prefill and decode tokens/s per prompt size, total tokens/s with concurrent requests, drafter acceptance |
+| embeddings | inputs/s and tokens/s |
+| decision endpoint (`decide`, decider) | decisions/s, latency, prefill tokens/s |
+| image pipeline (omni) | seconds per image, steps/s |
+
+Every prompt is fresh random text, so a prompt cache can't speed up prefill.
+Its length is calibrated against the server's own token counts. Generation
+ignores EOS, so every request decodes the same number of tokens. After one
+warm-up, the numbers are medians over `--runs`. On llama-server, prefill and
+decode come from the server's own `timings`. Elsewhere, the stream is timed
+on the client. Drafter acceptance comes from llama-server's timings or from
+the change in vLLM's spec-decode counters. Prompt sizes that don't fit the
+context are skipped and listed as notes.
+
+With several NAMEs, the models are tested one after another with the same
+options. The result is one comparison table per prompt size, with a row for
+each model and a "vs best" column. That column ranks by decode t/s (total t/s
+with concurrent requests), tokens/s, decisions/s, or seconds per image. If
+the models are of different kinds (say, a chat model and an image pipeline),
+each kind gets its own menu and its own table. A model that doesn't answer is
+skipped with a note.
+
+With no NAME, a checklist of the running models opens: space ticks a model,
+`a` ticks them all, and Enter confirms. If only one model is running, it is
+picked without asking. Next comes a menu: Run on top, then a Profile row and
+one row per option, like `run`'s menu. The profiles are `last` (this model's previous
+test, or for several models the previous comparison), `default`, `quick` (one short pass), `long` (16K and 32K prompts, for
+prefill speed), `load` (4 concurrent requests), and your own, saved from
+the menu. A profile only sets options that apply to the model. Typed flags
+win over the profile. `--delete-profile NAME` removes one of yours.
+
+Each test is real load. If the model is already working on requests (from
+llama-server's `/slots`, vLLM/SGLang metrics, or the llama-server behind a
+decision endpoint), `speedtest` asks before running, or refuses without
+`--force` when it isn't on a terminal.
+
 ### Chatting with a running model
 
 `llama-server` already exposes a built-in web chat UI at

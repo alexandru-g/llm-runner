@@ -7,6 +7,20 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`llmctl speedtest`:** measures a running model on its own port. Text
+  models report time to first token, prefill and decode tokens/s, and drafter
+  acceptance. Embedding models report inputs and tokens/s, decision endpoints
+  report decisions/s, and image pipelines report seconds per image. Prompts
+  are fresh random text sized to the requested token counts, so no prompt
+  cache helps. Several names, or several models ticked with space in the
+  picker, are tested one after another with the same options and compared in
+  one table per prompt size. With no name, it opens the picker and then an
+  options menu with profiles (`last`, `default`, `quick`, `long`, `load`, and
+  your own). It asks before loading a model that is already serving requests
+  (`--force` skips that), and `--json` prints the results as JSON.
+
 ## [1.8.0] - 2026-11-01
 
 ### Added

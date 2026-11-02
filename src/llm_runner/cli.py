@@ -1855,6 +1855,218 @@ def show(identifier: str | None) -> None:
 
 
 @cli.command()
+@click.argument("identifiers", nargs=-1, metavar="[NAME]...")
+@click.option("--profile", "profile", default=None, metavar="NAME",
+              help="Set the options from a profile: last, default, quick, long, load, "
+                   "or one saved from the menu (--list-profiles). Flags typed "
+                   "alongside it win. With the menu, the menu opens on it.")
+@click.option("--menu/--no-menu", "-i", "menu", default=None,
+              help="Show the options menu before testing. On by default when "
+                   "NAME is left out (and stdin is a terminal).")
+@click.option("--prompt-tokens", "prompt", default=None, metavar="N[,N…]",
+              help="Prompt sizes to test, in tokens (text: the prompt; embeddings: "
+                   "each input; decisions: the state). e.g. 512,4096.")
+@click.option("--gen", "gen", type=click.IntRange(1, 65536), default=None,
+              help="Text: tokens generated per request (EOS ignored).")
+@click.option("--concurrency", "-c", "concurrency", type=click.IntRange(1, 256), default=None,
+              help="Requests sent at once (text, embeddings, decisions).")
+@click.option("--runs", "-r", "runs", type=click.IntRange(1, 100), default=None,
+              help="Measured runs per prompt size, after a warm-up.")
+@click.option("--inputs", "inputs", type=click.IntRange(1, 4096), default=None,
+              help="Embeddings: inputs per request.")
+@click.option("--questions", "questions", type=click.IntRange(1, 1024), default=None,
+              help="Decisions: questions per request.")
+@click.option("--size", "size", default=None, metavar="WxH",
+              help="Images: image size, e.g. 1024x1024.")
+@click.option("--steps", "steps", type=click.IntRange(1, 1000), default=None,
+              help="Images: denoising steps (default: the model's).")
+@click.option("--force", is_flag=True, default=False,
+              help="Test even while the model is serving other requests.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Print the results as JSON.")
+@click.option("--list-profiles", is_flag=True, default=False,
+              help="List the speedtest profiles and exit.")
+@click.option("--delete-profile", "delete_profile", default=None, metavar="NAME",
+              help="Delete one of your speedtest profiles and exit.")
+def speedtest(identifiers: tuple[str, ...], profile: str | None, menu: bool | None,
+              prompt: str | None, gen: int | None, concurrency: int | None,
+              runs: int | None, inputs: int | None, questions: int | None,
+              size: str | None, steps: int | None, force: bool, as_json: bool,
+              list_profiles: bool, delete_profile: str | None) -> None:
+    """Measure the speed of running models on their own API.
+
+    Text models: time to first token, prefill and decode tokens/s (and the
+    drafter's acceptance). Embedding models: inputs and tokens/s. Decision
+    endpoints: decisions/s and latency. Image models: seconds per image.
+
+    Requests go straight to each model's port, with fresh random prompts so
+    no prompt cache helps, and the results are medians over the runs. Several
+    NAMEs are tested one after another with the same options and compared in
+    one table. With no NAME: the only running model, or a list to tick (space
+    selects, Enter confirms); then an options menu with profiles, like `run`'s.
+    """
+    from llm_runner import speedtest as st
+
+    if delete_profile:
+        if delete_profile in st.RESERVED:
+            raise click.UsageError(f"'{delete_profile}' is built in.")
+        if not st.delete_profile(delete_profile):
+            raise click.UsageError(f"No speedtest profile '{delete_profile}'. Yours: "
+                                   + (", ".join(st.user_profiles()) or "(none)"))
+        click.echo(f"Deleted speedtest profile '{delete_profile}'.")
+        return
+    if list_profiles:
+        rows = [("last", "all", "this model's last test", ""),
+                ("default", "all", "llmctl's defaults", "")]
+        rows += [(p.name, ",".join(p.kinds), p.blurb, _st_flags(p.values))
+                 for p in st.PROFILES]
+        rows += [(n, r.get("kind", "?"), "yours", _st_flags(r["values"]))
+                 for n, r in sorted(st.user_profiles().items())]
+        w = [max(len(r[i]) for r in rows) for i in range(3)]
+        click.echo(f"{'NAME':<{w[0]}}  {'FOR':<{w[1]}}  {'USE':<{w[2]}}  SETS")
+        for row in rows:
+            click.echo(f"{row[0]:<{w[0]}}  {row[1]:<{w[1]}}  {row[2]:<{w[2]}}  {row[3]}".rstrip())
+        click.echo("\nFOR: text, embed, decide, image. A profile sets only the options "
+                   "that apply to the model; the rest keep their defaults.")
+        return
+
+    picked = not identifiers
+    if picked:
+        running = _models_running()
+        if not running:
+            raise click.UsageError("No running models.")
+        chosen_procs = running if len(running) == 1 else _pick_instances_interactively(running)
+    else:
+        chosen_procs = []
+        for ident in identifiers:
+            p = proc.find(ident)
+            if p is None or p.backend == GATEWAY:
+                raise click.UsageError(f"No running model matches '{ident}'.")
+            if all(p.name != q.name for q in chosen_procs):
+                chosen_procs.append(p)
+    targets = [st.target_of(p) for p in chosen_procs]
+
+    typed = {k: v for k, v in dict(prompt=prompt, gen=gen, concurrency=concurrency,
+                                   runs=runs, inputs=inputs, questions=questions,
+                                   size=size, steps=steps).items() if v is not None}
+    if prompt is not None:
+        try:
+            typed["prompt"] = ",".join(str(n) for n in st.parse_sizes(prompt))
+        except ValueError:
+            raise click.BadOptionUsage("--prompt-tokens",
+                                       f"--prompt-tokens takes sizes like 512,4096, not '{prompt}'")
+    if size is not None:
+        try:
+            w_, h_ = st.parse_image_size(size)
+        except ValueError:
+            raise click.BadOptionUsage("--size", f"--size takes WxH like 1024x1024, not '{size}'")
+        typed["size"] = f"{w_}x{h_}"
+
+    # One group per kind (normally just one): each gets its own options.
+    groups: dict[str, list] = {}
+    for t in targets:
+        groups.setdefault(t.kind, []).append(t)
+    plans = []
+    for kind, group in groups.items():
+        applies = {s.param for s in st.settings_for(kind)}
+        own = {k: v for k, v in typed.items() if k in applies}
+        for k in typed.keys() - applies:
+            who = group[0].name if len(group) == 1 else f"the {kind} models"
+            click.echo(f"note: --{k.replace('_', '-')} doesn't apply to {who} "
+                       f"({kind}); ignored.", err=True)
+        chosen = st.find_profile(group, profile) if profile else st.profiles_for(group)[0]
+        if (menu or (menu is None and picked)) and sys.stdin.isatty():
+            values = st.configure(group, chosen, own)
+        else:
+            values = {**st.resolve(kind, chosen), **own}
+        defaults = st.defaults_for(kind)
+        st.remember(group, {k: v for k, v in values.items() if v != defaults[k]})
+        plans.append((kind, group, values))
+
+    # Every model must answer, and none should be busy, before any test starts.
+    down = [(t, why) for t in targets if (why := st.health(t))]
+    if down and len(down) == len(targets):
+        raise click.UsageError("; ".join(f"{t.name} is {why}" for t, why in down) + ".")
+    for t, why in down:
+        click.echo(f"note: skipping {t.name}: it is {why}.", err=True)
+    skip = {t.name for t, _ in down}
+    busy = [(t, n) for t in targets if t.name not in skip and (n := st.active_requests(t))]
+    if busy and not force:
+        msg = (", ".join(f"{t.name} is working on {n} request(s)" for t, n in busy)
+               + " now: the test would compete with them, slow them down and "
+               "measure less than the model can do.")
+        if not sys.stdin.isatty():
+            raise click.UsageError(msg + " Pass --force to test anyway.")
+        click.echo(msg, err=True)
+        if not click.confirm("Test anyway?", default=False, err=True):
+            raise click.Abort()
+
+    todo = [(kind, t, values) for kind, group, values in plans for t in group
+            if t.name not in skip]
+    live = sys.stderr.isatty() and not as_json
+    results: dict[str, list] = {kind: [] for kind, _, _ in plans}
+    interrupted = False
+    for i, (kind, t, values) in enumerate(todo, 1):
+        prefix = f"[{i}/{len(todo)}] {t.name}: " if len(todo) > 1 else ""
+
+        def progress(m: str, prefix: str = prefix) -> None:
+            if live:
+                click.echo(f"\r\033[K  {prefix}{m}", nl=False, err=True)
+
+        started = time.monotonic()
+        try:
+            rows, header = st.run(t, values, echo=progress)
+        except KeyboardInterrupt:
+            interrupted = True
+            break
+        finally:
+            if live:
+                click.echo("\r\033[K", nl=False, err=True)
+        results[kind].append((t, rows, header))
+        if len(todo) > 1 and not as_json:
+            click.echo(f"  done: {t.name} ({time.monotonic() - started:.0f} s)", err=True)
+    if interrupted:
+        if not any(results.values()):
+            raise click.Abort()
+        click.echo("Interrupted; showing the models finished so far.", err=True)
+
+    def as_dict(t, values, rows, header):
+        return {"name": t.name, "backend": t.backend, "port": t.port, "kind": t.kind,
+                "drafter": t.drafter, "options": values, **header, "results": rows}
+
+    done = [(kind, t, rows, header, values) for kind, _, values in plans
+            for t, rows, header in results[kind]]
+    if as_json:
+        if len(todo) == 1 and len(done) == 1:
+            kind, t, rows, header, values = done[0]
+            click.echo(json.dumps(as_dict(t, values, rows, header), indent=2))
+        else:
+            click.echo(json.dumps({"models": [as_dict(t, v, r, h) for _, t, r, h, v in done]},
+                                  indent=2))
+    else:
+        outputs = []
+        for kind, _, values in plans:
+            got = results[kind]
+            if len(got) == 1:
+                t, rows, header = got[0]
+                outputs.append(st.render(t, values, rows, header))
+            elif got:
+                outputs.append(st.render_compare(kind, values, got))
+        click.echo("\n\n".join(outputs))
+    if not any(r.get("ok") for _, _, rows, _, _ in done for r in rows):
+        sys.exit(1)
+
+
+def _st_flags(values: dict) -> str:
+    """A speedtest profile's values as the flags they stand for."""
+    flag = {"prompt": "--prompt-tokens", "gen": "--gen", "concurrency": "--concurrency",
+            "runs": "--runs", "inputs": "--inputs", "questions": "--questions",
+            "size": "--size", "steps": "--steps"}
+    return " ".join(f"{flag.get(k, k)} {v}" for k, v in values.items()
+                    if v is not None) or "(defaults)"
+
+
+@cli.command()
 @click.argument("identifier", required=False)
 @click.option("--lines", "-n", type=int, default=80, help="Tail length.")
 @click.option("--follow", "-f", is_flag=True, default=False,
@@ -2903,6 +3115,30 @@ def _pick_instance_interactively(running: list[proc.RunningProcess]) -> proc.Run
         use_shortcuts=False,
     ).ask()
     if selected is None:
+        raise click.Abort()
+    return selected
+
+
+def _pick_instances_interactively(running: list[proc.RunningProcess]
+                                  ) -> list[proc.RunningProcess]:
+    """Tick one or more running instances: space selects, Enter confirms."""
+    try:
+        import questionary
+    except ImportError as e:
+        raise click.UsageError(
+            "questionary not installed. Pass the NAMEs (or PIDs) explicitly."
+        ) from e
+    name_w = max(len(p.name) for p in running)
+    choices = [questionary.Choice(title=f"{p.name:<{name_w}}  {p.backend:<7}  port={p.port}",
+                                  value=p)
+               for p in running]
+    selected = questionary.checkbox(
+        "Select the models to test:",
+        choices=choices,
+        instruction="(space selects, a toggles all, Enter confirms)",
+        validate=lambda picked: bool(picked) or "select at least one with space",
+    ).ask()
+    if not selected:
         raise click.Abort()
     return selected
 
