@@ -38,6 +38,9 @@ SYSTEMONE = "systemone"
 # /v1/images/*: image-generation pipelines (vLLM-Omni). Kept apart from openai
 # so a chat call without "model" still finds the one chat model.
 IMAGES = "images"
+# Triton's HTTP API (KServe v2, /v2/models/<m>/...): CV models on the onnx
+# and triton backends. The model is named in the path, not the body.
+KSERVE = "kserve"
 
 _STATUS_RANK = {"ready": 0, "loading": 1}
 
@@ -106,7 +109,8 @@ def pick(instances: list[Instance], requested: object, api: str,
     unique prefix of either, or empty when only one model serves ``api``;
     ``name@node`` keeps it to one node."""
     pool = [i for i in instances if i.api == api]
-    kind = {SYSTEMONE: "decision endpoint", IMAGES: "image model"}.get(api, "model")
+    kind = {SYSTEMONE: "decision endpoint", IMAGES: "image model",
+            KSERVE: "CV model"}.get(api, "model")
     ids = sorted({i.id for i in pool})
     groups = {g: [] for i in pool for g in i.groups if g not in ids}
     for i in pool:

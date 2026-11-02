@@ -34,7 +34,7 @@ import click
 from llm_runner import backends
 from llm_runner import config as config_mod
 from llm_runner import process as proc
-from llm_runner.backends import DECIDER, GATEWAY, HF_ENGINES, LLAMA, OMNI
+from llm_runner.backends import CV_BACKENDS, DECIDER, GATEWAY, HF_ENGINES, LLAMA, OMNI
 from llm_runner.registry import ModelSpec, default_group, looks_like_embedding_model
 
 CHOICES_FILE = proc.STATE_DIR / "launch.json"
@@ -149,7 +149,7 @@ SETTINGS: list[Setting] = [
             lambda t: t.backend == LLAMA),
     Setting("n_parallel", "Parallel slots",
             lambda t: [(None, "auto"), (1, "1"), (2, "2"), (4, "4"), (8, "8")],
-            lambda t: t.backend != OMNI),
+            lambda t: t.backend not in (OMNI, *CV_BACKENDS)),
     Setting("group_name", "Group", _group_values, lambda t: True,
             custom="Group name (letters, digits, . _ -):"),
 ]

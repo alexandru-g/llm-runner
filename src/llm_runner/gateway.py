@@ -45,7 +45,7 @@ import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from llm_runner import __version__
 from llm_runner import auth
@@ -55,9 +55,9 @@ from llm_runner import metrics as metrics_mod
 from llm_runner import process as proc
 from llm_runner import supervisor as sup_mod
 from llm_runner import tracing
-from llm_runner.backends import (DECIDE, DECIDER, GATEWAY, OMNI, SGLANG, VLLM, hf_has_vision,
-                                 is_decision_model)
-from llm_runner.cluster import (BUSY_HEADER, HEARTBEAT_EVERY, HOP_HEADER, IMAGES, OPENAI,
+from llm_runner.backends import (CV_BACKENDS, DECIDE, DECIDER, GATEWAY, OMNI, SGLANG, VLLM,
+                                 health_path, hf_has_vision, is_decision_model)
+from llm_runner.cluster import (BUSY_HEADER, HEARTBEAT_EVERY, HOP_HEADER, IMAGES, KSERVE, OPENAI,
                                 PROTOCOL, SPILL_HEADER, SYSTEMONE, TOKEN_HEADER, ClusterView,
                                 Instance, RegistryTable,
                                 Unroutable, has_images, is_context_error, order, pick,
@@ -93,6 +93,8 @@ class Model:
     def api(self) -> str:
         if self.backend == OMNI:
             return IMAGES
+        if self.backend in CV_BACKENDS:
+            return KSERVE
         return SYSTEMONE if self.backend in (DECIDE, DECIDER) else OPENAI
 
     @property
@@ -311,7 +313,8 @@ class LocalModels:
         if hit and now - hit[0] < HEALTH_TTL and not fresh:
             return hit[1]
         try:
-            with urllib.request.urlopen(config_mod.local_url(m.port, "/health"), timeout=1) as r:
+            with urllib.request.urlopen(config_mod.local_url(m.port, health_path(m.backend)),
+                                        timeout=1) as r:
                 state = "ready" if r.status == 200 else "loading"
         except urllib.error.HTTPError:
             state = "loading"        # llama-server answers 503 while it loads
@@ -354,7 +357,7 @@ class LocalModels:
         elif m.backend == DECIDER:
             info["vision"] = False
             info["decision"] = True
-        elif m.backend == OMNI:
+        elif m.backend == OMNI or m.backend in CV_BACKENDS:
             info["vision"] = False
             info["decision"] = False
         if m.api == OPENAI:
@@ -1044,6 +1047,9 @@ def make_handler(gw: Gateway):
                 return self._forward(cands, lambda c: local_path if c.local
                                      else f"/m/{c.id}{local_path}", lambda c: body)
 
+            if path.startswith("/v2/models/"):
+                return self._kserve(path, query, body, hop)
+
             if path in ("/health", "/healthz", "/"):
                 return self._json(200, {"status": "ok", "node": gw.node,
                                         "models": len(gw.local.models())})
@@ -1103,6 +1109,33 @@ def make_handler(gw: Gateway):
             if by_header and requested is not None:
                 self.headers.replace_header("X-Model", cands[0].id)
             return self._forward(cands, lambda c: self.path, body_for)
+
+        def _kserve(self, path: str, query: str, body: bytes, hop: bool) -> None:
+            """Triton's HTTP API (``/v2/models/<m>/...``) for CV models: routed by
+            the name in the path (an id, group, prefix or ``name@node``), which
+            each instance gets as its own exact name; the body (JSON, or the
+            binary tensor extension) passes through as is."""
+            self._obs["count"] = not hop
+            name, _, rest = path[len("/v2/models/"):].partition("/")
+            name = unquote(name)
+            try:
+                cands = pick(gw.instances(local_only=hop), name, KSERVE)
+            except Unroutable as e:
+                bare, pin = split_pin(name)
+                if e.code == "model_not_found" and pin is None and \
+                        (down := self._configured_down(bare)):
+                    return self._unavailable(bare, down)
+                return self._error(e.status, e.code, e.message)
+            if hop and self.headers.get(SPILL_HEADER) == "1":
+                cands = [c for c in cands if not gw.local.busy(c.id)]
+                if not cands:
+                    return self._busy()
+            tail = (f"/{rest}" if rest else "") + (f"?{query}" if query else "")
+
+            def path_for(c: Instance) -> str:
+                own = f"/v2/models/{quote(c.id, safe='')}{tail}"
+                return own if c.local else f"/m/{quote(c.id, safe='')}{own}"
+            return self._forward(cands, path_for, lambda c: body)
 
         def _busy(self) -> None:
             self._obs.update(status=503, code="busy")

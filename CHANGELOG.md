@@ -20,6 +20,34 @@ All notable changes to llm-runner (`llmctl`). The format follows
   options menu with profiles (`last`, `default`, `quick`, `long`, `load`, and
   your own). It asks before loading a model that is already serving requests
   (`--force` skips that), and `--json` prints the results as JSON.
+- **Computer-vision models (backends `onnx` and `triton`):** a folder holding
+  an ONNX graph in Triton's layout (`1/model.onnx`, optional `spec.toml`,
+  `config.pbtxt` and `model.toml`) is listed as one model with backend `onnx`.
+  `run` serves it on ONNX Runtime (llmctl's own server, CUDA or CPU, in an
+  ONNX Runtime venv), or with `--backend triton` on Triton in Docker:
+  TensorRT on a GPU, with the engine built on the host by trtexec in the
+  Triton image, strongly typed (refused if trtexec didn't build it so), and
+  cached per graph, TensorRT version, GPU, build shapes and flags (with a
+  `build.json` recording its precision), and ONNX Runtime on a host without
+  one. Both answer
+  Triton's HTTP API (KServe v2, the binary tensor extension, and
+  `/v2/models/<m>/config` with `detector_spec` and `model_version`
+  parameters), so one client works against either. Triton 26.09 is in
+  `images.json`; a Jetson takes NGC's iGPU image through `config runtime`.
+- The gateway routes `/v2/models/<name>/...` to CV models only (`llmctl.api`
+  `kserve`), by id, group, prefix or `name@node`, across the cluster.
+- **`llmctl import`:** copies a fine-tune from a local folder or file into
+  `MODELS_DIR`: a CV model (into Triton's layout), a GGUF file or a
+  checkpoint folder, recording its licence (required, or from a model card),
+  version, base model and origin. `list` shows the licence and version.
+- `llmctl download` of a repo of ONNX exports (onnx-community's) fetches one
+  graph as a CV model, with a `model.toml` naming it and, for a graph of
+  dynamic size, TensorRT build shapes at the preprocessor's size.
+
+### Changed
+
+- Health checks use each backend's own path: Triton's `/v2/health/ready`,
+  `/health` for the rest.
 
 ## [1.8.0] - 2026-11-01
 

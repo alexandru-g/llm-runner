@@ -14,7 +14,10 @@ A "model" is either
   carries ``decider_config.json`` (``backend="decider"``), or
 * any directory holding a diffusers pipeline (``model_index.json`` + a
   subfolder of weights per component, e.g. FLUX.1) — served by vLLM-Omni
-  (``backend="omni"``) for image generation.
+  (``backend="omni"``) for image generation, or
+* any directory holding a computer-vision model (an ONNX graph in Triton's
+  layout, see :mod:`llm_runner.cv`) — served by ONNX Runtime
+  (``backend="onnx"``) or Triton (``backend="triton"``).
 
 The friendly key for a GGUF is its filename stem, lowercased; for an HF dir
 it is the directory name, lowercased. If two models share a key (across
@@ -141,15 +144,30 @@ def _find_hf_dirs(base: Path) -> list[Path]:
     """Checkpoint directories under ``base`` (outermost only — a nested
     ``vision_tower/config.json`` inside a checkpoint is not its own model),
     and diffusers pipelines, whose ``transformer/``, ``vae/``, ... each look
-    like a checkpoint but are components of the one model."""
+    like a checkpoint but are components of the one model, and CV model
+    folders (the folder holding ``1/model.onnx``, not ``1/``)."""
+    from llm_runner import cv
+    # One walk for every marker; hidden folders (.cache/, an install still
+    # being verified) are skipped.
+    by_name: dict[str, list[Path]] = {}
+    for root, dirs, files in os.walk(base):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for f in files:
+            key = "*.onnx" if f.endswith(".onnx") else f
+            by_name.setdefault(key, []).append(Path(root) / f)
     found: list[Path] = []
+
+    def is_cv(d: Path) -> bool:
+        return cv.is_cv_dir(d) and not backends.is_hf_model_dir(d)
     for marker, is_model in (("model_index.json", backends.is_diffusers_dir),
+                             (cv.MODEL_TOML, is_cv), (cv.SPEC_TOML, is_cv),
+                             (cv.CONFIG_PBTXT, is_cv), ("*.onnx", is_cv),
                              ("config.json", backends.is_hf_model_dir)):
-        for f in sorted(base.rglob(marker)):
+        for f in sorted(by_name.get(marker, [])):
             d = f.parent
-            if any(part.startswith(".") for part in d.relative_to(base).parts):
-                continue  # .cache/ etc.
-            if any(d.is_relative_to(x) for x in found):
+            if marker == "*.onnx" and d.name in (cv.VERSION_DIR, "onnx") and d != base:
+                d = d.parent
+            if d == base or any(d.is_relative_to(x) for x in found):
                 continue
             if is_model(d):
                 found.append(d)
@@ -183,14 +201,16 @@ def discover_models(models_dir: Path | None = None) -> dict[str, ModelSpec]:
         for p in paths:
             key = stem if len(paths) == 1 else f"{p.parent.name.lower()}/{stem}"
             if p.is_dir():
+                backend = backends.infer_backend(p)
+                cv_model = backend == backends.ONNX
                 specs[key] = ModelSpec(
                     key=key,
                     model_path=p,
                     mmproj_path=None,
                     size=backends.hf_dir_size(p),
-                    backend=backends.infer_backend(p),
-                    hf_vision=backends.hf_has_vision(p),
-                    decision=backends.is_decision_model(p),
+                    backend=backend,
+                    hf_vision=not cv_model and backends.hf_has_vision(p),
+                    decision=not cv_model and backends.is_decision_model(p),
                 )
             else:
                 specs[key] = ModelSpec(

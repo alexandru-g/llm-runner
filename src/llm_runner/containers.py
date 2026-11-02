@@ -16,7 +16,9 @@ starts:
   folder, since vLLM hashes the model path into it;
 - the port is published on the bind host only, and the engine listens on
   ``0.0.0.0`` inside the container;
-- a per-model writable cache is mounted at ``/cache`` (see :func:`prepare_cache`).
+- a per-model writable cache is mounted at ``/cache`` (see :func:`prepare_cache`);
+- Triton's one-model repository, staged by llmctl, is mounted read-only at
+  ``/repo``, and on a host without a GPU no GPU is asked for.
 
 ``docker run`` stays attached, so the tracked PID, the log file, ``stop``
 and ``--wait`` work exactly as for host processes.
@@ -34,18 +36,25 @@ from importlib import resources
 from pathlib import Path
 
 from llm_runner import backends
-from llm_runner.backends import LLAMA, SGLANG, VLLM
+from llm_runner.backends import LLAMA, SGLANG, TRITON, VLLM
 
 HOST = "host"
 DOCKER = "docker"
 RUNTIMES = (HOST, DOCKER)
 # Backends that can run in a container.
-CONTAINER_BACKENDS = (VLLM, SGLANG, LLAMA)
+CONTAINER_BACKENDS = (VLLM, SGLANG, LLAMA, TRITON)
 CONTAINER_MODEL = "/model"
+CONTAINER_REPO = "/repo"
+# `gpus` of a launch on a host without a GPU (Triton on CPU).
+NO_GPU = "none"
+# Triton's ONNX Runtime backend segfaults on RF-DETR with the default 8 MiB
+# stack, and with 16 MiB (found by SS6M A0 in an offline CPU VM).
+TRITON_STACK = 64 * 1024 * 1024
 CONTAINER_MODELS = "/models"
 CONTAINER_CACHE = "/cache"
 # The engine binary inside each image, when images.json doesn't say.
-_DEFAULT_ENTRYPOINT = {VLLM: ["vllm"], SGLANG: ["sglang"], LLAMA: ["/app/llama-server"]}
+_DEFAULT_ENTRYPOINT = {VLLM: ["vllm"], SGLANG: ["sglang"], LLAMA: ["/app/llama-server"],
+                       TRITON: ["tritonserver"]}
 # What the cache directories inside the container are. Every tool that
 # caches compiled kernels is pointed below /cache so one export carries all.
 _CACHE_ENV = {
@@ -173,6 +182,8 @@ def parse_gpus(value: str | None) -> str:
 
 
 def gpu_args(gpus: str) -> list[str]:
+    if gpus == NO_GPU:
+        return []
     if has_cdi():
         ids = ["all"] if gpus == "all" else gpus.split(",")
         return [a for i in ids for a in ("--device", f"nvidia.com/gpu={i}")]
@@ -197,7 +208,7 @@ def gpu_arch(index: int = 0) -> str | None:
 
 
 def first_gpu(gpus: str) -> int:
-    return 0 if gpus == "all" else int(gpus.split(",")[0])
+    return 0 if gpus in ("all", NO_GPU) else int(gpus.split(",")[0])
 
 
 # ------------------------------------------------------------------ runtime --
@@ -252,9 +263,22 @@ def container_cmd(cmd: list[str], *, backend: str, image: str, model_path: str,
     inner = backends.with_bind_host(cmd, backend, "0.0.0.0")
     out = entrypoint(backend, image)[1:] + inner[1:]
     out = [_sub_path(a, str(model_dir), CONTAINER_MODEL) for a in out]
+    repo = triton_repository(cmd) if backend == TRITON else None
+    if repo:
+        out = [_sub_path(a, repo, CONTAINER_REPO) for a in out]
     if _mounts_models_dir(models_dir, model_dir):
         out = [_sub_path(a, str(models_dir), CONTAINER_MODELS) for a in out]
     return out
+
+
+def triton_repository(cmd: list[str]) -> str | None:
+    """The host folder a recorded ``tritonserver`` command serves."""
+    for i, a in enumerate(cmd):
+        if a.startswith("--model-repository="):
+            return a.split("=", 1)[1]
+        if a == "--model-repository" and i + 1 < len(cmd):
+            return cmd[i + 1]
+    return None
 
 
 def _mounts_models_dir(models_dir: Path, model_dir: Path) -> bool:
@@ -294,6 +318,10 @@ def docker_argv(*, name: str, cmd: list[str], port: int, backend: str,
     if backend in (VLLM, SGLANG):
         # Worker processes share tensors through /dev/shm.
         argv += ["--shm-size", "8g"]
+    if backend == TRITON:
+        if repo := triton_repository(cmd):
+            argv += ["-v", f"{repo}:{CONTAINER_REPO}:ro"]
+        argv += ["--shm-size", "1g", "--ulimit", f"stack={TRITON_STACK}"]
     argv += gpu_args(runtime.get("gpus") or "all")
     for k, v in env.items():
         argv += ["-e", f"{k}={v}"]

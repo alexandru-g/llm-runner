@@ -74,7 +74,7 @@ This is the standard OpenAI list, plus an `llmctl` block on each entry:
 | `llmctl.node` | Where a call goes right now: the first entry of `nodes`. |
 | `llmctl.local` | Whether the machine you asked also runs this model. |
 | `llmctl.status` | `ready`, `loading` or `down`, for the best copy. |
-| `llmctl.api` | `openai` (chat, completions, embeddings), `images` (image generation: `/v1/images/*`, e.g. FLUX.1), or `systemone` (decision endpoints, see below). |
+| `llmctl.api` | `openai` (chat, completions, embeddings), `images` (image generation: `/v1/images/*`, e.g. FLUX.1), `kserve` (CV models: Triton's HTTP API, `/v2/models/<m>/...`), or `systemone` (decision endpoints, see below). |
 | `llmctl.group` | Another name that also reaches this model (see Groups). |
 | `llmctl.context`, `vision`, `embeddings`, `decision`, `parallel` | What the best copy can do. Per-machine values are in `nodes`. |
 | `llmctl.nodes` | Every copy, best first: ready copies, then lower priority number, then the machine you asked. |
@@ -143,6 +143,7 @@ generated. Closing the connection cancels the generation on the model server.
 | `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/responses`, any other `/v1/...` with a JSON body | The body's `model`. |
 | `POST /v1/images/generations`, `/v1/images/edits` | The body's `model` (a multipart upload: the `X-Model` header), among image models only. |
 | `POST /v1/systemone` (alias `/v1/decisions`) | The body's `model`, among decision endpoints only. |
+| `ANY /v2/models/<name>/...` (`/infer`, `/config`, `/ready`, metadata) | `<name>` in the path, among CV models only (backends `onnx` and `triton`). Each copy gets its exact name in the path; the body (JSON, or KServe's binary tensor extension) passes through as is. |
 | `GET /v1/spec` | The `X-Model` header, among decision endpoints. |
 | `ANY /m/<name>/<path>` | `<name>`: an exact id, a group, or either with `@node`. `<path>` is passed through as is, for llama-server's `/completion`, `/tokenize`, `/detokenize`, `/props`, `/slots`, `/health`, or a decision endpoint's `/v1/spec`. |
 | `GET /health`, `GET /healthz` | The gateway itself: `{"status": "ok", "node": ..., "models": <local count>}`. |

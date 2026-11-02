@@ -26,7 +26,7 @@ class World:
         self.s = sup.Supervisor(tmp_path, health=self._health, restore=self._restore,
                                 clock=lambda: self.now)
 
-    def _health(self, port):
+    def _health(self, port, path="/health"):
         return any(p.port == port and p.name in self.healthy for p in self.live.values())
 
     def _restore(self, names):

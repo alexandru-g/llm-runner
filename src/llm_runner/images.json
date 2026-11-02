@@ -47,6 +47,30 @@
           "config": "sha256:a41d3809acd522d8e2b4b780126696b3ae0e800ac086da34bd9e867b0631b91c"
         }
       }
+    },
+    "triton": {
+      "image": "nvcr.io/nvidia/tritonserver@sha256:350820308a0e62efbb22f9d4e5b29c970b7c7a54f7b275674e457e5fd8bab1a5",
+      "tag": "26.09-py3",
+      "engine_version": "2.73.0",
+      "entrypoint": [
+        "tritonserver"
+      ],
+      "platforms": [
+        "linux/amd64",
+        "linux/arm64"
+      ],
+      "license": "BSD-3-Clause",
+      "comment": "dGPU and SBSA builds only. A Jetson needs NGC's iGPU image (e.g. 26.02-py3-igpu): llmctl config runtime triton docker --image nvcr.io/nvidia/tritonserver@sha256:...",
+      "by_platform": {
+        "linux/amd64": {
+          "manifest": "sha256:1f08352ff9318894ca24bb36a532ad450b1289f7a6aeb163ae752a446c400fe6",
+          "config": "sha256:7814bbb0a7aa6c545927add2c7a4bd4fc897b4271cba16eae4674548193d60e8"
+        },
+        "linux/arm64": {
+          "manifest": "sha256:6b8d409e272f4fb78dbfff0982ddefc8efe39411adb8b029756922e0f72d1447",
+          "config": "sha256:c8578b36847ab15f333e31290743e7050526255d6a654e06b6dc80460a321995"
+        }
+      }
     }
   }
 }

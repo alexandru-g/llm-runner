@@ -27,7 +27,11 @@ build-backend = "hatchling.build"
 packages = ["src/llm_runner"]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "numpy>=2.4.6",
+    "onnxruntime>=1.31.1",
+    "pytest>=8",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

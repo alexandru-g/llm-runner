@@ -7,8 +7,10 @@ CLI (`llmctl`) to download, list, start, stop, and tail models served via
 files) or [vLLM](https://docs.vllm.ai) / [SGLang](https://docs.sglang.io)
 (Hugging Face safetensors checkpoints). Works with any GGUF or HF checkpoint (Gemma, Llama, Qwen,
 Mistral, etc.) and arbitrary local files/dirs via `--ft`. Embedding models
-(e.g. bge-m3) are supported too via `--embeddings`, and image generation with
-diffusers pipelines (FLUX.1) on [vLLM-Omni](https://github.com/vllm-project/vllm-omni).
+(e.g. bge-m3) are supported too via `--embeddings`, image generation with
+diffusers pipelines (FLUX.1) on [vLLM-Omni](https://github.com/vllm-project/vllm-omni),
+and computer-vision models (ONNX graphs, e.g. RF-DETR fine-tunes) on ONNX
+Runtime or [Triton](https://github.com/triton-inference-server/server).
 
 The backend is picked from the model format: a `.gguf` runs on
 `llama-server`, a checkpoint directory (`config.json` + `*.safetensors`) runs
@@ -277,6 +279,29 @@ setting, `~/.venvs/vllm-omni/bin/vllm`, `~/venvs/vllm-omni/bin/vllm` and a uv
 tool named `vllm-omni`. It never takes the `vllm` on `PATH`, which is plain
 vLLM. Elsewhere: `llmctl config omni-bin /path/to/venv/bin/vllm`.
 
+### 6. ONNX Runtime and Triton (optional, for computer-vision models)
+
+The `onnx` backend runs llmctl's own small server (`onnx_server.py`) with the
+Python of an ONNX Runtime venv:
+
+```bash
+uv venv --python 3.12 ~/.venvs/onnxruntime
+uv pip install -p ~/.venvs/onnxruntime onnxruntime-gpu numpy   # `onnxruntime` for CPU only
+```
+
+llmctl finds it at `~/.venvs/onnxruntime/bin/python` (or `llmctl config
+onnx-bin /path/to/venv/bin/python`, `$LLM_RUNNER_ONNX_BIN`). On a Jetson,
+PyPI's `onnxruntime` is CPU only; the CUDA build is the onnxruntime-gpu wheel
+made for its JetPack.
+
+The `triton` backend runs NVIDIA's Triton server in Docker, from the image in
+`images.json` (Triton 26.09, `docker pull nvcr.io/nvidia/tritonserver@sha256:3508…`).
+A Jetson needs NGC's iGPU build instead (e.g. `26.02-py3-igpu`):
+
+```bash
+llmctl config runtime triton docker --image nvcr.io/nvidia/tritonserver@sha256:…
+```
+
 ## Models
 
 Models are discovered dynamically under `MODELS_DIR`:
@@ -285,7 +310,11 @@ Models are discovered dynamically under `MODELS_DIR`:
   `*mmproj*.gguf` in the same folder is auto-attached as the vision projector;
 - any directory holding a Hugging Face checkpoint (`config.json` plus
   `*.safetensors`/`*.bin` weights) is a **vllm** model, keyed by the directory
-  name. `--backend sglang` serves the same directory on SGLang.
+  name. `--backend sglang` serves the same directory on SGLang;
+- any directory holding a computer-vision model (an ONNX graph, in Triton's
+  layout `1/model.onnx` or alone in the folder) is an **onnx** model, keyed by
+  the directory name. `--backend triton` serves it on Triton (see
+  [Computer-vision models](#computer-vision-models-onnx-on-onnx-runtime-or-triton)).
 
 `llmctl list` shows which backend each key resolves to.
 
@@ -320,6 +349,42 @@ Other flags:
 - `--no-mmproj` — don't download the vision projector
 - `--no-draft` — don't download the speculative/MTP drafter
 - `--subdir <name>` — override the target subdir (default: repo name, lowercased, `-GGUF` stripped)
+
+A repo of ONNX exports (no GGUFs, no safetensors), such as
+`onnx-community/rfdetr_small-ONNX`, becomes a CV model: pick one graph (or
+`--file onnx/model_fp16.onnx`); llmctl fetches it with its external data and
+the repo's JSON files and README, and writes a `model.toml` naming the graph,
+the repo, revision and licence. When the graph's height and width are
+dynamic, the preprocessor's size goes into the TensorRT build shapes.
+
+### Import a fine-tune with `llmctl import`
+
+A model you trained yourself isn't on a hub. `import` copies it from a local
+folder or file into `MODELS_DIR` and records where it came from:
+
+```bash
+llmctl import ~/train/ext1/build/frames --name ext1 --version 1.0.0 \
+    --license Apache-2.0 --base-model rfdetr-medium     # a CV model (ONNX + spec.toml)
+llmctl import ~/out/my-tune-Q4_K_M.gguf --name my-tune --license apache-2.0
+llmctl import ~/out/qwen3-8b-sft --license apache-2.0  # an HF checkpoint folder
+```
+
+- **Licence:** required (`--license`, an SPDX id or `other`) unless a model
+  card in the folder states one in its YAML front matter (`license:`, along
+  with `base_model:` and `model_version:`, which fill in `--base-model` and
+  `--version`). `llmctl list` shows it with the version.
+- **CV models** land in Triton's layout: the graph becomes `1/model.onnx`
+  (external-data files keep their names beside it); `spec.toml`,
+  `config.pbtxt` and the card are copied as they are. A `model.toml` records
+  task, version, licence, base model, source and the graph's sha256. With
+  several graphs in the folder, `--onnx FILE` says which.
+- **GGUF** files are renamed to `<name>.gguf`, so the key is the name;
+  `mmproj` files beside them come along. Checkpoint and diffusers folders are
+  copied whole (hidden files left out).
+- **Versions:** an existing name is refused; import each version under its
+  own `--name` (e.g. `ext1-1.1.0`), or `--replace` one that isn't running.
+- `--json` prints `{name, folder, format, license, version, base_model,
+  files, bytes}`. `llmctl update` leaves imported models alone.
 
 ### Update a downloaded model
 
@@ -676,6 +741,77 @@ helps on a card with room for the bf16 build.
 Through the gateway, `/v1/images/*` goes only to image models and chat,
 completions and embeddings never do, so a chat call without `"model"` still
 finds the one chat model when FLUX runs beside it.
+
+### Computer-vision models (ONNX on ONNX Runtime or Triton)
+
+A CV model is a folder in Triton's model layout, so the same files serve
+both backends and a Triton deployment elsewhere:
+
+```
+ext1/
+  1/model.onnx     the graph (1/model.plan: a prebuilt TensorRT engine)
+  spec.toml        optional detector spec (M0's ModelSpec), read as is
+  config.pbtxt     optional Triton config; generated when missing
+  model.toml       optional llmctl fields: task, version, license, source,
+                   which graph (`onnx = "onnx/model_fp16.onnx"`), [tensorrt] shapes
+```
+
+`llmctl import` and `llmctl download` write it; a folder holding a single
+`.onnx` works too. Both backends answer Triton's HTTP API (KServe v2), so one
+client works against either:
+
+```bash
+llmctl run ext1                            # onnx: ONNX Runtime, CUDA if present, else CPU
+llmctl run ext1 --backend triton --wait    # Triton in Docker: TensorRT on a GPU
+curl -s localhost:9000/v2/models/ext1                 # inputs and outputs
+curl -s localhost:9000/v2/models/ext1/config          # Triton's model config
+curl -s localhost:9000/v2/models/ext1/infer -d '{"inputs": [{"name": "frames",
+  "datatype": "UINT8", "shape": [1, 480, 640, 3], "data": [...]}]}'
+```
+
+Clients that send tensors with the binary extension
+(`Inference-Header-Content-Length`, raw bytes after the JSON header) work
+unchanged; so does Triton's `GET /v2/models/<m>/config`, which carries two
+parameters M0's detector client reads: `detector_spec` (spec.toml as compact
+JSON) and `model_version` (model.toml's `version`).
+
+**onnx.** llmctl's `onnx_server.py` under the ONNX Runtime venv's Python:
+one session, requests in parallel, no batching across requests. `-X
+'--device cpu'` keeps it off the GPU; `-X '--threads 8'` sets CPU threads.
+
+**triton.** Always in a container (`--image` or `llmctl config runtime
+triton docker --image …`). llmctl stages a one-model repository under its
+state dir and serves it over HTTP only (no gRPC, no Triton metrics port):
+
+- **On a GPU**, TensorRT. The engine is built on the host, the first time,
+  with `trtexec` inside the same Triton image (no network; strongly typed, so
+  the graph's own types, e.g. FP16 from ModelOpt), and cached under
+  `<state>/engines/<onnx sha256>/trt<version>-sm<cc>-<shapes hash>/` with a
+  `build.json` (the ONNX and plan hashes, image, TensorRT version, GPU,
+  shapes, max batch) and the trtexec log. A changed graph, image, GPU or
+  build shape or flag builds a new one. Build shapes: model.toml's `[tensorrt]` `min`,
+  `opt` and `max`; else from spec.toml's layout (`frames`: 1x64x64x3 up to
+  16x1080x1920x4, opt 16x720x1280x4; `nchw`: its height and width); else the
+  graph's own shape when only the batch is dynamic. Engines are built with
+  `--stronglyTyped`, as M0's build-engine.sh does, so precision comes from the
+  graph; a build whose log doesn't say `Precision: Strongly Typed` is refused,
+  and `build.json` records the precision. TensorRT 11 builds that way anyway;
+  TensorRT 10 (Jetson images) would otherwise build an FP16 graph as FP32: on
+  orin's Triton 26.02, RF-DETR medium (frames) took 59 ms per batch of two
+  720p frames as FP32 (a 125 MB plan) and 27 ms strongly typed (69 MB).
+  model.toml's `[tensorrt]` takes extra `flags`, and `strongly_typed = false`
+  to leave the flag out.
+- **Without a GPU**, the ONNX graph on Triton's ONNX Runtime backend (CPU),
+  with a 64 MiB stack (its default segfaults on RF-DETR).
+- **The config:** a shipped `config.pbtxt` is kept (renamed to the served
+  name, given the two parameters when it lacks them, moved to ONNX Runtime
+  and `KIND_CPU` without a GPU). Otherwise llmctl writes one in M0's shape:
+  `max_batch_size` 16 (model.toml `max_batch`), dynamic batching with
+  preferred sizes 4, 8 and 16 and a 2 ms queue delay, one instance.
+
+Names must suit Triton's API (letters, digits, `.`, `_`, `-`). Through the
+gateway, `/v2/models/<name>/...` goes to CV models only and `<name>` may be an
+id, a group, a unique prefix or `name@node`; the body passes through untouched.
 
 ### Fitting large models into limited VRAM
 

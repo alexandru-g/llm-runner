@@ -1,6 +1,6 @@
 """Serving backends: how to find each server binary and build its argv.
 
-Five backends are supported:
+Seven backends are supported:
 
 ``llama``
     llama.cpp's ``llama-server`` serving a single GGUF. The argv builder for
@@ -38,6 +38,17 @@ Five backends are supported:
     its own (``~/.venvs/vllm-omni``) rather than sharing the ``vllm`` tool;
     ``vllm`` on PATH is never taken for it. Pin another location with
     ``llmctl config omni-bin`` or ``$LLM_RUNNER_OMNI_BIN``.
+
+``onnx``
+    ONNX Runtime on a computer-vision model folder (:mod:`llm_runner.cv`),
+    behind Triton's HTTP API (KServe v2), CUDA or CPU. The server is
+    llmctl's own ``onnx_server.py``, run by the Python of an ONNX Runtime
+    venv (``~/.venvs/onnxruntime``, or ``llmctl config onnx-bin``).
+
+``triton``
+    NVIDIA Triton Inference Server on the same folders, always in a
+    container: TensorRT on a GPU (the engine built on the host and cached),
+    ONNX Runtime on a host without one.
 """
 from __future__ import annotations
 
@@ -58,18 +69,24 @@ VLLM = "vllm"
 SGLANG = "sglang"
 DECIDER = "decider"
 OMNI = "omni"
+ONNX = "onnx"
+TRITON = "triton"
 # Not a model server: the systemone-proxy started by `llmctl decide` in front
 # of a running llama-server.
 DECIDE = "decide"
 # Not a model server either: the `llmctl gateway` router that puts every
 # running model behind one port. Started with the first model.
 GATEWAY = "gateway"
-BACKENDS = (LLAMA, VLLM, SGLANG, DECIDER, OMNI)
+BACKENDS = (LLAMA, VLLM, SGLANG, DECIDER, OMNI, ONNX, TRITON)
 # Engines that serve a Hugging Face checkpoint dir behind an OpenAI /v1 API.
 # They take the same llmctl options and are interchangeable for a model.
 HF_ENGINES = (VLLM, SGLANG)
 # Python-packaged engines found by find_engine (and `llmctl config <x>-bin`).
 PY_ENGINES = (*HF_ENGINES, OMNI)
+# Computer-vision backends: Triton's HTTP API on a CV model folder (cv.py).
+CV_BACKENDS = (ONNX, TRITON)
+# Engines whose binary `llmctl config <x>-bin` pins.
+BIN_ENGINES = (*PY_ENGINES, ONNX)
 
 
 # Set for every process llmctl starts. vLLM sends usage stats home unless told
@@ -106,6 +123,8 @@ def with_bind_host(cmd: list[str], backend: str, host: str) -> list[str]:
     cmd = list(cmd)
     if "--host" in cmd[:-1]:
         cmd[cmd.index("--host") + 1] = host
+    elif "--http-address" in cmd[:-1]:          # tritonserver
+        cmd[cmd.index("--http-address") + 1] = host
     elif backend in (DECIDE, GATEWAY):
         # Recorded before llmctl passed --host; both default to 0.0.0.0.
         cmd += ["--host", host]
@@ -126,10 +145,11 @@ def find_llama_server() -> str | None:
 
 # $LLM_RUNNER_<X>_BIN overrides discovery of each Python-packaged engine.
 _BIN_ENV = {VLLM: "LLM_RUNNER_VLLM_BIN", SGLANG: "LLM_RUNNER_SGLANG_BIN",
-            OMNI: "LLM_RUNNER_OMNI_BIN"}
+            OMNI: "LLM_RUNNER_OMNI_BIN", ONNX: "LLM_RUNNER_ONNX_BIN"}
 # (venv / uv tool name, executable) where they differ from the backend name.
-# vLLM-Omni's CLI is `vllm` from a venv that also holds vllm-omni.
-_ENGINE_DIST = {OMNI: ("vllm-omni", "vllm")}
+# vLLM-Omni's CLI is `vllm` from a venv that also holds vllm-omni; the onnx
+# backend runs llmctl's server with the Python of an onnxruntime venv.
+_ENGINE_DIST = {OMNI: ("vllm-omni", "vllm"), ONNX: ("onnxruntime", "python")}
 
 
 def bin_env_var(backend: str) -> str:
@@ -153,7 +173,8 @@ def find_engine(backend: str) -> str | None:
     ``~/venvs/<x>`` or ``~/<x>/.venv``. Returns an absolute path (or None)
     so the recorded launch argv keeps working from a systemd unit whose PATH
     lacks ``~/.local/bin``. For omni, ``<x>`` is ``vllm-omni`` and PATH is
-    skipped: the ``vllm`` there is plain vLLM.
+    skipped: the ``vllm`` there is plain vLLM. For onnx it is the ``python``
+    of a venv named ``onnxruntime``.
     """
     env = os.environ.get(_BIN_ENV[backend])
     if env:
@@ -225,7 +246,16 @@ def find_systemone_proxy() -> str | None:
     return None
 
 
+def onnx_server_script() -> str:
+    """llmctl's KServe v2 server for the onnx backend, run by the
+    onnxruntime venv's Python (it imports nothing from llmctl)."""
+    return str(Path(__file__).resolve().with_name("onnx_server.py"))
+
+
 def find(backend: str) -> str | None:
+    if backend == TRITON:
+        # Triton runs in a container only; what it needs is docker.
+        return shutil.which("docker")
     if backend == LLAMA:
         return find_llama_server()
     if backend == DECIDER:
@@ -251,6 +281,15 @@ def missing_hint(backend: str) -> str:
                 "create its venv (`uv venv --python 3.12 .venv312 && uv pip install "
                 "-p .venv312/bin/python -e \".[serve]\"`) and point llmctl at it with "
                 "`llmctl config decider-dir /path/to/decider` (or $LLM_RUNNER_DECIDER_DIR).")
+    if backend == ONNX:
+        return ("ONNX Runtime not found. It gets a venv of its own: `uv venv --python 3.12 "
+                "~/.venvs/onnxruntime && uv pip install -p ~/.venvs/onnxruntime "
+                "onnxruntime-gpu numpy` (plain `onnxruntime` for CPU only; on a Jetson, the "
+                "onnxruntime-gpu wheel for its JetPack), or point at another venv's python "
+                "with `llmctl config onnx-bin /path/to/venv/bin/python` (or "
+                "$LLM_RUNNER_ONNX_BIN).")
+    if backend == TRITON:
+        return ("The triton backend runs in Docker; install the docker CLI.")
     if backend == OMNI:
         return ("vLLM-Omni not found. It needs a venv of its own with the matching vLLM "
                 "release: `uv venv --python 3.12 ~/.venvs/vllm-omni && uv pip install "
@@ -581,14 +620,27 @@ def is_decider_model_dir(path: Path) -> bool:
 
 
 def infer_backend(path: Path) -> str:
-    """``omni`` for a diffusers pipeline dir, ``decider`` for a decider
-    checkpoint dir, ``vllm`` for any other HF checkpoint dir, ``llama`` for
-    anything else (GGUF)."""
+    """``omni`` for a diffusers pipeline dir, ``onnx`` for a CV model folder
+    (or an ``.onnx`` file), ``decider`` for a decider checkpoint dir,
+    ``vllm`` for any other HF checkpoint dir, ``llama`` for anything else
+    (GGUF)."""
+    from llm_runner import cv
+    if path.suffix == ".onnx":
+        return ONNX
     if path.is_dir():
         if is_diffusers_dir(path):
             return OMNI
+        if cv.is_cv_dir(path) and not is_hf_model_dir(path):
+            return ONNX
         return DECIDER if is_decider_model_dir(path) else VLLM
     return LLAMA
+
+
+def health_path(backend: str) -> str:
+    """The path that answers 200 once ``backend``'s server is ready: Triton
+    has only KServe's; every other server (llmctl's onnx server too) has
+    ``/health``."""
+    return "/v2/health/ready" if backend == TRITON else "/health"
 
 
 # -------------------------------------------------------------- vllm argv --

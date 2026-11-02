@@ -29,7 +29,9 @@ from llm_runner import images
 from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner import registry
-from llm_runner.backends import DECIDER, GATEWAY, HF_ENGINES, LLAMA, OMNI, PY_ENGINES, SGLANG, VLLM
+from llm_runner import cv
+from llm_runner.backends import (BIN_ENGINES, CV_BACKENDS, DECIDER, GATEWAY, HF_ENGINES, LLAMA,
+                                 OMNI, ONNX, PY_ENGINES, SGLANG, TRITON, VLLM)
 from llm_runner.registry import MODELS_DIR, ModelSpec, discover_models
 
 
@@ -218,6 +220,10 @@ def _resolve_runtime(backend: str, kind: str | None, image: str | None,
     configured = containers.runtime_from_config(backend, config_mod.load())
     if image and kind == containers.HOST:
         raise click.UsageError("--image needs --runtime docker.")
+    if backend == TRITON:
+        if kind == containers.HOST:
+            raise click.UsageError("triton runs in a container only (no --runtime host).")
+        kind = containers.DOCKER
     kind = kind or (containers.DOCKER if image else configured["kind"])
     runtime: dict = {"kind": kind, "gpus": gpus}
     if kind != containers.DOCKER:
@@ -233,6 +239,12 @@ def _resolve_runtime(backend: str, kind: str | None, image: str | None,
     if not ref:
         raise click.UsageError(f"No image for {backend}: pass --image repo@sha256:… or "
                                f"`llmctl config runtime {backend} docker --image …`.")
+    if backend == TRITON and ref == containers.default_image(TRITON) and \
+            Path("/etc/nv_tegra_release").exists():
+        raise click.UsageError(
+            "This is a Jetson: Triton needs NGC's iGPU image here, not the default "
+            "dGPU one. `llmctl config runtime triton docker --image "
+            "nvcr.io/nvidia/tritonserver@sha256:…` (the -igpu tag), or pass --image.")
     if not containers.is_pinned(ref) and not allow_tag:
         raise click.UsageError(f"{ref} is not pinned by digest. Use repo@sha256:…, or "
                                "--allow-tag for development.")
@@ -292,9 +304,9 @@ def _warn_foreign_flags(ctx: click.Context, backend: str) -> None:
         # decider takes only --port / --n-parallel / -X / -E; everything
         # engine-specific is meaningless there.
         groups = {LLAMA: _LLAMA_ONLY_PARAMS, hf: _HF_ENGINE_PARAMS}
-    elif backend == OMNI:
-        # An image pipeline takes --port / --name / -X / -E and the runtime
-        # flags; sampling knobs (steps, guidance, seed) travel per request.
+    elif backend == OMNI or backend in CV_BACKENDS:
+        # An image pipeline or a CV model takes --port / --name / -X / -E and
+        # the runtime flags; everything else travels per request.
         groups = {LLAMA: _LLAMA_ONLY_PARAMS, hf: _HF_ENGINE_PARAMS,
                   "text-model": _TEXT_MODEL_PARAMS}
     else:
@@ -305,6 +317,90 @@ def _warn_foreign_flags(ctx: click.Context, backend: str) -> None:
         if used:
             click.echo(f"warning: {other}-only option(s) ignored for {backend}: "
                        f"{', '.join(used)}", err=True)
+
+
+def _cv_cmd(backend: str, binary: str, model_path: Path, *, name: str, port: int,
+            runtime: dict, extra: list[str]) -> list[str]:
+    """The command serving a CV model (see :mod:`llm_runner.cv`).
+
+    onnx: llmctl's KServe v2 server under the onnxruntime venv's Python,
+    with the Triton-style config it answers /config with. triton: a
+    one-model repository staged under the state dir (the config, and the
+    ONNX graph or a TensorRT engine built for this GPU and cached), served
+    by tritonserver over HTTP only."""
+    try:
+        m = cv.load(model_path)
+    except cv.CVError as e:
+        raise click.UsageError(str(e)) from None
+    gpus = runtime.get("gpus") or "all"
+    host_gpu = cv.gpu(containers.first_gpu(gpus)) if gpus != containers.NO_GPU else None
+    stage = proc.STATE_DIR / "cv" / name
+    try:
+        if backend == ONNX:
+            if m.onnx is None:
+                raise click.UsageError(f"{model_path} has a TensorRT engine but no ONNX "
+                                       "graph; serve it with --backend triton.")
+            stage.mkdir(parents=True, exist_ok=True)
+            cfg = stage / "config.json"
+            cfg.write_text(json.dumps(cv.server_config(m, name, gpu=host_gpu is not None),
+                                      indent=2) + "\n")
+            return [binary, "-I", backends.onnx_server_script(), "--model", str(m.onnx),
+                    "--name", name, "--host", config_mod.get_bind_host(), "--port",
+                    str(port), "--config", str(cfg), *extra]
+        if host_gpu is None:
+            runtime["gpus"] = containers.NO_GPU
+        shipped_ort = bool(m.config and re.search(r'^\s*backend:\s*"onnxruntime"', m.config,
+                                                  re.M))
+        engine = "tensorrt" if host_gpu and not shipped_ort else "onnxruntime"
+        if engine == "onnxruntime":
+            if m.onnx is None:
+                raise click.UsageError(f"{model_path} has only a TensorRT engine, and this "
+                                       "host has no GPU to run it.")
+            if m.config and "tensorrt_plan" in m.config:
+                click.echo("No GPU here: serving the ONNX graph on Triton's ONNX Runtime "
+                           "backend (CPU) instead of TensorRT.")
+            model_file = m.onnx
+        elif m.onnx is None:
+            click.echo("warning: no ONNX graph, so the shipped 1/model.plan is served as is; "
+                       "it only loads on the GPU and TensorRT version it was built for.",
+                       err=True)
+            model_file = m.plan
+        else:
+            model_file = _triton_engine(m, runtime, host_gpu)
+        text = cv.triton_config(m, name, engine=engine, gpu=host_gpu is not None)
+        repo = cv.stage_repository(stage / "repo", name, text, model_file)
+    except cv.CVError as e:
+        raise click.UsageError(str(e)) from None
+    click.echo(f"Triton: {engine} on {host_gpu.name if host_gpu else 'CPU'}; repository "
+               f"{repo / name}")
+    return ["tritonserver", f"--model-repository={repo}", "--http-address",
+            config_mod.get_bind_host(), "--http-port", str(port), "--allow-grpc=false",
+            "--allow-metrics=false", "--model-control-mode=none", *extra]
+
+
+def _triton_engine(m: cv.CVModel, runtime: dict, host_gpu: cv.GPU) -> Path:
+    """This host's TensorRT engine for ``m``: from the engine cache (keyed by
+    the ONNX file, TensorRT version, GPU and build shapes), else built now
+    with trtexec in the Triton image."""
+    assert m.onnx is not None
+    found = images.local_image(runtime["image"], proc.STATE_DIR)
+    run_image = found[0] if found else runtime["image"]
+    trt = cv.image_tensorrt_version(run_image) or \
+        "img-" + (runtime.get("digest") or "").removeprefix("sha256:")[:12]
+    inputs, _ = m.io()
+    max_batch = m.max_batch(inputs)
+    flags = cv.trtexec_flags(m)
+    build = cv.EngineBuild(onnx_sha256=cv.sha256(m.onnx), tensorrt=trt, gpu=host_gpu,
+                           input=m.input_name(inputs),
+                           shapes=cv.build_shapes(m, inputs, max_batch),
+                           max_batch=max_batch, flags=flags)
+    out = cv.engine_dir(proc.STATE_DIR / "engines", build)
+    if (out / "model.plan").is_file():
+        click.echo(f"Engine: cached {out / 'model.plan'}")
+        return out / "model.plan"
+    return cv.build_engine(m, build, out, image=run_image,
+                           gpu_args=containers.gpu_args(runtime.get("gpus") or "all"),
+                           served_image=runtime["image"], log=click.echo)
 
 
 def _log_tail(path: str, lines: int = 25) -> str:
@@ -321,8 +417,9 @@ def _log_tail(path: str, lines: int = 25) -> str:
 
 def _wait_healthy(rec: proc.RunningProcess, timeout: float) -> bool:
     """Poll ``/health`` until the server answers 200, the process dies, or
-    ``timeout`` elapses. llama-server, vllm and sglang all expose it."""
-    url = config_mod.local_url(rec.port, "/health")
+    ``timeout`` elapses. llama-server, vllm and sglang all expose it; Triton
+    answers KServe's ``/v2/health/ready`` instead."""
+    url = config_mod.local_url(rec.port, backends.health_path(rec.backend))
     deadline = time.time() + timeout
     spinner = "|/-\\"
     i = 0
@@ -403,7 +500,7 @@ def config_show() -> None:
     for backend in backends.BACKENDS:
         found = backends.find(backend)
         click.echo(f"  {backend:<6} {found or '(not found)'}")
-    for engine in PY_ENGINES:
+    for engine in BIN_ENGINES:
         var = backends.bin_env_var(engine)
         if os.environ.get(var):
             click.echo(f"  ({engine} overridden by ${var})")
@@ -645,6 +742,13 @@ def _engine_bin_command(engine: str) -> None:
             "plain vLLM and never used for it). Example:\n\n"
             "\b\n  llmctl config omni-bin ~/envs/vllm-omni/bin/vllm")
         return
+    if engine == ONNX:
+        command.help = (
+            "Persist the Python of the venv holding onnxruntime (the onnx backend runs "
+            "llmctl's server with it), or print it when PATH is omitted.\n\nOnly needed "
+            "when the venv isn't ~/.venvs/onnxruntime. Example:\n\n"
+            "\b\n  llmctl config onnx-bin ~/envs/ort/bin/python")
+        return
     command.help = (
         f"Persist the path to the `{engine}` CLI, or print it when PATH is omitted.\n\n"
         f"Only needed when {engine} lives somewhere llmctl doesn't look: PATH, the "
@@ -652,7 +756,7 @@ def _engine_bin_command(engine: str) -> None:
         f"\b\n  llmctl config {engine}-bin ~/envs/{engine}/bin/{engine}")
 
 
-for _engine in PY_ENGINES:
+for _engine in BIN_ENGINES:
     _engine_bin_command(_engine)
 
 
@@ -932,11 +1036,23 @@ def list_cmd() -> None:
         draft = "yes" if spec.has_draft else ""
         decision = "yes" if spec.decision else ""
         src = sources[key]
-        rev = (src.get("revision") or "")[:12]
-        lic = (src.get("license") or "")[:12]
+        meta = _cv_meta(spec) if not (src.get("license") and src.get("revision")) else {}
+        rev = str(src.get("revision") or meta.get("revision") or meta.get("version") or "")[:12]
+        lic = str(src.get("license") or meta.get("license") or "")[:12]
         rel = spec.model_path.relative_to(MODELS_DIR) if spec.model_path.is_relative_to(MODELS_DIR) else spec.model_path
         click.echo(f"{key:<{key_w}}  {spec.backend:<7}  {size:>8}  {vision:<6}  {draft:<6}  "
                    f"{decision:<8}  {rev:<12}  {lic:<12}  {rel}")
+
+
+def _cv_meta(spec: ModelSpec) -> dict:
+    """A CV model folder's model.toml (licence, revision, version), for what
+    its recorded source lacks (a folder made by hand, or downloaded)."""
+    if spec.backend != ONNX:
+        return {}
+    try:
+        return cv.load(spec.model_path).meta
+    except cv.CVError:
+        return {}
 
 
 def _profile_flags(values: dict) -> str:
@@ -1000,12 +1116,15 @@ def profile_rm(name: str) -> None:
 
 @cli.command()
 @click.argument("model", required=False)
-@click.option("--backend", type=click.Choice(["auto", LLAMA, VLLM, SGLANG, DECIDER, OMNI]),
+@click.option("--backend", type=click.Choice(["auto", LLAMA, VLLM, SGLANG, DECIDER, OMNI,
+                                              ONNX, TRITON]),
               default="auto", show_default=True,
               help="Serving engine. auto = llama-server for a GGUF, vllm for a "
                    "Hugging Face checkpoint directory, omni (vLLM-Omni) for a "
-                   "diffusers pipeline. sglang serves the same checkpoints as vllm "
-                   "and is only used when asked for.")
+                   "diffusers pipeline, onnx (ONNX Runtime) for a CV model. sglang "
+                   "serves the same checkpoints as vllm, and triton (in Docker; "
+                   "TensorRT on a GPU) the same CV models as onnx; both only when "
+                   "asked for.")
 @click.option("--port", "-p", type=int, default=None,
               help="Listen port. Auto-selected starting at 8080 if omitted or taken.")
 @click.option("--ctx-size", "-c", type=int, default=None,
@@ -1186,8 +1305,9 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     GGUF models run on llama-server; Hugging Face checkpoint directories run
     on vllm (or sglang with --backend sglang), or on decider.serve when they
     carry a decider_config.json; diffusers pipelines (e.g. FLUX.1) run on
-    vLLM-Omni and answer /v1/images/generations. Use --ft <path> to bypass the
-    registry.
+    vLLM-Omni and answer /v1/images/generations; CV models (ONNX) run on ONNX
+    Runtime, or on Triton with --backend triton, and answer Triton's HTTP API
+    (/v2/models/NAME/infer). Use --ft <path> to bypass the registry.
     """
     spec: ModelSpec | None = None
     if ft_path:
@@ -1235,6 +1355,13 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     # tokenizer via -X) but an HF directory can never run on llama-server.
     if backend == "auto":
         backend = detected
+    elif backend not in CV_BACKENDS and detected == ONNX:
+        raise click.UsageError(
+            f"'{model_path.name}' is a CV model; --backend onnx or triton serves it.")
+    elif backend in CV_BACKENDS and detected != ONNX:
+        raise click.UsageError(
+            f"'{model_path.name}' is not a CV model (an ONNX graph); the {backend} backend "
+            "serves those.")
     elif backend != OMNI and detected == OMNI:
         raise click.UsageError(
             f"'{model_path.name}' is a diffusers pipeline; only --backend omni serves it.")
@@ -1249,6 +1376,12 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         raise click.UsageError(
             f"'{model_path.name}' is not a diffusers pipeline (no model_index.json); "
             "the omni backend serves image-generation pipelines.")
+    if backend in CV_BACKENDS:
+        if ft_path and not ft_name:
+            name = model_path.stem if model_path.is_file() else model_path.name
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+            raise click.UsageError(f"'{name}' can't name a CV model (Triton's API takes "
+                                   "letters, digits, '.', '_' and '-'); pass --name.")
     runtime = _resolve_runtime(backend, runtime_kind, image, allow_tag, gpu, dns)
     # A container brings its own engine; the host needn't have one.
     binary = backend if runtime["kind"] == containers.DOCKER else _require_backend(backend)
@@ -1264,7 +1397,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                                "--kv-quant q8_0 (→ fp8) or f16.")
     # decider.serve speaks the decision protocol itself; on the other engines a
     # decision model only serves raw completions.
-    decision = backend not in (DECIDER, OMNI) and (
+    decision = backend not in (DECIDER, OMNI, *CV_BACKENDS) and (
         spec.decision if spec else backends.is_decision_model(model_path))
     if decision:
         click.echo(f"note: '{model_path.name}' is a decision model — its answers are "
@@ -1273,7 +1406,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
 
     # Default embeddings mode by filename when the user didn't force it.
     stem = model_path.stem if model_path.is_file() else model_path.name
-    if backend == OMNI:
+    if backend == OMNI or backend in CV_BACKENDS:
         embeddings = False
     elif embeddings is None:
         embeddings = registry.looks_like_embedding_model(stem, model_path)
@@ -1299,7 +1432,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         if draft_spec:
             click.echo("Ignoring --draft: speculative decoding doesn't apply to "
                        "embedding servers.", err=True)
-    elif not no_draft and backend != OMNI:
+    elif not no_draft and backend != OMNI and backend not in CV_BACKENDS:
         draft_path = _resolve_draft(draft_spec, spec, backend)
 
     extra_args = [tok for chunk in extra for tok in shlex.split(chunk)]
@@ -1326,6 +1459,9 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         cmd = backends.build_omni_cmd(binary, model_path, name=name, port=chosen_port,
                                       offload=offload, host=config_mod.get_bind_host(),
                                       extra=extra_args)
+    elif backend in CV_BACKENDS:
+        cmd = _cv_cmd(backend, binary, model_path, name=name, port=chosen_port,
+                      runtime=runtime, extra=extra_args)
     elif backend in HF_ENGINES:
         if gpu_mem is None:
             picked = backends.default_gpu_mem(backend)
@@ -1446,7 +1582,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     if wait:
         # vllm/sglang load weights, profile memory and capture CUDA graphs
         # before they listen; llama-server is usually up in seconds.
-        timeout = 600 if backend in (*PY_ENGINES, DECIDER) else 120
+        timeout = 600 if backend in (*PY_ENGINES, DECIDER, TRITON) else 120
         t0 = time.time()
         if _wait_healthy(rec, timeout=timeout):
             proc.record_event(rec.name, "ready", f"pid {rec.pid} port {rec.port} after "
@@ -1470,6 +1606,9 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                    "--wait to block on /health. Generate with POST /v1/images/generations "
                    f"(model \"{name}\"; num_inference_steps, guidance_scale and seed per "
                    "request).")
+    if backend in CV_BACKENDS:
+        click.echo(f"Infer: POST /v2/models/{name}/infer (Triton's HTTP API; through the "
+                   f"gateway too). Config: GET /v2/models/{name}/config.")
 
 
 @cli.command("ps")
@@ -1944,6 +2083,9 @@ def speedtest(identifiers: tuple[str, ...], profile: str | None, menu: bool | No
                 raise click.UsageError(f"No running model matches '{ident}'.")
             if all(p.name != q.name for q in chosen_procs):
                 chosen_procs.append(p)
+    cv_models = [p.name for p in chosen_procs if p.backend in CV_BACKENDS]
+    if cv_models:
+        raise click.UsageError(f"speedtest has no CV models yet: {', '.join(cv_models)}.")
     targets = [st.target_of(p) for p in chosen_procs]
 
     typed = {k: v for k, v in dict(prompt=prompt, gen=gen, concurrency=concurrency,
@@ -3293,6 +3435,90 @@ def _snapshot_hf(repo_id: str, info, target_dir: Path, *, revalidate: bool) -> N
                    err=True)
 
 
+def _download_onnx(repo_id: str, info, target: Path, filename: str | None, *,
+                   revalidate: bool) -> None:
+    """A repo of ONNX exports (onnx-community's, ...) as a CV model: one
+    graph (picked like a GGUF quant, or --file), its external data, and the
+    repo's top-level JSON and docs. A model.toml names the graph and records
+    the repo, revision and licence; when the graph's height and width are
+    dynamic, it also gets TensorRT build shapes at the preprocessor's size."""
+    from huggingface_hub import hf_hub_download
+    sizes = {s.rfilename: getattr(s, "size", None) for s in info.siblings}
+    graphs = sorted(n for n in sizes if n.endswith(".onnx"))
+    meta = cv._read_toml(target / cv.MODEL_TOML) if (target / cv.MODEL_TOML).is_file() else {}
+    chosen = filename or meta.get("onnx")
+    if chosen is None:
+        if len(graphs) == 1:
+            chosen = graphs[0]
+        else:
+            try:
+                import questionary
+            except ImportError as e:
+                raise click.UsageError("questionary not installed; pass --file "
+                                       "<path of the .onnx in the repo>.") from e
+            chosen = questionary.select(
+                f"Select an ONNX graph from {repo_id}:",
+                choices=[questionary.Choice(title=f"{_fmt_size(sizes[n])}  {n}", value=n)
+                         for n in graphs], use_shortcuts=False).ask()
+            if chosen is None:
+                raise click.Abort()
+    if chosen not in sizes:
+        raise click.UsageError(f"{chosen} is not in {repo_id}. Graphs: {', '.join(graphs)}")
+    wanted = [chosen] + [n for n in sizes if n != chosen and n.startswith(chosen)
+                         and not n.endswith(".onnx")]
+    wanted += [n for n in sizes if "/" not in n and (n.endswith(".json") or n.startswith(
+        ("README", "LICENSE", "LICENCE")))]
+    total = sum(sizes[n] or 0 for n in wanted)
+    target.mkdir(parents=True, exist_ok=True)
+    click.echo(f"Target: {target}  (CV model, ONNX)")
+    click.echo(f"  ↓ {'Revalidating' if revalidate else 'Downloading'} {len(wanted)} files "
+               f"({_fmt_size(total).strip()}) from {repo_id} ...")
+    try:
+        for n in wanted:
+            hf_hub_download(repo_id=repo_id, filename=n, local_dir=str(target))
+    except Exception as e:
+        raise click.UsageError(f"Download failed: {e}") from None
+    if not meta:
+        card = info.card_data or {}
+        license_ = card.get("license") if hasattr(card, "get") else None
+        fields = {"onnx": chosen, "task": info.pipeline_tag, "license": license_,
+                  "source": repo_id, "revision": info.sha}
+        text = "".join(f"{k} = {json.dumps(v)}\n" for k, v in fields.items() if v)
+        shapes = _preprocessor_shapes(target, chosen)
+        if shapes:
+            text += "\n[tensorrt]\n" + "".join(f'{k} = "{v}"\n' for k, v in shapes.items())
+        (target / cv.MODEL_TOML).write_text(
+            "# Written by `llmctl download`; edit freely (llmctl update keeps it).\n" + text)
+    _write_source(target, repo_id, wanted, fmt="onnx")
+    try:
+        m = cv.load(target)
+        ins, outs = m.io()
+        click.echo("  inputs:  " + ", ".join(f"{t.name} {t.datatype}{list(t.shape)}" for t in ins))
+        click.echo("  outputs: " + ", ".join(f"{t.name} {t.datatype}{list(t.shape)}" for t in outs))
+    except cv.CVError as e:
+        click.echo(f"warning: {e}", err=True)
+
+
+def _preprocessor_shapes(folder: Path, graph: str) -> dict[str, str] | None:
+    """TensorRT build shapes for an NCHW graph whose height and width are
+    dynamic, at the size its preprocessor_config.json resizes to."""
+    try:
+        ins, _ = cv.onnx_io(folder / graph)
+        pre = json.loads((folder / "preprocessor_config.json").read_text())
+    except (cv.CVError, OSError, ValueError):
+        return None
+    size = pre.get("size") if isinstance(pre, dict) else None
+    if not ins or len(ins[0].shape) != 4 or ins[0].shape[1] != 3 or \
+            -1 not in ins[0].shape[2:] or not isinstance(size, dict):
+        return None
+    h, w = size.get("height"), size.get("width")
+    if not (isinstance(h, int) and isinstance(w, int)):
+        return None
+    b = cv.DEFAULT_MAX_BATCH if ins[0].shape[0] == -1 else ins[0].shape[0]
+    return {"min": f"1x3x{h}x{w}" if ins[0].shape[0] == -1 else f"{b}x3x{h}x{w}",
+            "opt": f"{b}x3x{h}x{w}", "max": f"{b}x3x{h}x{w}"}
+
+
 def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
                   no_draft: bool, subdir: str | None, *, revalidate: bool = False,
                   target_dir: Path | None = None, hf: bool = False) -> None:
@@ -3319,6 +3545,13 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
         raise click.UsageError(f"Failed to fetch repo info for '{repo_id}': {e}") from e
 
     siblings = {s.rfilename: s for s in info.siblings if s.rfilename.endswith(".gguf")}
+    names = [s.rfilename for s in info.siblings]
+    if not hf and not siblings and any(n.endswith(".onnx") for n in names) and \
+            not any(n.endswith(_HF_WEIGHT_SUFFIXES) for n in names):
+        _download_onnx(repo_id, info, target_dir or MODELS_DIR / (subdir or
+                                                                  _derive_subdir(repo_id)),
+                       filename, revalidate=revalidate)
+        return
     if hf or not siblings:
         if filename:
             raise click.UsageError("--file only applies to GGUF repos; a Hugging "
@@ -3469,7 +3702,8 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
 @cli.command()
 @click.argument("repo_id")
 @click.option("--file", "filename", default=None,
-              help="Skip the interactive picker and download this exact file.")
+              help="Skip the interactive picker and download this exact file (a GGUF "
+                   "quant, or an ONNX graph's path in the repo).")
 @click.option("--no-mmproj", is_flag=True,
               help="Don't download the vision projector (mmproj) alongside the quant.")
 @click.option("--no-draft", is_flag=True,
@@ -3486,6 +3720,8 @@ def download(repo_id: str, filename: str | None, no_mmproj: bool, no_draft: bool
 
     GGUF repos: pick a quant (served by llama-server).
     Checkpoint repos (safetensors): snapshot the whole repo (served by vllm).
+    ONNX repos (e.g. onnx-community's): pick one graph, a CV model (served by
+    ONNX Runtime, or Triton with `run --backend triton`).
 
     Examples:
 
@@ -3809,6 +4045,161 @@ def _expected_cache_rule(caches: list[dict]) -> str:
     _, rule = containers.match_cache(caches, kind="vllm", digest=digest, engine_ver=ver,
                                      arch=containers.gpu_arch(0))
     return rule
+
+
+def _card_front_matter(folder: Path) -> tuple[Path | None, dict]:
+    """A model card's YAML front matter (``license``, ``base_model``,
+    ``model_version``, ...) from the first ``*.md`` in ``folder`` that has one."""
+    import yaml
+    for card in sorted(folder.glob("*.md")):
+        try:
+            text = card.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        m = re.match(r"---\s*\n(.*?)\n---\s*(\n|$)", text, re.S)
+        if not m:
+            continue
+        try:
+            data = yaml.safe_load(m.group(1))
+        except yaml.YAMLError:
+            continue
+        if isinstance(data, dict):
+            return card, data
+    return None, {}
+
+
+def _import_plan(source: Path, name: str, onnx: Path | None) -> tuple[str, dict[str, Path]]:
+    """``(format, {path in the new folder: source file})`` for ``import``."""
+    if source.suffix == ".onnx" or onnx is not None or \
+            (source.is_dir() and cv.is_cv_dir(source) and not backends.is_hf_model_dir(source)):
+        return "cv", cv.import_files(source, onnx)
+    if source.is_file() and source.suffix == ".gguf":
+        # Named after the import, so its key is NAME; mmproj files come along.
+        files = {f"{name}.gguf": source}
+        for p in sorted(source.parent.glob("*.gguf")):
+            if "mmproj" in p.name.lower():
+                files[p.name] = p
+        return "gguf", files
+    if source.is_dir() and (backends.is_hf_model_dir(source) or
+                            backends.is_diffusers_dir(source)):
+        files = {str(p.relative_to(source)): p for p in sorted(source.rglob("*"))
+                 if p.is_file() and not any(part.startswith(".")
+                                            for part in p.relative_to(source).parts)}
+        return "hf", files
+    raise click.UsageError(
+        f"{source} is not a model llmctl serves: an ONNX graph (a CV model folder or "
+        "an .onnx file), a GGUF file, or a checkpoint or diffusers folder.")
+
+
+@cli.command("import")
+@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@click.option("--name", default=None,
+              help="Folder and key under MODELS_DIR (default: SOURCE's name). Keep "
+                   "versions side by side, e.g. --name ext1-1.1.0.")
+@click.option("--license", "license_", default=None,
+              help="SPDX id of the weights' licence, or 'other'. Required unless a "
+                   "model card in SOURCE states one.")
+@click.option("--version", "version", default=None,
+              help="Release version (CV: Triton's model_version parameter).")
+@click.option("--base-model", default=None, help="The model it was fine-tuned from.")
+@click.option("--task", default=None, help="CV task, e.g. detection.")
+@click.option("--onnx", "onnx_file", default=None,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="The ONNX graph to serve, when SOURCE holds several.")
+@click.option("--replace", is_flag=True, default=False,
+              help="Replace an existing model of that name (refused while it's served).")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Print one JSON result on stdout.")
+def import_cmd(source: Path, name: str | None, license_: str | None, version: str | None,
+               base_model: str | None, task: str | None, onnx_file: Path | None,
+               replace: bool, as_json: bool) -> None:
+    """Import a fine-tune from a local folder or file into MODELS_DIR.
+
+    SOURCE is a CV model (a folder with an ONNX graph, and M0's spec.toml,
+    config.pbtxt and model card when it has them, or one .onnx file), a
+    GGUF file, or a Hugging Face checkpoint or diffusers folder. The files
+    are copied (SOURCE is left as it is), a CV model into Triton's layout
+    (1/model.onnx). The licence, version, base model and where it came from
+    are recorded; `llmctl list` shows the licence, and a CV model's
+    model.toml carries them for its Triton config.
+
+    \b
+      llmctl import ~/train/ext1/build/frames --name ext1 --version 1.0.0 \\
+          --license Apache-2.0 --base-model rfdetr-medium
+    """
+    source = source.expanduser().resolve()
+    folder = source if source.is_dir() else source.parent
+    card, front = _card_front_matter(folder)
+    license_ = license_ or front.get("license")
+    if not license_:
+        raise click.UsageError("No licence: pass --license SPDX (or 'other'). Every "
+                               "imported model records the licence of its weights.")
+    version = version or (str(front["model_version"]) if front.get("model_version") else None)
+    base_model = base_model or front.get("base_model")
+    name = name or (source.stem if source.is_file() else source.name)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+        raise click.UsageError(f"'{name}' isn't a usable name: letters, digits, '.', '_' "
+                               "and '-'; pass --name.")
+    try:
+        fmt, files = _import_plan(source, name, onnx_file)
+    except cv.CVError as e:
+        raise click.UsageError(str(e)) from None
+    if card is not None and fmt == "cv":
+        files.setdefault(card.name, card)
+    target = MODELS_DIR / name
+    if target.exists():
+        if not replace:
+            raise click.UsageError(f"{target} exists; pass --replace, or import this "
+                                   "version under another --name.")
+        served = [p.name for p in proc.list_running()
+                  if p.model_path and Path(p.model_path).is_relative_to(target)]
+        if served:
+            raise click.UsageError(f"{target} is served by {', '.join(served)}; stop it first.")
+    tmp = MODELS_DIR / f".import-{name}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    total = 0
+    try:
+        for rel, src in files.items():
+            dst = tmp / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            total += dst.stat().st_size
+        record = {"source": "import", "origin": str(source), "format": fmt,
+                  "license": license_, "revision": version, "base_model": base_model,
+                  "imported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        if fmt == "cv":
+            onnx_dst = tmp / cv.VERSION_DIR / "model.onnx"
+            meta = {k: v for k, v in (("task", task), ("version", version),
+                                      ("license", license_), ("base_model", base_model),
+                                      ("source", str(source))) if v}
+            if onnx_dst.is_file():
+                record["onnx_sha256"] = meta["onnx_sha256"] = cv.sha256(onnx_dst)
+            (tmp / cv.MODEL_TOML).write_text(
+                "# Written by `llmctl import`; llmctl's fields (spec.toml stays as shipped).\n"
+                + "".join(f"{k} = {json.dumps(v)}\n" for k, v in meta.items()))
+            cv.load(tmp)            # it must serve as imported
+        (tmp / _SOURCE_FILE).write_text(json.dumps(
+            {k: v for k, v in record.items() if v is not None}, indent=2) + "\n")
+        if target.exists():
+            shutil.rmtree(target)
+        os.replace(tmp, target)
+    except (OSError, cv.CVError) as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise click.UsageError(f"import failed: {e}") from None
+    key = next((k for k, s in discover_models().items()
+                if (s.model_path if s.model_path.is_dir() else s.model_path.parent) == target),
+               name)
+    result = {"name": key, "folder": str(target), "format": fmt, "license": license_,
+              "version": version, "base_model": base_model, "files": len(files),
+              "bytes": total}
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    click.echo(f"Imported {source} as {key} ({fmt}, {len(files)} files, "
+               f"{_fmt_size(total).strip()}, licence {license_}"
+               + (f", version {version}" if version else "") + f") into {target}")
+    click.echo(f"Run it: llmctl run {key}"
+               + (" (or --backend triton)" if fmt == "cv" else ""))
 
 
 @cli.command("install")

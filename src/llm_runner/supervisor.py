@@ -35,6 +35,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from llm_runner import backends
 from llm_runner import config as config_mod
 from llm_runner import logs
 from llm_runner import process as proc
@@ -55,9 +56,9 @@ def backoff(n: int) -> float:
     return min(2.0 * (2 ** n), BACKOFF_CAP)
 
 
-def healthy(port: int, timeout: float = 1.0) -> bool:
+def healthy(port: int, path: str = "/health", timeout: float = 1.0) -> bool:
     try:
-        with urllib.request.urlopen(config_mod.local_url(port, "/health"), timeout=timeout) as r:
+        with urllib.request.urlopen(config_mod.local_url(port, path), timeout=timeout) as r:
             return r.status == 200
     except (urllib.error.HTTPError, OSError, ValueError):
         return False
@@ -79,7 +80,7 @@ class Tracked:
 
 class Supervisor:
     def __init__(self, state_dir: Path | None = None, *,
-                 health: Callable[[int], bool] = healthy,
+                 health: Callable[[int, str], bool] = healthy,
                  restore: Callable[[list[str]], list] = lambda names: proc.restore(names),
                  on_restart: Callable[[str], None] | None = None,
                  clock: Callable[[], float] = time.monotonic):
@@ -159,7 +160,7 @@ class Supervisor:
                     if t.state in DOWN_STATES:
                         t.state = STARTING
                         self._event(name, STARTING, f"pid {p.pid}", pid=p.pid, port=p.port)
-                if self.health(p.port):
+                if self.health(p.port, backends.health_path(p.backend)):
                     if t.state != READY:
                         t.state, t.ready_since, t.seen_ready = READY, now, True
                         self._event(name, READY, f"pid {p.pid} port {p.port}",

@@ -35,7 +35,8 @@ against it.
   (`group` is then the first).
 
 - `--json` output of `install`, `verify`, `cache export`, `apply`,
-  `images`, `images load`, `images save` and (since 1.2) `ps`: the keys documented in the README keep their names, types and
+  `images`, `images load`, `images save`, (since 1.2) `ps` and (since 1.9)
+  `import`: the keys documented in the README keep their names, types and
   meaning. New keys may appear; parse leniently.
 
 ### File formats
@@ -58,11 +59,19 @@ against it.
 - **Provenance sidecar** `.llmctl-source.json` of an installed model: the
   keys `source`, `repo_id`, `revision`, `license`, `format`, `files`,
   `sha256`, `manifest_sha256`, `caches`.
+  (Since 1.9) an imported model's: `source` (`import`), `origin`, `format`,
+  `license`, `revision`, `base_model`, `imported_at`, `onnx_sha256`.
+- **CV model folders** (since 1.9): `1/model.onnx` (or `model.toml`'s
+  `onnx`), `1/model.plan`, `config.pbtxt`, `spec.toml` (read, never written),
+  and `model.toml` with `onnx`, `task`, `version`, `license`, `base_model`,
+  `source`, `revision`, `max_batch`, `spec` and `[tensorrt]` `min`, `opt`,
+  `max`, `flags`.
 
 ### Gateway HTTP API
 
-- The OpenAI-compatible routes the gateway forwards (`/v1/...`), the
-  per-model prefixes `/m/<name>/...`, and its error format
+- The OpenAI-compatible routes the gateway forwards (`/v1/...`), (since
+  1.9) Triton's `/v2/models/<name>/...` for CV models, the per-model prefixes
+  `/m/<name>/...`, and its error format
   (`{"error": {"code", "message", "type"}}`) with HTTP status codes.
 - `/healthz` (the gateway is up) and `/readyz` (200 only when every
   autostart model is ready; 503 when no model is declared or running).
