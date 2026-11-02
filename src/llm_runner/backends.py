@@ -636,6 +636,12 @@ def infer_backend(path: Path) -> str:
     return LLAMA
 
 
+def is_jetson() -> bool:
+    """An NVIDIA Jetson (L4T): its GPU is integrated, so images built for
+    discrete GPUs don't run there."""
+    return Path("/etc/nv_tegra_release").exists()
+
+
 def health_path(backend: str) -> str:
     """The path that answers 200 once ``backend``'s server is ready: Triton
     has only KServe's; every other server (llmctl's onnx server too) has

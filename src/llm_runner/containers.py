@@ -87,8 +87,16 @@ def expected_images() -> dict:
     return data.get("images", {}) if isinstance(data, dict) else {}
 
 
+def image_key(backend: str) -> str:
+    """The images.json entry for ``backend`` on this host: Triton on a Jetson
+    takes NGC's iGPU build (``triton-igpu``)."""
+    if backend == TRITON and backends.is_jetson() and f"{TRITON}-igpu" in expected_images():
+        return f"{TRITON}-igpu"
+    return backend
+
+
 def default_image(backend: str) -> str | None:
-    entry = expected_images().get(backend)
+    entry = expected_images().get(image_key(backend))
     return entry.get("image") if isinstance(entry, dict) else None
 
 

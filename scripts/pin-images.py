@@ -32,6 +32,12 @@ def by_platform(ref: str, platforms: list[str]) -> dict:
     index = raw(ref)
     if "sha256:" + hashlib.sha256(index).hexdigest() != digest:
         sys.exit(f"{ref}: the registry's index doesn't hash to its digest")
+    if "config" in json.loads(index):
+        # A single-platform image (NGC's iGPU Triton): the digest is the manifest's.
+        if len(platforms) != 1:
+            sys.exit(f"{ref} is one manifest, not an index; list one platform")
+        return {platforms[0]: {"manifest": digest,
+                               "config": json.loads(index)["config"]["digest"]}}
     listed = {f"{m['platform']['os']}/{m['platform']['architecture']}": m["digest"]
               for m in json.loads(index).get("manifests", [])
               if m.get("platform", {}).get("os") != "unknown"}

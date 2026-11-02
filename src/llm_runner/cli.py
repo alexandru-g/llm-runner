@@ -30,6 +30,7 @@ from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner import registry
 from llm_runner import cv
+from llm_runner import engines as engines_mod
 from llm_runner.backends import (BIN_ENGINES, CV_BACKENDS, DECIDER, GATEWAY, HF_ENGINES, LLAMA,
                                  OMNI, ONNX, PY_ENGINES, SGLANG, TRITON, VLLM)
 from llm_runner.registry import MODELS_DIR, ModelSpec, discover_models
@@ -239,12 +240,6 @@ def _resolve_runtime(backend: str, kind: str | None, image: str | None,
     if not ref:
         raise click.UsageError(f"No image for {backend}: pass --image repo@sha256:… or "
                                f"`llmctl config runtime {backend} docker --image …`.")
-    if backend == TRITON and ref == containers.default_image(TRITON) and \
-            Path("/etc/nv_tegra_release").exists():
-        raise click.UsageError(
-            "This is a Jetson: Triton needs NGC's iGPU image here, not the default "
-            "dGPU one. `llmctl config runtime triton docker --image "
-            "nvcr.io/nvidia/tritonserver@sha256:…` (the -igpu tag), or pass --image.")
     if not containers.is_pinned(ref) and not allow_tag:
         raise click.UsageError(f"{ref} is not pinned by digest. Use repo@sha256:…, or "
                                "--allow-tag for development.")
@@ -258,7 +253,7 @@ def _resolve_runtime(backend: str, kind: str | None, image: str | None,
     # --dns '' drops a configured list for this launch.
     if dns_ips if dns_ips is not None else configured.get("dns"):
         runtime["dns"] = dns_ips if dns_ips is not None else configured["dns"]
-    expected = containers.expected_images().get(backend) or {}
+    expected = containers.expected_images().get(containers.image_key(backend)) or {}
     if expected.get("image") == ref and expected.get("engine_version"):
         runtime["engine_version"] = expected["engine_version"]
     return runtime
@@ -4045,6 +4040,135 @@ def _expected_cache_rule(caches: list[dict]) -> str:
     _, rule = containers.match_cache(caches, kind="vllm", digest=digest, engine_ver=ver,
                                      arch=containers.gpu_arch(0))
     return rule
+
+
+@cli.command("setup")
+@click.argument("backend", required=False,
+                type=click.Choice(list(engines_mod.SETUP_BACKENDS)))
+@click.option("--runtime", "runtime_kind", type=click.Choice([containers.HOST, containers.DOCKER]),
+              default=None, help="docker: the backend's container image instead of a host "
+                                 "install (triton is always docker).")
+@click.option("--upgrade", is_flag=True,
+              help="Install the tested version over another one (or reinstall it).")
+@click.option("--cpu", is_flag=True, help="onnx: the CPU build even on a GPU host.")
+@click.option("--index-url", default=None, metavar="URL",
+              help="onnx on a Jetson: the index with the onnxruntime-gpu wheel for its "
+                   "JetPack (third-party; PyPI's build is CPU only there).")
+@click.option("--find-links", type=click.Path(exists=True, file_okay=False, path_type=Path),
+              default=None, help="Install from wheels in this folder, offline.")
+@click.option("--archive", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="Load the image from this archive (`llmctl images save`) "
+                                 "instead of pulling it.")
+@click.option("--dry-run", is_flag=True, help="Show the plan and stop.")
+@click.option("--yes", "-y", is_flag=True, help="Don't ask before running it.")
+def setup_cmd(backend: str | None, runtime_kind: str | None, upgrade: bool, cpu: bool,
+              index_url: str | None, find_links: Path | None, archive: Path | None,
+              dry_run: bool, yes: bool) -> None:
+    """Show what each backend has on this host, or install what BACKEND needs.
+
+    With no BACKEND: one row per backend, with the version found and the one
+    this llmctl was tested with. With one, a plan to get it there, run after
+    you confirm:
+
+    \b
+      vllm, sglang   a uv tool at the tested version (engines.json)
+      omni, onnx     a venv under ~/.venvs (onnx: the GPU build when this
+                     host has an NVIDIA GPU, else CPU)
+      triton         the image pinned in images.json (NGC's iGPU build on
+                     a Jetson), pulled by digest or loaded with --archive
+      --runtime docker  the same for vllm, sglang and llama, and their
+                     runtime setting
+      llama, decider checked only: build or clone them (README, Install)
+
+    A different installed version is left alone unless --upgrade.
+    """
+    from llm_runner import images
+    cfg = config_mod.load()
+    if backend is None:
+        rows = engines_mod.status(proc.STATE_DIR, cfg)
+        click.echo(f"{'BACKEND':<8} {'STATE':<9} {'VERSION':<20} {'TESTED':<8} WHERE")
+        for r in rows:
+            click.echo(f"{r.backend:<8} {r.state:<9} {(r.version or '-'):<20} "
+                       f"{(r.tested or '-'):<8} {r.where or '-'}"
+                       + (f"   [{r.note}]" if r.note else ""))
+        return
+    docker = backend == TRITON or runtime_kind == containers.DOCKER
+    if runtime_kind == containers.HOST and backend == TRITON:
+        raise click.UsageError("triton runs in a container only.")
+    if docker and backend not in containers.CONTAINER_BACKENDS:
+        raise click.UsageError(f"{backend} has no container image.")
+    if backend in (LLAMA, DECIDER) and not docker:
+        row = next(r for r in engines_mod.status(proc.STATE_DIR, cfg) if r.backend == backend)
+        click.echo(f"{backend}: {row.state}" + (f" at {row.where}" if row.where else "")
+                   + (f" ({row.version})" if row.version else ""))
+        click.echo("llmctl doesn't install it: " + (
+            "build llama.cpp (README, Install step 2), or `llmctl setup llama "
+            "--runtime docker` for its image." if backend == LLAMA else
+            "clone and set up decider (README, Install step 4)."))
+        return
+    if (find_links or archive) is None and not dry_run:
+        _require_online("setup")
+    try:
+        steps = (engines_mod.plan_image(backend, proc.STATE_DIR, cfg, archive=archive,
+                                        set_runtime=backend != TRITON) if docker else
+                 engines_mod.plan_engine(backend, upgrade=upgrade, cpu=cpu,
+                                         index_url=index_url, find_links=find_links))
+    except engines_mod.SetupError as e:
+        raise click.UsageError(str(e)) from None
+    if backend == ONNX and backends.is_jetson() and not index_url and not cpu and not docker:
+        click.echo("note: on a Jetson PyPI's onnxruntime is CPU only. For CUDA, pass "
+                   "--index-url with the index that has the onnxruntime-gpu wheel for this "
+                   "JetPack (a third-party index).", err=True)
+    if not steps:
+        click.echo(f"{backend}: already set up; nothing to do.")
+        return
+    click.echo(f"To set up {backend}:")
+    for n, s in enumerate(steps, 1):
+        click.echo(f"  {n}. {s.what}")
+        if s.argv:
+            click.echo(f"     $ {shlex.join(s.argv)}")
+    if dry_run:
+        return
+    if not yes and not click.confirm("Run it?", default=True):
+        raise click.Abort()
+    for s in steps:
+        click.echo(f"==> {s.what}")
+        if s.argv:
+            if subprocess.run(s.argv).returncode != 0:
+                raise click.ClickException(f"failed: {shlex.join(s.argv)}")
+        elif s.archive is not None:
+            try:
+                result = images.load(s.archive, proc.STATE_DIR)
+            except (bundle.BundleError, images.BadArchive) as e:
+                raise click.ClickException(str(e)) from None
+            click.echo(f"loaded {result.get('ref')} as {result.get('image_id', '')[:19]}")
+        elif s.config:
+            runtimes = dict(config_mod.load().get("runtime") or {})
+            runtimes.update(s.config["runtime"])
+            config_mod.update(runtime=runtimes)
+    _setup_verify(backend, docker)
+
+
+def _setup_verify(backend: str, docker: bool) -> None:
+    """After a setup: the backend's status row, and for onnx what ONNX
+    Runtime can run on."""
+    cfg = config_mod.load()
+    row = (engines_mod.image_status(backend, proc.STATE_DIR,
+                                    containers.runtime_from_config(backend, cfg))
+           if docker else next(r for r in engines_mod.status(proc.STATE_DIR, cfg)
+                               if r.backend == backend))
+    click.echo(f"{backend}: {row.state}" + (f", {row.version}" if row.version else "")
+               + (f" at {row.where}" if row.where else ""))
+    if backend == ONNX and not docker and row.where:
+        version, providers = engines_mod.check_onnx(row.where)
+        if version is None:
+            raise click.ClickException(f"{row.where} can't import onnxruntime and numpy.")
+        click.echo(f"onnxruntime {version}: {', '.join(providers)}")
+        if "CUDAExecutionProvider" not in providers and engines_mod.backends_gpu():
+            click.echo("warning: this host has a GPU, but ONNX Runtime will run on CPU.",
+                       err=True)
+    if row.state not in ("ok", "found"):
+        raise click.ClickException(f"{backend} is still {row.state}.")
 
 
 def _card_front_matter(folder: Path) -> tuple[Path | None, dict]:

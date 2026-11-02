@@ -52,6 +52,11 @@ against it.
   by digest), `tag`, `engine_version`, `entrypoint`, `platforms`, `license`,
   and (since 1.1) `by_platform` (per platform, `manifest` and `config`
   digests).
+- **`engines.json`** (since 1.10), schema `llmctl-engines/1`: per engine,
+  `kind` (`uv-tool` or `venv`), `python`, `packages`, `with`, `venv`,
+  `torch_backend`, `dist` and `version`. The pinned versions change between
+  releases; that's what the file is for. (Since 1.10 `images.json` may hold an
+  entry that isn't a backend name, `triton-igpu`.)
 - **Image archive sidecar** `llmctl-image.json`, schema `llmctl-image/1`:
   `ref`, `platform`, and the registry's `index` and `manifest`, base64.
   The images themselves change between releases; that's what the file is

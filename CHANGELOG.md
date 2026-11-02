@@ -7,6 +7,22 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`llmctl setup`:** with no argument, one row per backend with the version
+  found on this host and the one llmctl was tested with. `llmctl setup
+  BACKEND` shows a plan and runs it once confirmed (`--yes`, `--dry-run`):
+  vllm and sglang as uv tools and vLLM-Omni and ONNX Runtime as venvs under
+  `~/.venvs`, at the versions in the new `engines.json` (onnx: the GPU build
+  on an NVIDIA host, CPU otherwise or with `--cpu`, a Jetson's wheel index
+  with `--index-url`); triton's image, and vllm, sglang and llama's with
+  `--runtime docker`, pulled by digest or loaded with `--archive`, plus the
+  runtime setting. An engine at another version is left alone unless
+  `--upgrade`; `--find-links` installs offline. llama.cpp and decider are
+  checked only.
+- `images.json` has `triton-igpu` (NGC's Triton 26.02 for Jetson), which a
+  Jetson takes instead of `triton` without any configuration.
+
 ## [1.9.0] - 2026-11-02
 
 ### Added

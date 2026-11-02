@@ -1,0 +1,45 @@
+{
+  "schema": "llmctl-engines/1",
+  "comment": "Host installs of the Python engines, at the versions this llmctl was tested with. `llmctl setup <backend>` installs them; container images are in images.json.",
+  "engines": {
+    "vllm": {
+      "kind": "uv-tool",
+      "tool": "vllm",
+      "python": "3.12",
+      "torch_backend": "auto",
+      "packages": ["vllm==0.29.0"],
+      "with": ["transformers==5.16.1"],
+      "dist": "vllm",
+      "version": "0.29.0"
+    },
+    "sglang": {
+      "kind": "uv-tool",
+      "tool": "sglang",
+      "python": "3.12",
+      "torch_backend": "auto",
+      "packages": ["sglang==0.5.22"],
+      "with": ["cuda-tile==1.6.0rc5", "flash-attn-4>=4.0.0b18"],
+      "dist": "sglang",
+      "version": "0.5.22"
+    },
+    "omni": {
+      "kind": "venv",
+      "venv": "~/.venvs/vllm-omni",
+      "python": "3.12",
+      "torch_backend": "auto",
+      "packages": ["vllm==0.30.0", "vllm-omni==0.30.0"],
+      "dist": "vllm-omni",
+      "version": "0.30.0"
+    },
+    "onnx": {
+      "kind": "venv",
+      "venv": "~/.venvs/onnxruntime",
+      "python": "3.12",
+      "packages": ["onnxruntime-gpu==1.31.1", "numpy"],
+      "cpu_packages": ["onnxruntime==1.31.1", "numpy"],
+      "jetson_packages": ["onnxruntime-gpu", "numpy"],
+      "dist": ["onnxruntime-gpu", "onnxruntime"],
+      "version": "1.31.1"
+    }
+  }
+}

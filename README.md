@@ -67,6 +67,41 @@ systemone-proxy isn't in them; its wheel is a separate release asset.
 invoke via `uv run llmctl ...` from inside the repo — that picks up edits
 without reinstalling.
 
+**The engines: `llmctl setup`.** With no argument it lists each backend with
+the version found on this host and the one this llmctl was tested with:
+
+```
+$ llmctl setup
+BACKEND  STATE     VERSION              TESTED   WHERE
+llama    found     b11805 (2c54a5ed2)   -        /home/alex/.local/bin/llama-server
+vllm     ok        0.29.0               0.29.0   /home/alex/.local/bin/vllm
+sglang   missing   -                    0.5.22   -   [llmctl setup sglang]
+omni     ok        0.30.0               0.30.0   /home/alex/.venvs/vllm-omni/bin/vllm
+decider  found     -                    -        /fast/ml/jev/decider
+onnx     ok        1.31.1               1.31.1   /home/alex/.venvs/onnxruntime/bin/python   [onnxruntime-gpu]
+triton   ok        2.73.0               -        26.09-py3 (nvcr.io/nvidia/tritonserver)
+```
+
+`llmctl setup BACKEND` shows a plan and runs it once you confirm (`--yes`
+skips the question, `--dry-run` stops after the plan). It does what the
+sections below describe, at the versions pinned in `engines.json`:
+
+- `vllm`, `sglang`: a uv tool (`uv tool install …`, with the pins each needs);
+- `omni`, `onnx`: a venv under `~/.venvs`. onnx takes `onnxruntime-gpu` on a
+  host with an NVIDIA GPU and `onnxruntime` otherwise (`--cpu` forces it).
+  On a Jetson PyPI only has the CPU build; `--index-url URL` names the
+  (third-party) index with the onnxruntime-gpu wheel for its JetPack;
+- `triton`: the image pinned in `images.json` (NGC's iGPU build on a
+  Jetson), pulled by digest, or `--archive FILE` from `llmctl images save`;
+- `vllm`, `sglang`, `llama` with `--runtime docker`: their image, and
+  `config runtime <backend> docker`;
+- `llama`, `decider`: checked only. Build llama.cpp and clone decider as
+  below.
+
+An engine already installed at another version is left alone; `--upgrade`
+installs the tested one. `--find-links DIR` installs from local wheels,
+offline. uv comes from `~/.local/bin` first, then `PATH`.
+
 ### 2. `llama-server` (native, on the host)
 
 `llmctl run` shells out to `llama-server`, so the binary must be on `PATH`.
@@ -295,12 +330,10 @@ PyPI's `onnxruntime` is CPU only; the CUDA build is the onnxruntime-gpu wheel
 made for its JetPack.
 
 The `triton` backend runs NVIDIA's Triton server in Docker, from the image in
-`images.json` (Triton 26.09, `docker pull nvcr.io/nvidia/tritonserver@sha256:3508…`).
-A Jetson needs NGC's iGPU build instead (e.g. `26.02-py3-igpu`):
-
-```bash
-llmctl config runtime triton docker --image nvcr.io/nvidia/tritonserver@sha256:…
-```
+`images.json`: Triton 26.09 (`triton`), or on a Jetson NGC's iGPU build
+26.02 (`triton-igpu`), which llmctl picks there by itself. `llmctl setup
+triton` pulls it by digest. Another image: `llmctl config runtime triton
+docker --image …`.
 
 ## Models
 
@@ -779,8 +812,9 @@ JSON) and `model_version` (model.toml's `version`).
 one session, requests in parallel, no batching across requests. `-X
 '--device cpu'` keeps it off the GPU; `-X '--threads 8'` sets CPU threads.
 
-**triton.** Always in a container (`--image` or `llmctl config runtime
-triton docker --image …`). llmctl stages a one-model repository under its
+**triton.** Always in a container: the image in `images.json` (the iGPU
+build on a Jetson), `--image`, or `llmctl config runtime triton docker
+--image …`. llmctl stages a one-model repository under its
 state dir and serves it over HTTP only (no gRPC, no Triton metrics port):
 
 - **On a GPU**, TensorRT. The engine is built on the host, the first time,
