@@ -28,6 +28,12 @@ All notable changes to llm-runner (`llmctl`). The format follows
   `client_left`. A client that half-closes its connection after sending a request
   counts as having left.
 
+### Known issues
+
+- **Gemma 4 can lose its answer after a stray `<channel|>`** on llama-server b11805
+  with `--reasoning-budget 0`: the reply stops after a plan, with `finish_reason:
+  stop`. See [docs/known-issues.md](docs/known-issues.md).
+
 ## [1.11.0] - 2026-11-04
 
 ### Added
