@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import socket
 
 import pytest
 
@@ -17,6 +18,7 @@ class World:
         self.live: dict[str, proc.RunningProcess] = {}
         self.specs: dict[str, proc.LaunchSpec] = {}
         self.healthy: set[str] = set()
+        self.silent: set[str] = set()       # answer nothing in time
         self.restored: list[str] = []
         self.next_pid = 100
         self.fail_restore = False
@@ -27,6 +29,8 @@ class World:
                                 clock=lambda: self.now)
 
     def _health(self, port, path="/health"):
+        if any(p.port == port and p.name in self.silent for p in self.live.values()):
+            return None
         return any(p.port == port and p.name in self.healthy for p in self.live.values())
 
     def _restore(self, names):
@@ -231,3 +235,65 @@ def test_gateway_answers_503_for_a_down_model_and_lists_it(monkeypatch, tmp_path
                'state="restarting"} 1' % g.node in text
     finally:
         httpd.shutdown()
+
+
+
+def _events(tmp_path):
+    return [json.loads(line)["event"] for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+
+
+def test_a_busy_model_stays_ready_and_logs_nothing(w, tmp_path):
+    w.add("flux")
+    w.run(4)
+    assert w.s.state("flux").state == sup.READY
+    ready_since, before = w.s.state("flux").ready_since, _events(tmp_path)
+    w.silent.add("flux")
+    w.run(10)
+    t = w.s.state("flux")
+    assert t.state == sup.READY and t.ready_since == ready_since
+    w.silent.clear()
+    w.run(4)
+    t = w.s.state("flux")
+    assert t.state == sup.READY and t.ready_since == ready_since and t.silent_since is None
+    assert _events(tmp_path) == before
+
+
+def test_silence_too_long_reads_as_stuck_and_each_silence_starts_over(w):
+    w.add("flux")
+    w.run(4)
+    w.silent.add("flux")
+    w.run(sup.BUSY_GRACE - 10)
+    w.silent.clear()
+    w.run(4)
+    w.silent.add("flux")
+    w.run(sup.BUSY_GRACE - 10)
+    assert w.s.state("flux").state == sup.READY         # two silences, neither too long
+    w.run(20)
+    assert w.s.state("flux").state == sup.STARTING
+    w.silent.clear()
+    w.run(4)
+    assert w.s.state("flux").state == sup.READY
+
+
+def test_a_refusal_is_not_busy(w):
+    w.add("flux")
+    w.run(4)
+    w.healthy.clear()
+    w.run(2)
+    assert w.s.state("flux").state == sup.STARTING
+
+
+def test_a_model_that_never_answered_is_not_ready_when_silent(w):
+    w.add("flux", healthy=False)
+    w.silent.add("flux")
+    w.run(10)
+    assert w.s.state("flux").state == sup.STARTING
+
+
+def test_healthy_tells_a_timeout_from_a_refusal():
+    with socket.socket() as listening:      # accepts in its backlog, never answers
+        listening.bind(("127.0.0.1", 0))
+        listening.listen()
+        port = listening.getsockname()[1]
+        assert sup.healthy(port, timeout=0.05) is None
+    assert sup.healthy(port, timeout=0.05) is False

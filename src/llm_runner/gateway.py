@@ -209,6 +209,8 @@ class LocalModels:
         self._mtime: float | None = None
         self._records: list[Model] = []
         self._health: dict[int, tuple[float, str]] = {}
+        # port -> (pid, when it stopped answering in time): who has answered.
+        self._answering: dict[int, tuple[int, float | None]] = {}
         self._lock = threading.Lock()
         self._seen: set[tuple[str, int]] = set()
 
@@ -316,12 +318,24 @@ class LocalModels:
             with urllib.request.urlopen(config_mod.local_url(m.port, health_path(m.backend)),
                                         timeout=1) as r:
                 state = "ready" if r.status == 200 else "loading"
+            if state == "ready":
+                self._answering[m.port] = (m.pid, None)
         except urllib.error.HTTPError:
             state = "loading"        # llama-server answers 503 while it loads
-        except (OSError, ValueError):
-            state = "down"
+        except (OSError, ValueError) as e:
+            state = "ready" if sup_mod.timed_out(e) and self._busy_not_stuck(m, now) else "down"
         self._health[m.port] = (now, state)
         return state
+
+    def _busy_not_stuck(self, m: Model, now: float) -> bool:
+        """A model that has answered, and has been silent for less than
+        :data:`supervisor.BUSY_GRACE`."""
+        pid, since = self._answering.get(m.port, (None, None))
+        if pid != m.pid:
+            return False
+        since = now if since is None else since
+        self._answering[m.port] = (pid, since)
+        return now - since < sup_mod.BUSY_GRACE
 
     def readiness(self) -> tuple[bool, dict[str, str]]:
         """Whether every model this machine should serve is ready, and each

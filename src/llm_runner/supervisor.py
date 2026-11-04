@@ -47,6 +47,10 @@ DEFAULT_MAX = 5
 WINDOW = 600.0          # restarts counted over this long; this long ready resets them
 BACKOFF_CAP = 60.0
 TICK = 2.0
+# How long a model that was answering may stay silent and still count as ready.
+# A server can be too busy to answer its health check: vLLM-Omni's event loop is
+# blocked for 2.5 s at the end of each FLUX image. A longer silence reads as stuck.
+BUSY_GRACE = 60.0
 STARTING, READY, RESTARTING, CRASHED = "starting", "ready", "restarting", "crashed"
 DOWN_STATES = (RESTARTING, CRASHED)
 
@@ -56,18 +60,29 @@ def backoff(n: int) -> float:
     return min(2.0 * (2 ** n), BACKOFF_CAP)
 
 
-def healthy(port: int, path: str = "/health", timeout: float = 1.0) -> bool:
+def timed_out(error: Exception) -> bool:
+    """A probe got no answer in time, unlike a refused connection, where nothing
+    is listening: the server may just be busy."""
+    return isinstance(error, TimeoutError) or \
+        isinstance(getattr(error, "reason", None), TimeoutError)
+
+
+def healthy(port: int, path: str = "/health", timeout: float = 1.0) -> bool | None:
+    """True or False; None when no answer came in time (see :func:`timed_out`)."""
     try:
         with urllib.request.urlopen(config_mod.local_url(port, path), timeout=timeout) as r:
             return r.status == 200
-    except (urllib.error.HTTPError, OSError, ValueError):
+    except urllib.error.HTTPError:
         return False
+    except (OSError, ValueError) as e:
+        return None if timed_out(e) else False
 
 
 @dataclass
 class Tracked:
     name: str
     state: str = STARTING
+    silent_since: float | None = None   # when it stopped answering in time, while ready
     pid: int | None = None
     ready_since: float | None = None
     seen_ready: bool = False
@@ -160,7 +175,13 @@ class Supervisor:
                     if t.state in DOWN_STATES:
                         t.state = STARTING
                         self._event(name, STARTING, f"pid {p.pid}", pid=p.pid, port=p.port)
-                if self.health(p.port, backends.health_path(p.backend)):
+                answer = self.health(p.port, backends.health_path(p.backend))
+                if answer is None and t.state == READY:
+                    t.silent_since = t.silent_since or now
+                    if now - t.silent_since >= BUSY_GRACE:
+                        t.state, t.silent_since = STARTING, None    # stuck
+                elif answer:
+                    t.silent_since = None
                     if t.state != READY:
                         t.state, t.ready_since, t.seen_ready = READY, now, True
                         self._event(name, READY, f"pid {p.pid} port {p.port}",
@@ -168,7 +189,7 @@ class Supervisor:
                     elif t.ready_since is not None and now - t.ready_since >= WINDOW:
                         t.restarts.clear()
                 elif t.state == READY:
-                    t.state = STARTING          # alive, not answering (reloading, stuck)
+                    t.state = STARTING          # alive, not answering (reloading)
             for name, spec in specs.items():
                 if name in live:
                     continue

@@ -4,6 +4,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -352,3 +353,122 @@ def test_listen_backlog_takes_a_burst(tmp_path):
         assert httpd.request_queue_size >= 128
     finally:
         httpd.server_close()
+
+
+# ---------------------------------------------------- a busy model is not down --
+
+def _probes(monkeypatch, *results):
+    """urlopen in the gateway answers with these in turn: a status or an exception."""
+    it = iter(results)
+
+    class Reply:
+        def __init__(self, status):
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(url, timeout=None):
+        got = next(it)
+        if isinstance(got, Exception):
+            raise got
+        return Reply(got)
+
+    monkeypatch.setattr(gw.urllib.request, "urlopen", urlopen)
+
+
+def _local(tmp_path, pid=7):
+    return gw.LocalModels(tmp_path / "running.json"), gw.Model("flux", pid, 8000, "omni", 0.0,
+                                                               "/m", ())
+
+
+def _clock(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(gw.time, "monotonic", lambda: now[0])
+    return now
+
+
+REFUSED = gw.urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+
+
+def test_a_model_too_busy_to_answer_stays_ready(tmp_path, monkeypatch):
+    local, m = _local(tmp_path)
+    _probes(monkeypatch, 200, TimeoutError(), TimeoutError(), 200)
+    assert [local.status(m, fresh=True) for _ in range(4)] == ["ready"] * 4
+
+
+def test_a_connect_timeout_counts_as_busy_too(tmp_path, monkeypatch):
+    local, m = _local(tmp_path)
+    _probes(monkeypatch, 200, gw.urllib.error.URLError(TimeoutError()))
+    assert [local.status(m, fresh=True) for _ in range(2)] == ["ready", "ready"]
+
+
+def test_silence_too_long_is_down_and_an_answer_starts_over(tmp_path, monkeypatch):
+    local, m = _local(tmp_path)
+    now = _clock(monkeypatch)
+    _probes(monkeypatch, 200, TimeoutError(), TimeoutError(), TimeoutError(), 200, TimeoutError())
+    assert local.status(m, fresh=True) == "ready"
+    assert local.status(m, fresh=True) == "ready"
+    now[0] += gw.sup_mod.BUSY_GRACE - 1
+    assert local.status(m, fresh=True) == "ready"
+    now[0] += 2
+    assert local.status(m, fresh=True) == "down"
+    assert local.status(m, fresh=True) == "ready"
+    now[0] += gw.sup_mod.BUSY_GRACE + 1
+    assert local.status(m, fresh=True) == "ready"       # silent for no time yet
+
+
+def test_the_silence_is_counted_from_the_first_miss_not_the_last_answer(tmp_path, monkeypatch):
+    """An idle gateway may not have probed for hours."""
+    local, m = _local(tmp_path)
+    now = _clock(monkeypatch)
+    _probes(monkeypatch, 200, TimeoutError())
+    assert local.status(m, fresh=True) == "ready"
+    now[0] += 3600
+    assert local.status(m, fresh=True) == "ready"
+
+
+def test_a_refusal_is_down_at_once(tmp_path, monkeypatch):
+    local, m = _local(tmp_path)
+    _probes(monkeypatch, 200, REFUSED)
+    assert [local.status(m, fresh=True) for _ in range(2)] == ["ready", "down"]
+
+
+def test_silent_before_it_ever_answered_is_down(tmp_path, monkeypatch):
+    local, m = _local(tmp_path)
+    _probes(monkeypatch, TimeoutError())
+    assert local.status(m, fresh=True) == "down"
+
+
+def test_another_process_on_the_port_has_not_answered(tmp_path, monkeypatch):
+    local, m = _local(tmp_path)
+    _, other = _local(tmp_path, pid=8)
+    _probes(monkeypatch, 200, TimeoutError())
+    assert local.status(m, fresh=True) == "ready"
+    assert local.status(other, fresh=True) == "down"
+
+
+def test_loading_is_not_touched(tmp_path, monkeypatch):
+    local, m = _local(tmp_path)
+    _probes(monkeypatch, 200,
+            gw.urllib.error.HTTPError("u", 503, "loading", None, None))
+    assert [local.status(m, fresh=True) for _ in range(2)] == ["ready", "loading"]
+
+
+def test_a_real_socket_that_never_answers_reads_as_a_timeout(tmp_path, monkeypatch):
+    local = gw.LocalModels(tmp_path / "running.json")
+    with socket.socket() as listening:
+        listening.bind(("127.0.0.1", 0))
+        listening.listen()
+        port = listening.getsockname()[1]
+        monkeypatch.setattr(gw.config_mod, "local_url", lambda p, path="": f"http://127.0.0.1:{p}{path}")
+        real = gw.urllib.request.urlopen
+        monkeypatch.setattr(gw.urllib.request, "urlopen",
+                            lambda url, timeout=None: real(url, timeout=0.05))
+        m = gw.Model("flux", 7, port, "omni", 0.0, "/m", ())
+        local._answering[port] = (7, None)
+        assert local.status(m, fresh=True) == "ready"
+    assert local.status(m, fresh=True) == "down"        # closed: refused

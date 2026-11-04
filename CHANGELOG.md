@@ -7,6 +7,39 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`llmctl chat`:** chat in the terminal with a running model anywhere in the
+  cluster, through this machine's gateway. Text models stream their replies
+  (reasoning dimmed) and keep the conversation, with `/clear`, `/retry`, `/system`
+  and `/set` for any request field. Image pipelines take each message as a prompt
+  and save the images on this machine, opening them in the default viewer when run
+  from a terminal (`--open`, `--no-open`), and `--image` or `/image` turns prompts into
+  edits. With no name, it uses the only model that can chat, or opens a picker
+  listing each model's nodes; `NAME@NODE` keeps it to one node. Decision, embedding
+  and CV models are left out, and naming one says why. `-m` or piped stdin sends one
+  message and exits, with the answer alone on stdout.
+- **`llmctl setup vllm` and `setup omni` on a Jetson Orin with JetPack 6:** they
+  unpack NVIDIA's `cuda-compat-orin`, which runs PyPI's CUDA 13 wheels on the
+  CUDA 12.6 driver with no change to the host, install the versions tested there
+  (vLLM 0.33, vLLM-Omni 0.32) and finish with a real operation on the GPU. `llmctl
+  run` adds the libraries for vLLM and Omni only. `setup vllm --runtime docker`
+  builds the image there from a Dockerfile shipped with llmctl and pins the runtime
+  to it. Other hosts keep their versions.
+
+### Fixed
+
+- A model too busy to answer its health check no longer reads as down. vLLM-Omni
+  stops answering for about 2.5 s at the end of each image, so `/v1/models`,
+  `/readyz` and the metrics flipped to `down`, `llmctl ps` to `starting`, a spurious
+  `ready` event was logged, and the time counted towards clearing restarts started
+  over. A model that has answered stays ready through up to 60 s of timed-out checks.
+  A refused connection still reads as down at once.
+- vLLM and Omni are sized from `/proc/meminfo` on a Jetson, where `nvidia-smi`
+  reports no memory and vLLM otherwise took its default share of the whole board.
+- A `~/.cache/vllm` the user can't write, left by a run as root, no longer stops
+  vLLM and Omni at their first compile: they use a cache folder of their own.
+
 ## [1.10.0] - 2026-11-02
 
 ### Added
