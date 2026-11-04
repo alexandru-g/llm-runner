@@ -111,6 +111,7 @@ def test_an_offload_flag_in_extra_replaces_the_default(extra):
 ])
 def test_default_offload_follows_free_vram(tmp_path, monkeypatch, free_gib, components):
     d = _flux(tmp_path, dit=22 * GIB, t5=9 * GIB)
+    monkeypatch.setattr(backends, "is_orin_jetpack6", lambda: False)
     monkeypatch.setattr(backends, "gpu_memory_mib",
                         lambda device=0: (free_gib * 1024, 24564))
     args, why = backends.default_omni_offload(d)
@@ -121,7 +122,25 @@ def test_default_offload_follows_free_vram(tmp_path, monkeypatch, free_gib, comp
         assert json.loads(args[1]) == {"mode": "layer", "components": components}
 
 
+def test_an_orin_offloads_unpinned_and_tiles_the_vae(tmp_path, monkeypatch):
+    d = _flux(tmp_path, dit=22 * GIB, t5=9 * GIB)
+    monkeypatch.setattr(backends, "is_orin_jetpack6", lambda: True)
+    monkeypatch.setattr(backends, "gpu_memory_mib", lambda device=0: (20 * 1024, 62000))
+    args, _ = backends.default_omni_offload(d)
+    assert json.loads(_arg(args, "--diffusion-offload-config")) == {
+        "mode": "layer", "components": ["dit"], "pin_memory": False}
+    assert "--vae-use-tiling" in args
+
+
+def test_an_orin_with_room_needs_neither(tmp_path, monkeypatch):
+    d = _flux(tmp_path, dit=22 * GIB, t5=9 * GIB)
+    monkeypatch.setattr(backends, "is_orin_jetpack6", lambda: True)
+    monkeypatch.setattr(backends, "gpu_memory_mib", lambda device=0: (50 * 1024, 62000))
+    assert backends.default_omni_offload(d)[0] == []
+
+
 def test_unknown_vram_offloads_the_dit(tmp_path, monkeypatch):
+    monkeypatch.setattr(backends, "is_orin_jetpack6", lambda: False)
     monkeypatch.setattr(backends, "gpu_memory_mib", lambda device=0: None)
     args, why = backends.default_omni_offload(_flux(tmp_path))
     assert json.loads(args[1])["components"] == ["dit"] and "unknown" in why

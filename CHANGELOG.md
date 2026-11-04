@@ -7,6 +7,13 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Omni on a Jetson Orin:** when the weights don't fit, `llmctl run` now also turns
+  off pinned memory for the offload and tiles the VAE, so Qwen-Image-2512 and
+  Edit-2511 start with no extra flags. Other models and hosts launch as before.
+  An offload flag in `-X` still replaces all of this.
+
 ### Fixed
 
 - **vLLM and Omni models read `down` while they load:** they don't listen until

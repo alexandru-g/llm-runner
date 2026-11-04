@@ -1004,8 +1004,14 @@ def default_omni_offload(model_path: Path) -> tuple[list[str], str]:
         components.append("text_encoder")
     why = (f"{total} MiB of weights, {mem[0]} MiB free" if mem is not None
            else "free VRAM unknown")
-    cfg = json.dumps({"mode": "layer", "components": components}, separators=(",", ":"))
-    return ["--diffusion-offload-config", cfg], why
+    cfg: dict = {"mode": "layer", "components": components}
+    tiling = []
+    if is_orin_jetpack6():
+        # Unified memory, so pinning gains nothing, and NvMap can't pin this
+        # much. With the weights in memory, the VAE decode needs tiling to fit.
+        cfg["pin_memory"] = False
+        tiling = ["--vae-use-tiling"]
+    return ["--diffusion-offload-config", json.dumps(cfg, separators=(",", ":")), *tiling], why
 
 
 def build_omni_cmd(vllm_bin: str, model_path: Path, *, name: str, port: int,

@@ -760,8 +760,9 @@ and 3.5. Text-model options (`--ctx-size`, `--kv-quant`, `--n-parallel`,
 **Memory.** `run` keeps the whole pipeline on the GPU when its weights plus
 4 GB fit the free VRAM. Otherwise the DiT streams from CPU a block at a time
 (`--diffusion-offload-config '{"mode":"layer","components":["dit"]}'`), and
-the text encoders too when even the rest doesn't fit. Pass any offload flag
-with `-X` to choose yourself. On an RTX 4090 (24 GB), with vLLM-Omni 0.30 in
+the text encoders too when even the rest doesn't fit. On a Jetson Orin, that
+offload also sets `"pin_memory":false` and adds `--vae-use-tiling`. Pass any
+offload flag with `-X` to choose yourself. On an RTX 4090 (24 GB), with vLLM-Omni 0.30 in
 bf16:
 
 | Model | Steps | 1024² image | Peak VRAM | Ready after |
