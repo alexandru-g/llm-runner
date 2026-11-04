@@ -13,6 +13,13 @@ All notable changes to llm-runner (`llmctl`). The format follows
   they've loaded, so the gateway couldn't tell a load from a failure. A running
   model that hasn't answered yet now reads `loading`, as llama-server does.
   Once it has answered, a refused connection is still `down` at once.
+- **A client leaving could keep a model busy for nobody:** the gateway only learned
+  a client had left when it next wrote to it, so a request still queued, or a reply
+  with nothing to send, kept going and held the model's slot. It now watches the
+  client while it waits and hangs up on the model at once, across nodes too, without
+  failing over. A request dropped before any reply logs status 499 and code
+  `client_left`. A client that half-closes its connection after sending a request
+  counts as having left.
 
 ## [1.11.0] - 2026-11-04
 

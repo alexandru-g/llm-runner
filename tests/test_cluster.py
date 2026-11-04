@@ -6,6 +6,7 @@ import dataclasses
 import http.client
 import json
 import os
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -518,3 +519,60 @@ def test_relayed_calls_carry_the_key_not_the_token(tmp_path):
         assert _Recorder.seen[-1][1]["Authorization"] == "Bearer mine"
     finally:
         rec.shutdown(); srv.shutdown()
+
+
+def test_a_client_leaving_cancels_across_nodes_and_does_not_fail_over(tmp_path):
+    asked, hung_up = threading.Event(), threading.Event()
+    fell_over = threading.Event()
+
+    class Silent(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            asked.set()
+            try:
+                self.connection.settimeout(10)
+                while self.connection.recv(65536):
+                    pass
+            except OSError:
+                pass
+            hung_up.set()
+            self.close_connection = True
+
+    class Other(_Fake):
+        def do_POST(self):
+            fell_over.set()
+            super().do_POST()
+
+    silent, other = _serve(Silent, "rtx"), _serve(Other, "orin")
+    lab, lab_srv = _node(tmp_path, "lab", 5, [], serve=True)
+    url = f"http://127.0.0.1:{lab.port}"
+    rtx, rtx_srv = _node(tmp_path, "rtx", 0, [_rec("quyet", silent.server_address[1])],
+                         registry_url=url)
+    orin, orin_srv = _node(tmp_path, "orin", 1, [_rec("quyet", other.server_address[1])],
+                           registry_url=url)
+    try:
+        for _ in range(2):
+            for g in (lab, rtx, orin):
+                g.heartbeat_once()
+        body = json.dumps({"model": "quyet", "stream": True}).encode()
+        # Through orin's gateway, to rtx's model: the better copy.
+        client = socket.create_connection(("127.0.0.1", orin.port), timeout=5)
+        client.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s"
+                       % (len(body), body))
+        assert asked.wait(3)
+        client.close()
+        assert hung_up.wait(3)
+        time.sleep(0.5)
+        assert not fell_over.is_set()
+    finally:
+        for s in (silent, other, lab_srv, rtx_srv, orin_srv):
+            s.shutdown()

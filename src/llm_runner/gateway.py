@@ -36,6 +36,7 @@ import os
 import re
 import uuid
 import secrets
+import select
 import signal
 import socket
 import threading
@@ -122,6 +123,8 @@ _STATE_OF = {"ready": "ready", "loading": "starting", "down": "down"}
 # for one whose engine says it is still loading.
 HELD_RETRY_AFTER = 30
 LOADING_RETRY_AFTER = 10
+# How long a watcher (_ClientWatch) outlives its request, at most. A hang-up wakes it at once.
+WATCH_EVERY_MS = 250
 # A client's X-Request-Id is kept when it is up to 128 visible ASCII characters.
 _REQUEST_ID = re.compile(r"[\x21-\x7e]{1,128}")
 # The flag carrying the context size in each engine's recorded command.
@@ -1281,6 +1284,7 @@ def make_handler(gw: Gateway):
                 host, port, timeout=10)
             gw.metrics.in_flight.add(1, **lbl)
             outcome = "error"
+            watch = None
             try:
                 replaced = {k.lower() for k in extra}
                 if "authorization" in replaced:
@@ -1294,10 +1298,13 @@ def make_handler(gw: Gateway):
                 try:
                     conn.connect()
                     conn.sock.settimeout(None)   # a long generation is not a hang
+                    watch = _ClientWatch(self.connection, conn.sock)
                     conn.request(self.command, path, body=body or None, headers=headers)
                     resp = conn.getresponse()
                     attempt.attrs["http.response.status_code"] = resp.status
                 except OSError as e:
+                    if watch is not None and watch.left:
+                        raise
                     attempt.attrs["error.type"] = type(e).__name__
                     where = f"port {port}" if c.local else \
                         f"node {c.node} (via {relay})" if relay else f"node {c.node} ({c.url})"
@@ -1349,10 +1356,26 @@ def make_handler(gw: Gateway):
                         return "failed"
                     self._relay(resp, data)
                     return "done"
-                self._relay(resp)
+                self._relay(resp, watch=watch)
+                outcome = "done"
+                return "done"
+            except (OSError, http.client.HTTPException):
+                if watch is None or not watch.left:
+                    raise
+                # Gone before any reply: nobody to answer, and no other node to try.
+                logs.emit(f"relay: client left: {self.command} {self.path} for "
+                          f"{self.address_string()} while waiting for the model",
+                          event="relay", level="warn", request_id=self._obs["rid"],
+                          side="client", bytes_out=0)
+                attempt.attrs["error.type"] = "client_left"
+                self._replied = True
+                self._obs["status"], self._obs["code"] = 499, "client_left"
+                self.close_connection = True
                 outcome = "done"
                 return "done"
             finally:
+                if watch is not None:
+                    watch.stop()
                 gw.metrics.in_flight.add(-1, **lbl)
                 conn.close()
                 if gw.exporter is not None and self._trace.exported:
@@ -1361,7 +1384,8 @@ def make_handler(gw: Gateway):
                     attempt.end()
                     gw.exporter.submit(attempt)
 
-        def _relay(self, resp: http.client.HTTPResponse, data: bytes | None = None) -> None:
+        def _relay(self, resp: http.client.HTTPResponse, data: bytes | None = None,
+                   watch: _ClientWatch | None = None) -> None:
             self._replied = True
             self._obs["status"] = resp.status
             ctype = (resp.getheader("Content-Type") or "").lower()
@@ -1395,6 +1419,9 @@ def make_handler(gw: Gateway):
                     chunk = resp.read1(65536)
                     side = "client"
                     if not chunk:
+                        if watch is not None and watch.left and not resp.chunked \
+                                and resp.length != 0:
+                            raise ConnectionAbortedError("client hung up")
                         break
                     if stream and self._obs["ttft"] is None:
                         self._obs["ttft"] = time.monotonic() - self._obs["t0"]
@@ -1412,6 +1439,8 @@ def make_handler(gw: Gateway):
                 if chunked:
                     self.wfile.write(b"0\r\n\r\n")
             except (OSError, http.client.HTTPException) as e:
+                if watch is not None and watch.left:
+                    side = "client"
                 # Either way the connection is done: a client that left gets
                 # nothing more, and one whose upstream broke sees the stream
                 # cut short. Closing upstream (in _try) stops generation.
@@ -1442,6 +1471,45 @@ def make_handler(gw: Gateway):
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _handle
 
     return Handler
+
+
+class _ClientWatch:
+    """Hangs up on the model as soon as the client does. A write is otherwise the
+    only way to learn a client left, so a request still queued, or a reply gone
+    silent, would keep the model's slot for nobody."""
+
+    def __init__(self, client: socket.socket, upstream: socket.socket):
+        self.left = False
+        self._client, self._upstream = client, upstream
+        self._done = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        poll = select.poll()
+        try:
+            poll.register(self._client, select.POLLIN)
+        except (OSError, ValueError):
+            return
+        while not self._done.is_set():
+            if not poll.poll(WATCH_EVERY_MS) or self._done.is_set():
+                continue
+            try:
+                # Peeked, not read: bytes here are the client's next request.
+                if self._client.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
+                    return
+            except BlockingIOError:
+                continue
+            except OSError:
+                pass
+            self.left = True
+            try:
+                self._upstream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
+
+    def stop(self) -> None:
+        self._done.set()
 
 
 class _Server(ThreadingHTTPServer):

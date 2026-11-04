@@ -4,6 +4,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -481,3 +482,184 @@ def test_a_real_socket_that_never_answers_reads_as_a_timeout(tmp_path, monkeypat
         local._answering[port] = (7, None)
         assert local.status(m, fresh=True) == "ready"
     assert local.status(m, fresh=True) == "down"        # closed: refused
+
+
+def test_real_sockets_read_loading_ready_then_down(tmp_path, monkeypatch):
+    class Health(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    with socket.socket() as free:
+        free.bind(("127.0.0.1", 0))
+        port = free.getsockname()[1]
+    monkeypatch.setattr(gw.config_mod, "local_url", lambda p, path="": f"http://127.0.0.1:{p}{path}")
+    local = gw.LocalModels(tmp_path / "running.json")
+    m = gw.Model("flux", 7, port, "omni", 0.0, "/m", ())
+    assert local.status(m, fresh=True) == "loading"     # nothing listening yet
+    server = ThreadingHTTPServer(("127.0.0.1", port), Health)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    assert local.status(m, fresh=True) == "ready"
+    server.shutdown()
+    server.server_close()
+    assert local.status(m, fresh=True) == "down"
+
+
+class _Silent:
+    """A model that takes a request and says nothing, or one reply and then
+    nothing; ``hung_up`` is set when the gateway closes its side."""
+
+    def __init__(self, first: bytes = b"", then: bytes | None = None, after: float = 0.0):
+        self.hung_up = threading.Event()
+        self.asked = threading.Event()
+        self._first, self._then, self._after = first, then, after
+        self._listen = socket.create_server(("127.0.0.1", 0))
+        self.port = self._listen.getsockname()[1]
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            conn, _ = self._listen.accept()
+            threading.Thread(target=self._one, args=(conn,), daemon=True).start()
+
+    def _one(self, conn):
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = conn.recv(65536)
+            if not chunk:
+                conn.close()
+                return
+            data += chunk
+        head, _, rest = data.partition(b"\r\n\r\n")
+        if head.startswith(b"GET "):        # the gateway's health probe
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            conn.close()
+            return
+        length = int(re.search(rb"(?i)content-length: (\d+)", head).group(1))
+        while len(rest) < length:
+            rest += conn.recv(65536)
+        self.asked.set()
+        if self._first:
+            conn.sendall(self._first)
+        if self._then is not None:
+            time.sleep(self._after)
+            conn.sendall(self._then)
+            conn.close()
+            return
+        conn.settimeout(10)
+        try:
+            while conn.recv(65536):
+                pass
+        except OSError:
+            pass
+        self.hung_up.set()
+        conn.close()
+
+
+SSE_HEAD = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n")
+PIECE = b"d\r\ndata: piece\n\n\r\n"
+END = b"0\r\n\r\n"
+ASK = {"model": "silent", "messages": [], "stream": True}
+
+
+@pytest.fixture
+def silent_on(tmp_path, monkeypatch):
+    """A gateway in front of a _Silent model, and the relay log lines."""
+    lines = []
+    real = gw.logs.emit
+    monkeypatch.setattr(gw.logs, "emit",
+                        lambda msg, **kw: (lines.append(msg), real(msg, **kw))[1])
+    servers = []
+
+    def start(model):
+        state = tmp_path / "running.json"
+        state.write_text(json.dumps([_record("silent", model.port)]))
+        httpd = gw.make_server(0, "127.0.0.1", gw.Gateway(gw.LocalModels(state)))
+        servers.append(httpd)
+        threading.Thread(target=httpd.serve_forever, args=(0.05,), daemon=True).start()
+        return httpd.server_address[1], lines
+
+    yield start
+    for s in servers:
+        s.shutdown()
+
+
+def _ask(port, extra=b""):
+    body = json.dumps(ASK).encode()
+    client = socket.create_connection(("127.0.0.1", port), timeout=5)
+    client.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                   b"Content-Length: %d\r\n\r\n%s%s" % (len(body), body, extra))
+    return client
+
+
+def _until_gone(client):
+    data = b""
+    while chunk := client.recv(65536):
+        data += chunk
+        if data.endswith(END):
+            break
+    return data
+
+
+def test_a_client_leaving_while_queued_hangs_up_on_the_model(silent_on):
+    model = _Silent()
+    port, lines = silent_on(model)
+    client = _ask(port)
+    assert model.asked.wait(3)
+    client.close()
+    assert model.hung_up.wait(3)
+    deadline = time.time() + 3
+    while not any("while waiting for the model" in x for x in lines) and time.time() < deadline:
+        time.sleep(0.02)
+    assert any("client left" in x and "while waiting for the model" in x for x in lines)
+
+
+def test_a_client_leaving_a_silent_reply_hangs_up_on_the_model(silent_on):
+    model = _Silent(SSE_HEAD + PIECE)
+    port, lines = silent_on(model)
+    client = _ask(port)
+    data = b""
+    while b"data: piece" not in data:
+        data += client.recv(65536)
+    client.close()
+    assert model.hung_up.wait(3)
+    deadline = time.time() + 3
+    while not any("client left" in x for x in lines) and time.time() < deadline:
+        time.sleep(0.02)
+    assert any("client left" in x for x in lines)
+    assert not any("upstream broke" in x for x in lines)
+
+
+def test_a_client_still_there_gets_the_reply_after_a_long_silence(silent_on):
+    wait = 3 * gw.WATCH_EVERY_MS / 1000
+    port, lines = silent_on(_Silent(SSE_HEAD + PIECE, PIECE + END, after=wait))
+    client = _ask(port)
+    data = _until_gone(client)
+    client.close()
+    assert data.count(b"data: piece") == 2
+    assert not any("client left" in x for x in lines)
+
+
+def test_bytes_from_the_client_are_not_a_hang_up(silent_on):
+    wait = 3 * gw.WATCH_EVERY_MS / 1000
+    port, lines = silent_on(_Silent(SSE_HEAD + PIECE, PIECE + END, after=wait))
+    client = _ask(port, extra=b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+    data = _until_gone(client)
+    assert data.count(b"data: piece") == 2
+    assert not any("client left" in x for x in lines)
+    client.settimeout(3)
+    assert b"200" in client.recv(65536)     # the next request wasn't eaten by the watcher
+    client.close()
+
+
+def test_a_finished_reply_is_not_called_a_cancel(silent_on):
+    port, lines = silent_on(_Silent(SSE_HEAD + PIECE + END, b""))
+    client = _ask(port)
+    assert _until_gone(client).endswith(END)
+    client.close()
+    time.sleep(2 * gw.WATCH_EVERY_MS / 1000)
+    assert not any("client left" in x for x in lines)

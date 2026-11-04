@@ -133,7 +133,9 @@ gateway then sends the request:
 ## Streaming and cancelling
 
 `"stream": true` works as usual: server-sent events pass through as they are
-generated. Closing the connection cancels the generation on the model server.
+generated. Closing the connection cancels the generation on the model server,
+or the request if it's still queued. A half-close (`shutdown(SHUT_WR)`) counts
+too, so keep the connection open for as long as you want the reply.
 
 ## Endpoints
 
