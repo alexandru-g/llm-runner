@@ -1,6 +1,13 @@
 {
   "schema": "llmctl-engines/1",
   "comment": "Host installs of the Python engines, at the versions this llmctl was tested with. `llmctl setup <backend>` installs them; container images are in images.json.",
+  "orin_compat": {
+    "comment": "CUDA 13 user-mode libraries for a Jetson Orin on JetPack 6, whose driver stops at 12.6.",
+    "version": "13.5",
+    "file": "cuda-compat-orin-13-5_13.5.47659993-1_arm64.deb",
+    "url": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-compat-orin-13-5_13.5.47659993-1_arm64.deb",
+    "sha256": "0f2bdb9116700b155b6eb632afac7ee54c373326735713d06cfee39a0210ee95"
+  },
   "engines": {
     "vllm": {
       "kind": "uv-tool",
@@ -10,7 +17,14 @@
       "packages": ["vllm==0.29.0"],
       "with": ["transformers==5.16.1"],
       "dist": "vllm",
-      "version": "0.29.0"
+      "version": "0.29.0",
+      "orin": {
+        "torch_backend": null,
+        "packages": ["vllm==0.33.0"],
+        "with": [],
+        "version": "0.33.0",
+        "image": {"tag": "llmctl/vllm-orin:0.33.0", "dockerfile": "vllm-orin", "uv": "0.12.17"}
+      }
     },
     "sglang": {
       "kind": "uv-tool",
@@ -29,7 +43,12 @@
       "torch_backend": "auto",
       "packages": ["vllm==0.30.0", "vllm-omni==0.30.0"],
       "dist": "vllm-omni",
-      "version": "0.30.0"
+      "version": "0.30.0",
+      "orin": {
+        "torch_backend": null,
+        "packages": ["vllm==0.32.0", "vllm-omni==0.32.0"],
+        "version": "0.32.0"
+      }
     },
     "onnx": {
       "kind": "venv",

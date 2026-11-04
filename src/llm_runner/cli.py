@@ -238,7 +238,8 @@ def _resolve_runtime(backend: str, kind: str | None, image: str | None,
     ref = image or (configured.get("image") if configured["kind"] == containers.DOCKER
                     else None) or containers.default_image(backend)
     if not ref:
-        raise click.UsageError(f"No image for {backend}: pass --image repo@sha256:… or "
+        raise click.UsageError(f"No image for {backend}: `llmctl setup {backend} --runtime docker`, "
+                               "--image repo@sha256:… or "
                                f"`llmctl config runtime {backend} docker --image …`.")
     if not containers.is_pinned(ref) and not allow_tag:
         raise click.UsageError(f"{ref} is not pinned by digest. Use repo@sha256:…, or "
@@ -4242,6 +4243,10 @@ def setup_cmd(backend: str | None, runtime_kind: str | None, upgrade: bool, cpu:
                      runtime setting
       llama, decider checked only: build or clone them (README, Install)
 
+    On a Jetson Orin with JetPack 6, vllm and omni take the versions tested
+    there and NVIDIA's CUDA 13 libraries, and vllm's image is built on the spot.
+    Nothing outside your home changes, and a GPU check runs at the end.
+
     A different installed version is left alone unless --upgrade.
     """
     from llm_runner import images
@@ -4272,7 +4277,8 @@ def setup_cmd(backend: str | None, runtime_kind: str | None, upgrade: bool, cpu:
         _require_online("setup")
     try:
         steps = (engines_mod.plan_image(backend, proc.STATE_DIR, cfg, archive=archive,
-                                        set_runtime=backend != TRITON) if docker else
+                                        set_runtime=backend != TRITON,
+                                        upgrade=upgrade) if docker else
                  engines_mod.plan_engine(backend, upgrade=upgrade, cpu=cpu,
                                          index_url=index_url, find_links=find_links))
     except engines_mod.SetupError as e:
@@ -4304,6 +4310,11 @@ def setup_cmd(backend: str | None, runtime_kind: str | None, upgrade: bool, cpu:
             except (bundle.BundleError, images.BadArchive) as e:
                 raise click.ClickException(str(e)) from None
             click.echo(f"loaded {result.get('ref')} as {result.get('image_id', '')[:19]}")
+        elif s.call is not None:
+            try:
+                s.call()
+            except engines_mod.SetupError as e:
+                raise click.ClickException(str(e)) from None
         elif s.config:
             runtimes = dict(config_mod.load().get("runtime") or {})
             runtimes.update(s.config["runtime"])
@@ -4331,6 +4342,14 @@ def _setup_verify(backend: str, docker: bool) -> None:
                        err=True)
     if row.state not in ("ok", "found"):
         raise click.ClickException(f"{backend} is still {row.state}.")
+    if "orin" in (engines_mod.pins().get(backend) or {}) and backends.is_orin_jetpack6():
+        configured = containers.runtime_from_config(backend, cfg)
+        try:
+            ran = engines_mod.check_gpu(backend, proc.STATE_DIR,
+                                        image=configured.get("image") if docker else None)
+        except engines_mod.SetupError as e:
+            raise click.ClickException(str(e)) from None
+        click.echo(f"GPU check passed: {ran}")
 
 
 def _card_front_matter(folder: Path) -> tuple[Path | None, dict]:

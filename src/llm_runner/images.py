@@ -100,6 +100,12 @@ def _record(state_dir: Path, ref: str, entry: dict) -> None:
     os.replace(tmp, path)
 
 
+def record_built(state_dir: Path, ref: str, image_id: str) -> None:
+    """Remember a local build under ``ref``, so it is run by ID on a store that
+    gives it no digest of that name."""
+    _record(state_dir, ref, {"platform": host_platform(), "image_id": image_id})
+
+
 def shipped_entry(ref: str) -> dict | None:
     """The ``images.json`` entry pinned to the same index digest as ``ref``."""
     digest = containers.pinned_digest(ref)

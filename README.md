@@ -98,6 +98,10 @@ sections below describe, at the versions pinned in `engines.json`:
 - `llama`, `decider`: checked only. Build llama.cpp and clone decider as
   below.
 
+On a Jetson Orin with JetPack 6, `vllm` and `omni` take the versions tested there
+and NVIDIA's CUDA 13 libraries (see [vLLM on a Jetson
+Orin](#vllm-and-omni-on-a-jetson-orin)).
+
 An engine already installed at another version is left alone; `--upgrade`
 installs the tested one. `--find-links DIR` installs from local wheels,
 offline. uv comes from `~/.local/bin` first, then `PATH`.
@@ -1479,6 +1483,48 @@ The image and its digest are reported in `ps`, in `/v1/models` (the
 `llmctl` object's `runtime`, `image`, `image_digest` and `image_id`, per node
 too), in the first lines of the model's log, and in the gateway's log when it
 starts routing to the model.
+
+### vLLM and Omni on a Jetson Orin
+
+PyPI's torch and vLLM are built against CUDA 13, and JetPack 6's driver stops at
+12.6. NVIDIA's `cuda-compat-orin` package runs CUDA 13's user-mode libraries on
+that kernel driver, so the wheels work without a reflash, root or any change to
+the host's CUDA. `llmctl setup` handles all of it on an Orin with JetPack 6:
+
+```bash
+llmctl setup vllm                  # vLLM 0.33 as a uv tool
+llmctl setup omni                  # vLLM-Omni 0.32 in ~/.venvs/vllm-omni
+llmctl setup vllm --runtime docker # or vLLM in a container, built on the Orin
+```
+
+Each one unpacks the package under `~/.local/share/llm-runner/cuda-compat-orin`
+(checked against the SHA256 in `engines.json`), installs the versions tested
+there, and ends by running a tensor operation on the GPU, because a torch with no
+kernels for a GPU still reports CUDA as available. `llmctl run` then puts those
+libraries on `LD_LIBRARY_PATH` for vLLM and Omni only. llama.cpp and everything
+else keep the host's CUDA 12.6.
+
+The container route builds `llmctl/vllm-orin:<version>` from the Dockerfile
+shipped with llmctl (about 8 minutes, a 14.7 GB image) and pins the runtime to it
+by ID. There's no published image that runs on an Orin. An offline host can use
+`--find-links DIR` for the host install, with the wheels and the `.deb` in `DIR`.
+Omni has no container runtime.
+
+`nvidia-smi` reports no memory on a Jetson, so llmctl sizes vLLM and Omni from
+`/proc/meminfo`, leaving 6 GiB more than elsewhere: the memory is shared with the
+system, and CUDA counts less of it as free than `MemAvailable` does.
+
+vLLM's native kernels include `sm_87`, the Orin's architecture, but torch's don't,
+so CUDA compiles those from PTX when they first launch. FlashInfer's kernels stay
+disabled. Measured on a 64 GB AGX Orin:
+
+| model | result |
+|---|---|
+| `gemma-4-12b-it-qat-w4a16-ct` (vLLM, 4-bit, Marlin kernels) | 18 t/s decode, about 1,000 t/s prefill; image input works |
+| `qwen3-0.6b` (vLLM) | 112 t/s decode, about 12,000 t/s prefill |
+| `flux.2-klein-4b` (Omni, 4 steps) | 8.6 s for 1024×1024, 2.9 s for 512×512, on the GPU with no offload; edits work |
+
+Speculative decoding, tool calling and larger models haven't been tried there.
 
 ### Images on hosts without a registry
 

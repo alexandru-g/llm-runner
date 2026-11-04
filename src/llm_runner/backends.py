@@ -109,11 +109,33 @@ SGLANG_ENV = {"SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0"}
 
 def launch_env(offline: bool, backend: str | None = None) -> dict[str, str]:
     """The environment llmctl sets for ``backend`` (``-E`` still wins): no
-    telemetry, offline mode, and for vllm/sglang the CUDA toolchain their
-    kernel JIT compiles with (:func:`toolchain_env`)."""
+    telemetry, offline mode, for vllm/sglang the CUDA toolchain their kernel
+    JIT compiles with (:func:`toolchain_env`), and what vLLM needs on an Orin
+    or with a cache folder it can't write."""
     return {**NO_TELEMETRY_ENV, **(OFFLINE_ENV if offline else {}),
             **(toolchain_env() if backend in PY_ENGINES else {}),
+            **(_orin_compat_env() if backend in PY_ENGINES else {}),
+            **(_vllm_cache_env() if backend in (VLLM, OMNI) else {}),
             **(SGLANG_ENV if backend == SGLANG else {})}
+
+
+def _orin_compat_env() -> dict[str, str]:
+    """CUDA 13's user-mode libraries first, where ``llmctl setup`` put them."""
+    compat = orin_compat_dir() if is_orin_jetpack6() else None
+    if compat is None:
+        return {}
+    inherited = os.environ.get("LD_LIBRARY_PATH")
+    return {"LD_LIBRARY_PATH": f"{compat}:{inherited}" if inherited else str(compat)}
+
+
+def _vllm_cache_env() -> dict[str, str]:
+    """A cache folder of its own when vLLM's default exists but can't be written
+    (left by a run as root): vLLM would stop at its first compile otherwise."""
+    root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    default = root / "vllm"
+    if not default.exists() or os.access(default, os.W_OK):
+        return {}
+    return {"VLLM_CACHE_ROOT": str(root / "llm-runner" / "vllm")}
 
 
 def with_bind_host(cmd: list[str], backend: str, host: str) -> list[str]:
@@ -642,6 +664,27 @@ def is_jetson() -> bool:
     return Path("/etc/nv_tegra_release").exists()
 
 
+def is_orin_jetpack6() -> bool:
+    """A Jetson Orin on JetPack 6 (L4T r36): its driver stops at CUDA 12.6, while
+    PyPI's torch and vLLM need 13 (``cuda-compat-orin`` closes the gap)."""
+    try:
+        return Path("/etc/nv_tegra_release").read_text().startswith("# R36")
+    except OSError:
+        return False
+
+
+def orin_compat_root() -> Path:
+    """Where ``llmctl setup`` unpacks ``cuda-compat-orin``."""
+    xdg = os.environ.get("XDG_DATA_HOME")
+    data = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+    return data / "llm-runner" / "cuda-compat-orin"
+
+
+def orin_compat_dir() -> Path | None:
+    """The folder of CUDA 13's libraries, when they have been unpacked."""
+    return next(iter(sorted(orin_compat_root().glob("usr/local/cuda-*/compat_orin"))), None)
+
+
 def health_path(backend: str) -> str:
     """The path that answers 200 once ``backend``'s server is ready: Triton
     has only KServe's; every other server (llmctl's onnx server too) has
@@ -652,7 +695,8 @@ def health_path(backend: str) -> str:
 # -------------------------------------------------------------- vllm argv --
 
 def gpu_memory_mib(device: int = 0) -> tuple[int, int] | None:
-    """(free, total) MiB for ``device`` via nvidia-smi, or None if unavailable."""
+    """(free, total) MiB for ``device`` via nvidia-smi, or None if unavailable.
+    A Jetson's nvidia-smi reports no memory: its GPU shares the system's."""
     import subprocess
     try:
         out = subprocess.run(
@@ -662,6 +706,17 @@ def gpu_memory_mib(device: int = 0) -> tuple[int, int] | None:
         free, total = (int(x) for x in out.strip().splitlines()[0].split(","))
         return free, total
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return _system_memory_mib() if is_jetson() else None
+
+
+def _system_memory_mib() -> tuple[int, int] | None:
+    """(available, total) MiB from /proc/meminfo."""
+    try:
+        info = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines()
+                    if ":" in line)
+        return (int(info["MemAvailable"].split()[0]) // 1024,
+                int(info["MemTotal"].split()[0]) // 1024)
+    except (OSError, ValueError, KeyError, IndexError):
         return None
 
 
@@ -683,6 +738,11 @@ VLLM_DEFAULT_GPU_MEM = 0.9
 _GPU_MEM_POLICY = {VLLM: (1536, VLLM_DEFAULT_GPU_MEM), SGLANG: (3072, 0.88)}
 
 
+# A Jetson's memory is shared with the system, and MemAvailable counts page cache
+# CUDA doesn't see as free: 55.8 GiB available was 53.3 GiB to vLLM on an Orin.
+_JETSON_EXTRA_HEADROOM_MIB = 6144
+
+
 def default_gpu_mem(backend: str = VLLM) -> tuple[float, str] | None:
     """Pick ``backend``'s GPU memory fraction from the free VRAM right now.
 
@@ -696,6 +756,8 @@ def default_gpu_mem(backend: str = VLLM) -> tuple[float, str] | None:
         return None
     free, total = mem
     headroom, cap = _GPU_MEM_POLICY[backend]
+    if is_jetson():
+        headroom += _JETSON_EXTRA_HEADROOM_MIB
     usable = max(free - headroom, 0)
     frac = min(cap, int(usable / total * 100) / 100)
     frac = max(frac, 0.05)

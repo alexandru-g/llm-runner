@@ -96,6 +96,8 @@ def image_key(backend: str) -> str:
 
 
 def default_image(backend: str) -> str | None:
+    if backend == VLLM and backends.is_orin_jetpack6():
+        return None         # the published image can't run there; `llmctl setup` builds one
     entry = expected_images().get(image_key(backend))
     return entry.get("image") if isinstance(entry, dict) else None
 

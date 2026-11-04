@@ -226,3 +226,248 @@ def test_engines_json_pins_every_installable_engine():
         assert any(p["version"] in pkg for pkg in p["packages"]), name
     assert json.loads(Path(engines.__file__).with_name("engines.json").read_text())[
         "schema"] == "llmctl-engines/1"
+
+
+# ------------------------------------------------------- Jetson Orin, JetPack 6 --
+
+def _deb() -> dict:
+    return engines._manifest()["orin_compat"]
+
+
+@pytest.fixture
+def orin(host, monkeypatch):
+    monkeypatch.setattr(backends, "is_jetson", lambda: True)
+    monkeypatch.setattr(backends, "is_orin_jetpack6", lambda: True)
+    monkeypatch.setattr(backends, "host_compiler",
+                        lambda max_major: ("/usr/bin/gcc", "/usr/bin/g++"))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    return host
+
+
+def _unpacked(host) -> Path:
+    d = host.home / ".local/share/llm-runner/cuda-compat-orin/usr/local/cuda-13.5/compat_orin"
+    d.mkdir(parents=True)
+    return d
+
+
+def test_orin_takes_its_own_versions_and_no_torch_backend(orin):
+    steps = engines.plan_engine("vllm", gpu=True)
+    assert "CUDA 13.5" in steps[0].what and steps[0].call is not None
+    argv = steps[1].argv
+    assert "vllm==0.33.0" in argv and "--torch-backend" not in argv and "--with" not in argv
+    argv = engines.plan_engine("omni")[-1].argv
+    assert "vllm==0.32.0" in argv and "vllm-omni==0.32.0" in argv
+    assert "--torch-backend" not in argv
+
+
+def test_other_hosts_keep_their_pins(host):
+    argv = engines.plan_engine("vllm")[0].argv
+    assert "vllm==0.29.0" in argv and "--torch-backend" in argv
+    assert not any(s.call for s in engines.plan_engine("omni"))
+
+
+def test_sglang_and_onnx_get_no_compat_on_an_orin(orin):
+    assert not any(s.call for s in engines.plan_engine("sglang"))
+    assert not any(s.call for s in engines.plan_engine("onnx", gpu=True, jetson=True))
+
+
+def test_orin_engine_in_place_but_no_compat_only_adds_it(orin):
+    orin.found["vllm"] = str(_venv(orin.home / ".local/share/uv/tools/vllm",
+                                   "vllm==0.33.0") / "bin" / "vllm")
+    row = engines._engine_status("vllm")
+    assert row.state == "configure" and row.tested == "0.33.0"
+    steps = engines.plan_engine("vllm")
+    assert len(steps) == 1 and steps[0].call is not None
+    _unpacked(orin)
+    assert engines._engine_status("vllm").state == "ok"
+    assert engines.plan_engine("vllm") == []
+
+
+def test_orin_without_a_compiler_is_told_before_installing(orin, monkeypatch):
+    monkeypatch.setattr(backends, "host_compiler", lambda max_major: None)
+    with pytest.raises(engines.SetupError, match="build-essential"):
+        engines.plan_engine("vllm")
+
+
+def _fake_dpkg(monkeypatch):
+    def run(argv, **kw):
+        assert argv[:2] == ["dpkg-deb", "-x"]
+        (Path(argv[3]) / "usr/local/cuda-13.5/compat_orin").mkdir(parents=True)
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(engines.subprocess, "run", run)
+
+
+def test_compat_is_taken_offline_checked_and_unpacked(orin, tmp_path, monkeypatch):
+    import hashlib
+    links = tmp_path / "links"
+    links.mkdir()
+    (links / _deb()["file"]).write_bytes(b"package")
+    monkeypatch.setitem(_deb(), "sha256", hashlib.sha256(b"package").hexdigest())
+    _fake_dpkg(monkeypatch)
+    engines.install_orin_compat(links)
+    assert backends.orin_compat_dir().name == "compat_orin"
+    assert [p.name for p in backends.orin_compat_root().parent.iterdir()] == ["cuda-compat-orin"]
+
+
+def test_a_compat_package_with_the_wrong_checksum_is_refused(orin, tmp_path, monkeypatch):
+    links = tmp_path / "links"
+    links.mkdir()
+    (links / _deb()["file"]).write_bytes(b"tampered")
+    _fake_dpkg(monkeypatch)
+    with pytest.raises(engines.SetupError, match="SHA256"):
+        engines.install_orin_compat(links)
+    assert backends.orin_compat_dir() is None
+
+
+def test_compat_missing_from_the_offline_folder_says_so(orin, tmp_path):
+    with pytest.raises(engines.SetupError, match="can't get"):
+        engines.install_orin_compat(tmp_path)
+
+
+def test_launch_env_on_an_orin_only_touches_vllm_and_omni(orin, monkeypatch):
+    compat = _unpacked(orin)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/inherited")
+    assert backends.launch_env(False, "vllm")["LD_LIBRARY_PATH"] == f"{compat}:/inherited"
+    assert backends.launch_env(False, "omni")["LD_LIBRARY_PATH"] == f"{compat}:/inherited"
+    assert "LD_LIBRARY_PATH" not in backends.launch_env(False, "llama")
+    assert "LD_LIBRARY_PATH" not in backends.launch_env(False, "onnx")
+
+
+def test_launch_env_elsewhere_has_no_compat(host):
+    _unpacked(host)
+    assert "LD_LIBRARY_PATH" not in backends.launch_env(False, "vllm")
+
+
+def test_a_cache_vllm_cannot_write_gets_replaced(host, monkeypatch):
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    assert "VLLM_CACHE_ROOT" not in backends.launch_env(False, "vllm")
+    cache = host.home / ".cache" / "vllm"
+    cache.mkdir(parents=True)
+    assert "VLLM_CACHE_ROOT" not in backends.launch_env(False, "vllm")
+    monkeypatch.setattr(backends.os, "access", lambda p, mode: False)
+    want = str(host.home / ".cache" / "llm-runner" / "vllm")
+    assert backends.launch_env(False, "vllm")["VLLM_CACHE_ROOT"] == want
+    assert backends.launch_env(False, "omni")["VLLM_CACHE_ROOT"] == want
+    assert "VLLM_CACHE_ROOT" not in backends.launch_env(False, "llama")
+
+
+def test_jetson_memory_comes_from_meminfo_when_smi_has_none(monkeypatch):
+    monkeypatch.setattr(backends, "is_jetson", lambda: True)
+    monkeypatch.setattr(backends, "_system_memory_mib", lambda: (50000, 62828))
+
+    def smi(*a, **k):
+        return SimpleNamespace(stdout="[N/A], [N/A]\n")
+
+    monkeypatch.setattr("subprocess.run", smi)
+    assert backends.gpu_memory_mib() == (50000, 62828)
+    # (50000 - 1536 - 6144) / 62828: the system shares this memory.
+    assert backends.default_gpu_mem("vllm")[0] == 0.67
+
+
+def test_system_memory_parses_meminfo():
+    free, total = backends._system_memory_mib()
+    assert 0 < free <= total
+
+
+TAG = "llmctl/vllm-orin:0.33.0"
+BUILT = "sha256:" + "c" * 64
+
+
+def test_orin_builds_its_image_and_pins_it_by_id(orin, monkeypatch):
+    present: dict[str, dict] = {}
+    monkeypatch.setattr(containers, "inspect_image", lambda ref: present.get(ref))
+    monkeypatch.setattr(cli.images, "local_image", lambda ref, state: (ref, ref))
+    steps = engines.plan_image("vllm", proc.STATE_DIR, {})
+    assert len(steps) == 2 and "build" in steps[0].what
+    argv = steps[0].argv
+    assert argv[:4] == ["/usr/bin/docker", "build", "-t", TAG]
+    assert "VLLM_VERSION=0.33.0" in argv and f"COMPAT_SHA256={_deb()['sha256']}" in argv
+    assert (Path(argv[-1]) / "Dockerfile").is_file()
+
+    present[TAG] = {"Id": BUILT}
+    steps[1].call()
+    ref = f"llmctl/vllm-orin@{BUILT}"
+    assert orin.cfg["runtime"]["vllm"] == {"kind": "docker", "image": ref}
+    assert containers.is_pinned(ref)
+    assert cli.images.loaded(proc.STATE_DIR)[ref]["image_id"] == BUILT
+    assert engines.plan_image("vllm", proc.STATE_DIR, orin.cfg) == []
+    row = engines.image_status("vllm", proc.STATE_DIR, orin.cfg["runtime"]["vllm"])
+    assert (row.state, row.version, row.where) == ("ok", "0.33.0", TAG)
+
+
+def test_orin_image_present_is_not_rebuilt_unless_upgrading(orin, monkeypatch):
+    monkeypatch.setattr(containers, "inspect_image", lambda ref: {"Id": BUILT})
+    monkeypatch.setattr(cli.images, "local_image", lambda ref, state: (ref, ref))
+    steps = engines.plan_image("vllm", proc.STATE_DIR, {})
+    assert len(steps) == 1 and steps[0].call is not None
+    assert "build" in engines.plan_image("vllm", proc.STATE_DIR, {}, upgrade=True)[0].argv
+
+
+def test_orin_has_no_published_vllm_image(orin, monkeypatch):
+    assert containers.default_image("vllm") is None
+    assert containers.default_image("llama") is not None
+    with pytest.raises(engines.SetupError, match="no archive"):
+        engines.plan_image("vllm", proc.STATE_DIR, {}, archive=Path("x.tar"))
+    row = engines.image_status("vllm", proc.STATE_DIR, {})
+    assert row.state == "missing" and "--runtime docker" in row.note
+
+
+def test_setup_on_an_orin_ends_with_a_gpu_check(orin, monkeypatch):
+    tool = _venv(orin.home / ".local/share/uv/tools/vllm", "vllm==0.33.0")
+    orin.found["vllm"] = str(tool / "bin" / "vllm")
+    (tool / "bin" / "vllm").write_text("")
+    _unpacked(orin)
+    calls = []
+    monkeypatch.setattr(engines, "plan_engine",
+                        lambda *a, **k: [engines.Step("x", call=lambda: None)])
+
+    def run(argv, **kw):
+        calls.append((argv, kw.get("env")))
+        return SimpleNamespace(returncode=0, stdout="2.14.0+cu130 Orin 64\n", stderr="")
+
+    monkeypatch.setattr(engines.subprocess, "run", run)
+    monkeypatch.setattr(engines, "status", lambda *a: [engines.Status("vllm", "ok")])
+    r = CliRunner().invoke(cli.cli, ["setup", "vllm", "-y"])
+    assert r.exit_code == 0, r.output
+    assert "GPU check passed: 2.14.0+cu130 Orin 64" in r.output
+    assert calls[0][0][0] == str(tool / "bin" / "python")
+    assert "compat_orin" in calls[0][1]["LD_LIBRARY_PATH"]
+
+
+def test_a_failed_gpu_check_fails_setup(orin, monkeypatch):
+    orin.found["omni"] = str(_venv(orin.home / ".venvs/vllm-omni", "vllm-omni==0.32.0")
+                             / "bin" / "vllm")
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return SimpleNamespace(returncode=1, stdout="", stderr="CUDA error: no kernel image\n")
+
+    monkeypatch.setattr(engines.subprocess, "run", run)
+    with pytest.raises(engines.SetupError, match="no kernel image"):
+        engines.check_gpu("omni", proc.STATE_DIR)
+    assert "import vllm_omni" in calls[0][-1]
+
+
+def test_gpu_check_of_an_image_runs_it(orin, monkeypatch):
+    monkeypatch.setattr(containers, "gpu_args", lambda g: ["--gpus", "all"])
+    monkeypatch.setattr(cli.images, "local_image", lambda ref, state: ("byid", "byid"))
+    seen = {}
+
+    def run(argv, **kw):
+        seen["argv"] = argv
+        return SimpleNamespace(returncode=0, stdout="2.14.0+cu130 Orin 64\n", stderr="")
+
+    monkeypatch.setattr(engines.subprocess, "run", run)
+    engines.check_gpu("vllm", proc.STATE_DIR, image="llmctl/vllm-orin@" + BUILT)
+    assert seen["argv"][:2] == ["/usr/bin/docker", "run"]
+    assert "byid" in seen["argv"] and "--gpus" in seen["argv"]
+
+
+def test_the_dockerfile_ships_in_the_package():
+    pin = engines.pins()["vllm"]["orin"]["image"]
+    folder = Path(engines.__file__).with_name("docker") / pin["dockerfile"]
+    text = (folder / "Dockerfile").read_text()
+    for arg in ("VLLM_VERSION", "UV_VERSION", "COMPAT_URL", "COMPAT_SHA256"):
+        assert f"ARG {arg}" in text
+    assert "g++" in text
