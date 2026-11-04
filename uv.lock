@@ -178,6 +178,7 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "huggingface-hub" },
+    { name = "prompt-toolkit" },
     { name = "pyyaml" },
     { name = "questionary" },
 ]
@@ -194,6 +195,7 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.1" },
     { name = "huggingface-hub", specifier = ">=0.24" },
+    { name = "prompt-toolkit", specifier = ">=3.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "questionary", specifier = ">=2.0" },
 ]

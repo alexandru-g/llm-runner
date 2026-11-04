@@ -456,6 +456,10 @@ def _request(t: Target, path: str, body: dict, timeout: float = 900.0):
     req = urllib.request.Request(_url(t, path), data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"},
                                  method="POST")
+    return _open(t, req, timeout)
+
+
+def _open(t: Target, req: urllib.request.Request, timeout: float):
     try:
         return urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:

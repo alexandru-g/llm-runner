@@ -2194,6 +2194,140 @@ def speedtest(identifiers: tuple[str, ...], profile: str | None, menu: bool | No
         sys.exit(1)
 
 
+def _chat_target(identifier: str | None, can_ask: bool, port: int | None):
+    """NAME, NAME@NODE or a local PID if given; else the only model in the cluster
+    that can chat, or a picker."""
+    from llm_runner import chat as chat_mod
+
+    entries = chat_mod.models_on(port)
+    if identifier is not None:
+        local = proc.find(identifier) if identifier.isdigit() else None
+        return chat_mod.resolve(entries, local.name if local else identifier)
+    if not entries:
+        raise click.UsageError("No running models.")
+    able = chat_mod.choices(entries)
+    if not able:
+        raise click.UsageError(
+            "None of the running models can chat:\n"
+            + "\n".join(f"  {e['id']}: {chat_mod.refusal(e)}" for e in entries
+                        if chat_mod.refusal(e)))
+    if len(able) == 1:
+        return able[0]
+    if not can_ask:
+        raise click.UsageError("Several models can chat; name one: "
+                               + ", ".join(m.ref for m in able) + ".")
+    return _pick_chat_model_interactively(able)
+
+
+@cli.command()
+@click.argument("identifier", required=False, metavar="[NAME]")
+@click.option("--message", "-m", default=None, metavar="TEXT",
+              help="Send one message, print the answer and exit. Piped stdin does "
+                   "the same.")
+@click.option("--system", "-s", default=None, metavar="TEXT",
+              help="Text models: the system prompt.")
+@click.option("--temperature", "-t", type=float, default=None,
+              help="Text models: sampling temperature.")
+@click.option("--max-tokens", type=click.IntRange(1), default=None,
+              help="Text models: longest reply, in tokens.")
+@click.option("--size", default=None, metavar="WxH",
+              help="Images: image size, e.g. 1024x1024 (default: the model's).")
+@click.option("--steps", type=click.IntRange(1, 1000), default=None,
+              help="Images: denoising steps (default: the model's).")
+@click.option("--negative", default=None, metavar="TEXT",
+              help="Images: what to keep out of the image.")
+@click.option("--image", "references", multiple=True,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path), metavar="FILE",
+              help="Images: a reference image, which makes prompts edits. Repeatable.")
+@click.option("--out", "-o", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Images: folder for the images (default: the current one).")
+@click.option("--open/--no-open", "preview", default=None,
+              help="Images: open each one in the default viewer. On by default when "
+                   "the output is a terminal and there's a desktop.")
+@click.option("--seed", type=int, default=None,
+              help="Fix the seed (images: otherwise a new one per prompt, printed).")
+@click.option("--set", "assignments", multiple=True, metavar="KEY=VALUE",
+              help="Any other request field, e.g. --set top_p=0.9. Repeatable.")
+def chat(identifier: str | None, message: str | None, system: str | None,
+         temperature: float | None, max_tokens: int | None, size: str | None,
+         steps: int | None, negative: str | None, references: tuple[Path, ...],
+         out: Path | None, preview: bool | None, seed: int | None,
+         assignments: tuple[str, ...]) -> None:
+    """Chat with a running model anywhere in the cluster, in the terminal.
+
+    Text models stream their replies and keep the conversation. Image models
+    (omni) take each message as a prompt, save the images here, wherever the model
+    runs, and open them in the default viewer; reference images turn prompts into
+    edits. Decision, embedding and CV models don't chat.
+
+    With no NAME: the only model that can chat, or a picker. NAME@NODE keeps it to
+    one node. Requests go through this machine's gateway. /help lists the commands
+    inside the chat.
+    """
+    from llm_runner import chat as chat_mod
+    from llm_runner import speedtest as st
+
+    piped = message is None and not sys.stdin.isatty()
+    port = config_mod.get_gateway_port()
+    target = _chat_target(identifier, sys.stdin.isatty(), port)
+    if target.status != "ready":
+        # Only a hint: a model busy generating an image can miss the gateway's
+        # health probe and read as down. The gateway answers if it really is.
+        click.echo(f"note: the gateway reports {target.id} on {target.node} as "
+                   f"{target.status}; trying anyway.", err=True)
+
+    params: dict = {}
+    if seed is not None:
+        params["seed"] = seed
+    for item in assignments:
+        key, eq, value = item.partition("=")
+        if not eq or not key:
+            raise click.BadOptionUsage("--set", f"--set takes KEY=VALUE, not '{item}'")
+        params[key] = chat_mod.parse_value(value)
+    if size is not None:
+        try:
+            w_, h_ = st.parse_image_size(size)
+        except ValueError:
+            raise click.BadOptionUsage("--size", f"--size takes WxH like 1024x1024, not '{size}'")
+        size = f"{w_}x{h_}"
+
+    is_image = target.kind == st.IMAGE
+    other_kind = (dict(system=system, temperature=temperature, max_tokens=max_tokens)
+                  if is_image else
+                  dict(size=size, steps=steps, negative=negative, out=out,
+                       image=references or None, open=preview))
+    for k, v in other_kind.items():
+        if v is not None:
+            click.echo(f"note: --{k.replace('_', '-')} doesn't apply to {target.id} "
+                       f"({target.kind}); ignored.", err=True)
+    try:
+        if is_image:
+            params |= {k: v for k, v in dict(size=size, steps=steps, negative=negative).items()
+                       if v is not None}
+            if preview and chat_mod.opener() is None:
+                click.echo("note: no desktop here to open images on (or no xdg-open); "
+                           "they are only saved.", err=True)
+            show = sys.stdout.isatty() if preview is None else preview
+            session = chat_mod.ImageSession(target, port, params, out, list(references),
+                                            preview=show)
+        else:
+            params |= {k: v for k, v in dict(temperature=temperature,
+                                             max_tokens=max_tokens).items() if v is not None}
+            session = chat_mod.TextSession(target, port, params, system)
+    except ValueError as e:
+        raise click.BadOptionUsage("--set", str(e))
+
+    if piped:
+        message = sys.stdin.read().strip()
+        if not message:
+            raise click.UsageError("Nothing on stdin to send.")
+    if message is not None:
+        if not session.send(message):
+            sys.exit(1)
+        return
+    chat_mod.repl(session)
+
+
 def _st_flags(values: dict) -> str:
     """A speedtest profile's values as the flags they stand for."""
     flag = {"prompt": "--prompt-tokens", "gen": "--gen", "concurrency": "--concurrency",
@@ -3276,6 +3410,34 @@ def _pick_instances_interactively(running: list[proc.RunningProcess]
         validate=lambda picked: bool(picked) or "select at least one with space",
     ).ask()
     if not selected:
+        raise click.Abort()
+    return selected
+
+
+def _pick_chat_model_interactively(models: list):
+    try:
+        import questionary
+    except ImportError as e:
+        raise click.UsageError(
+            "questionary not installed. Pass a NAME explicitly."
+        ) from e
+    name_w = max(len(m.id) for m in models)
+    node_w = max(len(m.node) for m in models)
+    choices = [
+        questionary.Choice(
+            title=f"{m.id:<{name_w}}  {m.node:<{node_w}}  {m.backend:<7}  {m.kind:<5}"
+                  + (f"  owner={m.owner}" if m.owner else "")
+                  + (f"  ({m.status})" if m.status != "ready" else ""),
+            value=m,
+        )
+        for m in models
+    ]
+    selected = questionary.select(
+        "Select a model to chat with:",
+        choices=choices,
+        use_shortcuts=False,
+    ).ask()
+    if selected is None:
         raise click.Abort()
     return selected
 

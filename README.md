@@ -1034,21 +1034,57 @@ decision endpoint), `speedtest` asks before running, or refuses without
 
 ### Chatting with a running model
 
-`llama-server` already exposes a built-in web chat UI at
-`http://localhost:<port>` — just open the port `llmctl ps` shows. For a
-terminal-native option, [aichat](https://github.com/sigoden/aichat) speaks
-the OpenAI-compatible API:
-
-```yaml
-# ~/.config/aichat/config.yaml
-clients:
-  - type: openai-compatible
-    name: local
-    api_base: http://localhost:8080/v1
-    models:
-      - name: local
-model: local:local
+```bash
+llmctl chat                        # auto-pick if 1 can chat; picker if many
+llmctl chat qwen3.5-4b -s "Answer briefly." -t 0.2
+llmctl chat qwen3.5-4b@orin        # keep it to one node
+llmctl chat qwen3.5-4b -m "Name three rivers." > rivers.txt   # one message, then exit
+git diff | llmctl chat qwen3.5-4b  # piped stdin is one message too
+llmctl chat flux.1-dev --size 768x768 --steps 20 -o ~/images
+llmctl chat flux.2-klein-4b --image photo.png -m "make the sky stormy"
 ```
+
+`chat` goes through this machine's gateway, like any client, so it reaches every
+model in the cluster, and needs the gateway running (`llmctl gateway start`). What
+a message does depends on the model:
+
+| model | a message |
+|---|---|
+| chat (llama, vllm, sglang) | streams the reply and keeps the conversation. Reasoning shows dimmed and isn't sent back. Tokens and speed follow each reply |
+| image pipeline (omni) | is a fresh prompt. The images are saved to `--out` (default: the current folder), their paths printed with the seed used, and they open in your default viewer. With reference images (`--image`, `/image FILE`), prompts become edits |
+
+Decision endpoints and models, embedding servers and CV models don't chat, so
+the picker leaves them out, and naming one says why.
+
+The picker lists every model in the cluster with its node, this machine's first.
+A model on two nodes gets a row for each, and the row you pick stays on that node.
+A plain NAME goes wherever the gateway routes it, and can fail over to another node.
+Images are saved on the machine running `llmctl chat`, wherever the model runs, and
+open there too: with `xdg-open` (`open` on macOS), when the output is a terminal and
+there's a desktop. Over plain SSH they are only saved. `--no-open` turns it off, and
+`--open` turns it on when the output isn't a terminal.
+These calls count in the gateway's metrics and traces like any others; traces
+carry metadata only, never a prompt or reply.
+
+In the chat, Enter sends and Alt+Enter starts a new line. Ctrl-C
+stops a reply, which also cancels it on the server, and what came so far stays
+in the conversation. Ctrl-D leaves. `/help` lists the commands:
+
+| command | what it does |
+|---|---|
+| `/clear` | text: forget the conversation |
+| `/retry` | answer the last message again (images: a new seed, unless one is set) |
+| `/system [TEXT]` | text: show or replace the system prompt |
+| `/image [FILE]` | images: add a reference image; with no FILE, drop them all |
+| `/set KEY VALUE`, `/unset KEY` | send any request field with every message, e.g. `/set top_p 0.9`. For images, `steps`, `negative`, `guidance` and `cfg` stand for `num_inference_steps`, `negative_prompt`, `guidance_scale` and `true_cfg_scale`. `--set KEY=VALUE` does the same from the command line |
+| `/exit` | leave |
+
+To send a message that starts with `/`, type `//`. The reply goes to stdout and
+everything else (reasoning, numbers, notes) to stderr, so redirecting keeps just
+the answer. A one-shot exits with 1 when it gets no complete answer.
+
+`llama-server` also has its own web chat UI at `http://localhost:<port>`: open
+the port `llmctl ps` shows.
 
 ### Decision endpoints with `llmctl decide`
 
