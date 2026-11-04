@@ -323,7 +323,10 @@ class LocalModels:
         except urllib.error.HTTPError:
             state = "loading"        # llama-server answers 503 while it loads
         except (OSError, ValueError) as e:
-            state = "ready" if sup_mod.timed_out(e) and self._busy_not_stuck(m, now) else "down"
+            if self._answering.get(m.port, (None, None))[0] != m.pid:
+                state = "loading"    # alive, and vLLM and Omni don't listen until they've loaded
+            else:
+                state = "ready" if sup_mod.timed_out(e) and self._busy_not_stuck(m, now) else "down"
         self._health[m.port] = (now, state)
         return state
 

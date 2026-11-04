@@ -7,6 +7,13 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **vLLM and Omni models read `down` while they load:** they don't listen until
+  they've loaded, so the gateway couldn't tell a load from a failure. A running
+  model that hasn't answered yet now reads `loading`, as llama-server does.
+  Once it has answered, a refused connection is still `down` at once.
+
 ## [1.11.0] - 2026-11-04
 
 ### Added

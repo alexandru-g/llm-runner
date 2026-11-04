@@ -73,7 +73,7 @@ This is the standard OpenAI list, plus an `llmctl` block on each entry:
 | `id` | The model's exact name. Two machines running the same file report the same id. |
 | `llmctl.node` | Where a call goes right now: the first entry of `nodes`. |
 | `llmctl.local` | Whether the machine you asked also runs this model. |
-| `llmctl.status` | `ready`, `loading` or `down`, for the best copy. A model too busy to answer its health check stays `ready` for up to 60 s. |
+| `llmctl.status` | `ready`, `loading` or `down`, for the best copy. A running model that hasn't answered yet is `loading` (vLLM and Omni don't listen until they've loaded), and one too busy to answer its health check stays `ready` for up to 60 s. |
 | `llmctl.api` | `openai` (chat, completions, embeddings), `images` (image generation: `/v1/images/*`, e.g. FLUX.1), `kserve` (CV models: Triton's HTTP API, `/v2/models/<m>/...`), or `systemone` (decision endpoints, see below). |
 | `llmctl.group` | Another name that also reaches this model (see Groups). |
 | `llmctl.context`, `vision`, `embeddings`, `decision`, `parallel` | What the best copy can do. Per-machine values are in `nodes`. |

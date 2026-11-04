@@ -431,24 +431,33 @@ def test_the_silence_is_counted_from_the_first_miss_not_the_last_answer(tmp_path
     assert local.status(m, fresh=True) == "ready"
 
 
-def test_a_refusal_is_down_at_once(tmp_path, monkeypatch):
+def test_a_refusal_after_answering_is_down_at_once(tmp_path, monkeypatch):
     local, m = _local(tmp_path)
     _probes(monkeypatch, 200, REFUSED)
     assert [local.status(m, fresh=True) for _ in range(2)] == ["ready", "down"]
 
 
-def test_silent_before_it_ever_answered_is_down(tmp_path, monkeypatch):
+def test_refused_before_it_ever_answered_is_loading(tmp_path, monkeypatch):
+    """vLLM and Omni don't listen until they've loaded."""
+    local, m = _local(tmp_path)
+    _probes(monkeypatch, REFUSED, REFUSED, 200)
+    assert [local.status(m, fresh=True) for _ in range(3)] == ["loading", "loading", "ready"]
+
+
+def test_silent_before_it_ever_answered_is_loading(tmp_path, monkeypatch):
     local, m = _local(tmp_path)
     _probes(monkeypatch, TimeoutError())
-    assert local.status(m, fresh=True) == "down"
+    assert local.status(m, fresh=True) == "loading"
 
 
 def test_another_process_on_the_port_has_not_answered(tmp_path, monkeypatch):
+    """Also what a restart looks like: a new pid, loading again."""
     local, m = _local(tmp_path)
     _, other = _local(tmp_path, pid=8)
-    _probes(monkeypatch, 200, TimeoutError())
+    _probes(monkeypatch, 200, TimeoutError(), REFUSED)
     assert local.status(m, fresh=True) == "ready"
-    assert local.status(other, fresh=True) == "down"
+    assert local.status(other, fresh=True) == "loading"
+    assert local.status(other, fresh=True) == "loading"
 
 
 def test_loading_is_not_touched(tmp_path, monkeypatch):
