@@ -7,6 +7,8 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-11-04
+
 ### Added
 
 - **`llmctl chat`:** chat in the terminal with a running model anywhere in the
@@ -436,6 +438,7 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.11.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.11.0
 [1.10.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.10.0
 [1.9.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.9.0
 [1.8.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.8.0
