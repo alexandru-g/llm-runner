@@ -1056,7 +1056,7 @@ a message does depends on the model:
 | model | a message |
 |---|---|
 | chat (llama, vllm, sglang) | streams the reply and keeps the conversation. Reasoning shows dimmed and isn't sent back. Tokens and speed follow each reply |
-| image pipeline (omni) | is a fresh prompt. The images are saved to `--out` (default: the current folder), their paths printed with the seed used, and they open in your default viewer. With reference images (`--image`, `/image FILE`), prompts become edits |
+| image pipeline (omni) | is a fresh prompt. The images are saved to `--out` (default: the current folder), their paths printed with the seed used, and they open in your default viewer. With reference images (`--image`, `/image FILE`), prompts become edits. References over about 1 MP are shrunk before sending, your file stays as it is, and the result comes back at the first reference's size unless you `/set size` |
 
 Decision endpoints and models, embedding servers and CV models don't chat, so
 the picker leaves them out, and naming one says why.

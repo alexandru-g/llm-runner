@@ -7,6 +7,14 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`llmctl chat` sent reference images at full size:** vLLM-Omni generates at the
+  first reference's size by default, so editing two photos took 14 minutes on an
+  Orin. Chat now shrinks references over about 1 MP before sending them, keeps their
+  shape and orientation, and leaves your files alone. A result comes back at the
+  shrunk size unless you `/set size`. This adds Pillow as a dependency.
+
 ## [1.12.0] - 2026-11-04
 
 ### Changed
