@@ -29,6 +29,8 @@ Standard library only, like systemone-proxy.
 """
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Callable
 import http.client
 import ipaddress
 import json
@@ -125,6 +127,8 @@ HELD_RETRY_AFTER = 30
 LOADING_RETRY_AFTER = 10
 # How long a watcher (_ClientWatch) outlives its request, at most. A hang-up wakes it at once.
 WATCH_EVERY_MS = 250
+# Requests a stop ends are counted for this long, then logged as one event.
+CUT_EVENT_AFTER = 1.0
 # A client's X-Request-Id is kept when it is up to 128 visible ASCII characters.
 _REQUEST_ID = re.compile(r"[\x21-\x7e]{1,128}")
 # The flag carrying the context size in each engine's recorded command.
@@ -216,6 +220,87 @@ class LocalModels:
         self._answering: dict[int, tuple[int, float | None]] = {}
         self._lock = threading.Lock()
         self._seen: set[tuple[str, int]] = set()
+        # holds.json, read when it changes: which engines `stop` is taking down.
+        self.holds_file = state_file.with_name("holds.json")
+        self._holds_key: tuple[int, int] | None = None
+        self._holds: dict = {}
+        self._holds_lock = threading.Lock()
+        self._cut: dict[tuple[str, int], int] = {}
+        self._relaying: dict[tuple[str, int], int] = {}     # requests per local engine
+
+    def stopping(self, name: str, pid: int | None) -> bool:
+        """`llmctl stop` (or `apply`) is taking down ``name``'s engine ``pid``:
+        its requests are ended and new ones refused. Matched by pid, so the
+        new instance of a planned restart is not."""
+        if pid is None:
+            return False
+        with self._holds_lock:
+            try:
+                st = self.holds_file.stat()
+                key = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                self._holds_key, self._holds = None, {}
+                return False
+            if key != self._holds_key:
+                try:
+                    raw = json.loads(self.holds_file.read_text())
+                except (OSError, ValueError):
+                    raw = {}
+                self._holds_key, self._holds = key, raw if isinstance(raw, dict) else {}
+            h = self._holds.get(name)
+        return isinstance(h, dict) and h.get("pid") == pid and h.get("until", 0) > time.time()
+
+    @contextlib.contextmanager
+    def relaying(self, name: str, pid: int | None):
+        """Count a request to a local engine while it runs (see :meth:`cutting`)."""
+        key = (name, pid or 0)
+        with self._holds_lock:
+            self._relaying[key] = self._relaying.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            with self._holds_lock:
+                if (n := self._relaying[key] - 1):
+                    self._relaying[key] = n
+                else:
+                    del self._relaying[key]
+
+    def cutting(self) -> bool:
+        """A request to an engine being stopped is still running: it is about
+        to get its error event, which a gateway exiting now would lose."""
+        with self._holds_lock:
+            keys = list(self._relaying)
+        return any(self.stopping(name, pid) for name, pid in keys)
+
+    def pid_of(self, name: str) -> int | None:
+        return next((m.pid for m in self.models() if m.name == name), None)
+
+    def count_cut(self, name: str, pid: int) -> None:
+        """One request ended because its engine is being stopped. The first
+        starts a short window; then one ``requests_cut`` event says how many."""
+        with self._holds_lock:
+            n = self._cut.get((name, pid), 0)
+            self._cut[(name, pid)] = n + 1
+        if n == 0:
+            t = threading.Timer(CUT_EVENT_AFTER, self._report_cut, (name, pid))
+            t.daemon = True
+            t.start()
+
+    def flush_cuts(self) -> None:
+        """Log the counts still in their window (the gateway is exiting:
+        `stop` of the last model takes it down within a second)."""
+        with self._holds_lock:
+            pending = list(self._cut)
+        for name, pid in pending:
+            self._report_cut(name, pid)
+
+    def _report_cut(self, name: str, pid: int) -> None:
+        with self._holds_lock:
+            n = self._cut.pop((name, pid), 0)
+        if not n:
+            return
+        proc.record_event(name, "requests_cut", f"{n} request(s) ended by stop; pid {pid}",
+                          state_dir=self.state_file.parent, pid=pid, requests=n)
 
     def models(self) -> list[Model]:
         with self._lock:
@@ -833,9 +918,11 @@ def make_handler(gw: Gateway):
             return m is not None and gw.local.status(m, fresh=True) == "loading"
 
         @staticmethod
-        def _held(name: str) -> tuple[str, int] | None:
+        def _held(name: str) -> tuple[str, int | None] | None:
             for held, h in proc.holds().items():
                 if name == held or name in _groups(h.get("group")):
+                    if h.get("by") == "stop":       # not coming back: no Retry-After
+                        return "it is being stopped (llmctl stop)", None
                     return f"it is being restarted ({h.get('reason')})", HELD_RETRY_AFTER
             return None
 
@@ -1243,6 +1330,18 @@ def make_handler(gw: Gateway):
             self._obs["inst"] = c
             lbl = {"model": c.id, "node": c.node, "backend": c.info.get("backend") or ""}
             tls, relay = False, None
+            pid = gw.local.pid_of(c.id) if c.local else None
+            if c.local and gw.local.stopping(c.id, pid):
+                # Its engine is going down: another copy, or 503 at once.
+                if not last:
+                    logs.emit(f"failover: {c.id} on {c.node} is being stopped",
+                              event="failover", level="warn", model=c.id, peer=c.node,
+                              reason="stopping", request_id=self._obs["rid"])
+                    self._obs["failovers"] += 1
+                    gw.metrics.failovers.inc(model=c.id, from_node=c.node, reason="stopping")
+                    return "failed"
+                self._unavailable(c.id, self._held(c.id) or ("it is being stopped", None))
+                return "done"
             if c.local:
                 host, port, extra = config_mod.local_host(), c.info["port"], {}
             elif relay := gw.relay_url(c):
@@ -1283,6 +1382,8 @@ def make_handler(gw: Gateway):
             conn = (http.client.HTTPSConnection if tls else http.client.HTTPConnection)(
                 host, port, timeout=10)
             gw.metrics.in_flight.add(1, **lbl)
+            counted = gw.local.relaying(c.id, pid) if c.local else contextlib.nullcontext()
+            counted.__enter__()
             outcome = "error"
             watch = None
             try:
@@ -1298,14 +1399,18 @@ def make_handler(gw: Gateway):
                 try:
                     conn.connect()
                     conn.sock.settimeout(None)   # a long generation is not a hang
-                    watch = _ClientWatch(self.connection, conn.sock)
+                    watch = _ClientWatch(self.connection, conn.sock, stopping=(
+                        lambda: gw.local.stopping(c.id, pid)) if pid is not None else None)
                     conn.request(self.command, path, body=body or None, headers=headers)
                     resp = conn.getresponse()
                     attempt.attrs["http.response.status_code"] = resp.status
                 except OSError as e:
                     if watch is not None and watch.left:
                         raise
-                    attempt.attrs["error.type"] = type(e).__name__
+                    cut = watch is not None and watch.cut
+                    if cut:             # waiting for the engine when the stop came
+                        gw.local.count_cut(c.id, pid)
+                    attempt.attrs["error.type"] = "stopped" if cut else type(e).__name__
                     where = f"port {port}" if c.local else \
                         f"node {c.node} (via {relay})" if relay else f"node {c.node} ({c.url})"
                     if not last:
@@ -1357,6 +1462,9 @@ def make_handler(gw: Gateway):
                     self._relay(resp, data)
                     return "done"
                 self._relay(resp, watch=watch)
+                if watch is not None and watch.cut:
+                    gw.local.count_cut(c.id, pid)
+                    attempt.attrs["error.type"] = "stopped"
                 outcome = "done"
                 return "done"
             except (OSError, http.client.HTTPException):
@@ -1376,6 +1484,7 @@ def make_handler(gw: Gateway):
             finally:
                 if watch is not None:
                     watch.stop()
+                counted.__exit__(None, None, None)
                 gw.metrics.in_flight.add(-1, **lbl)
                 conn.close()
                 if gw.exporter is not None and self._trace.exported:
@@ -1422,6 +1531,12 @@ def make_handler(gw: Gateway):
                         if watch is not None and watch.left and not resp.chunked \
                                 and resp.length != 0:
                             raise ConnectionAbortedError("client hung up")
+                        # Cut by a stop, or an engine that ended the stream
+                        # itself on SIGTERM before the watch saw the stop.
+                        if watch is not None and not watch.left and (watch.cut or (
+                                stream and b"[DONE]" not in keep and watch.stopping_now())):
+                            watch.cut, side = True, "upstream"
+                            raise ConnectionAbortedError("the model is being stopped")
                         break
                     if stream and self._obs["ttft"] is None:
                         self._obs["ttft"] = time.monotonic() - self._obs["t0"]
@@ -1441,10 +1556,13 @@ def make_handler(gw: Gateway):
             except (OSError, http.client.HTTPException) as e:
                 if watch is not None and watch.left:
                     side = "client"
+                elif side == "upstream" and watch is not None and watch.stopping_now():
+                    watch.cut = True       # the engine broke the stream on SIGTERM
                 # Either way the connection is done: a client that left gets
                 # nothing more, and one whose upstream broke sees the stream
                 # cut short. Closing upstream (in _try) stops generation.
-                who = "client left" if side == "client" else "upstream broke"
+                who = "client left" if side == "client" else \
+                    "model stopped" if watch is not None and watch.cut else "upstream broke"
                 logs.emit(f"relay: {who}: {self.command} {self.path} for "
                           f"{self.address_string()} after {sent} bytes ({e!r})",
                           event="relay", level="warn", request_id=self._obs["rid"],
@@ -1453,8 +1571,10 @@ def make_handler(gw: Gateway):
                 if side == "upstream" and stream and chunked:
                     # Say so instead of cutting the stream: one last SSE
                     # event with an OpenAI-style error, then a clean end.
+                    cut = watch is not None and watch.cut
                     event = b"data: " + json.dumps({"error": {
-                        "message": "The model stopped answering mid-stream.",
+                        "message": "The model was stopped mid-stream." if cut
+                        else "The model stopped answering mid-stream.",
                         "type": "server_error", "param": None,
                         "code": "model_unavailable"}}).encode() + b"\n\n"
                     try:
@@ -1476,13 +1596,27 @@ def make_handler(gw: Gateway):
 class _ClientWatch:
     """Hangs up on the model as soon as the client does. A write is otherwise the
     only way to learn a client left, so a request still queued, or a reply gone
-    silent, would keep the model's slot for nobody."""
+    silent, would keep the model's slot for nobody.
 
-    def __init__(self, client: socket.socket, upstream: socket.socket):
-        self.left = False
+    Also hangs up when ``stopping()`` says the engine is being stopped
+    (``cut``): a dying llama-server keeps the stream open and silent."""
+
+    def __init__(self, client: socket.socket, upstream: socket.socket,
+                 stopping: Callable[[], bool] | None = None):
+        self.left = self.cut = False
         self._client, self._upstream = client, upstream
+        self._stopping = stopping
         self._done = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
+
+    def stopping_now(self) -> bool:
+        return self._stopping is not None and self._stopping()
+
+    def _hang_up(self) -> None:
+        try:
+            self._upstream.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def _run(self) -> None:
         poll = select.poll()
@@ -1491,7 +1625,14 @@ class _ClientWatch:
         except (OSError, ValueError):
             return
         while not self._done.is_set():
-            if not poll.poll(WATCH_EVERY_MS) or self._done.is_set():
+            ready = poll.poll(WATCH_EVERY_MS)
+            if self._done.is_set():
+                return
+            if self.stopping_now():
+                self.cut = True
+                self._hang_up()
+                return
+            if not ready:
                 continue
             try:
                 # Peeked, not read: bytes here are the client's next request.
@@ -1502,10 +1643,7 @@ class _ClientWatch:
             except OSError:
                 pass
             self.left = True
-            try:
-                self._upstream.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+            self._hang_up()
             return
 
     def stop(self) -> None:
@@ -1576,7 +1714,13 @@ def serve(port: int = DEFAULT_PORT, host: str = "0.0.0.0") -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        # `stop` of the last model takes the gateway down right after: let the
+        # requests it cut say so first.
+        deadline = time.monotonic() + 1.0
+        while gw.local.cutting() and time.monotonic() < deadline:
+            time.sleep(0.05)
         stop.set()
+        gw.local.flush_cuts()
         gw.goodbye()
         if gw.exporter is not None:
             gw.exporter.close()

@@ -890,9 +890,16 @@ When the gateway is up, its all-models URL is printed underneath.
 llmctl stop                        # auto-pick if 1 running; picker if many
 llmctl stop gemma-4-e4b-it-q4_k_m  # by name
 llmctl stop 12345                  # by PID
+llmctl stop NAME --timeout 0       # SIGKILL at once, for an engine that won't exit
 ```
 
-Sends `SIGTERM` to the process group; escalates to `SIGKILL` after 10 s.
+Sends `SIGTERM` to the process group; escalates to `SIGKILL` after 10 s
+(`--timeout SECONDS`, 0 for at once). The gateway ends the model's requests
+first, so clients don't wait out the grace: a stream in progress gets an SSE
+`error` event (`model_unavailable`) and ends; a request still waiting for its
+reply, and any new one until the engine is gone, gets 503 `model_unavailable`
+(or goes to another copy of the model, if one runs). One `requests_cut` event
+says how many requests were ended.
 A stopped model leaves autostart. So does a model that isn't running (it
 crashed, or the supervisor is between restarts): `llmctl stop NAME` takes it
 out of autostart, so it isn't restarted or brought back at boot, and stops
@@ -1823,6 +1830,7 @@ each in `<state>/events.jsonl`:
 | `ready` | it answered `/health` | `run --wait`, `apply --wait`, `supervisor` |
 | `start_failed` | it exited, or wasn't ready in time, before it was ever ready (log) | `run --wait`, `apply --wait`, `supervisor` |
 | `stopped` | it was stopped on purpose (`apply` gives the reason) | `stop`, `apply` |
+| `requests_cut` | the gateway ended requests to it because it was being stopped (`requests`: how many) | gateway |
 | `restarting`, `restarted`, `restart_failed`, `crashed`, `starting`, `forgotten` | crash handling | `supervisor` |
 
 Each line has `ts`, `model`, `event` and `detail`, plus `pid`, `port`,

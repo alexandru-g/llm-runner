@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from llm_runner import config as config_mod
-from llm_runner.backends import launch_env, with_bind_host
+from llm_runner.backends import GATEWAY, launch_env, with_bind_host
 
 
 def _resolve_state_dir() -> Path:
@@ -441,6 +441,53 @@ def stop(identifier: str, *, timeout: float = 10.0,
     # the gateway's supervisor never takes the dying process for a crash.
     if not keep_autostart:
         autostart_remove(target.name)
+    # Before any signal: the gateway ends this engine's requests at once and
+    # answers new ones 503, instead of relaying a stream the dying engine
+    # keeps open and silent for the whole grace.
+    own_hold = _mark_stopping(target, timeout)
+    try:
+        _terminate(target, timeout)
+    finally:
+        if own_hold:
+            _linger(target.name, target.pid)
+    procs = [p for p in reconcile() if p.pid != target.pid]
+    _save(procs)
+    return target
+
+
+def _mark_stopping(target: RunningProcess, timeout: float) -> bool:
+    """Hold ``target`` with its pid, which tells the gateway this engine is
+    going down. Joins a hold already there (`llmctl apply`'s); returns
+    whether the hold is this stop's own, to release when done."""
+    if target.backend == GATEWAY:
+        return False
+    held = holds()
+    if target.name in held and held[target.name].get("by") != "stop":
+        held[target.name]["pid"] = target.pid
+        _write_holds(held)
+        return False
+    held[target.name] = {"reason": "llmctl stop", "by": "stop", "group": target.group or None,
+                         "pid": target.pid, "until": time.time() + timeout + 60}
+    _write_holds(held)
+    return True
+
+
+# A stop's hold outlives the engine this long: a SIGKILL'd engine's stream
+# ends like a finished one, and the gateway, reading it, must still know why.
+STOP_LINGER = 5.0
+
+
+def _linger(name: str, pid: int) -> None:
+    """Let this stop's hold lapse shortly, rather than now (see STOP_LINGER)."""
+    held = holds()
+    h = held.get(name)
+    if h is not None and h.get("by") == "stop" and h.get("pid") == pid:
+        h["until"] = time.time() + STOP_LINGER
+        _write_holds(held)
+
+
+def _terminate(target: RunningProcess, timeout: float) -> None:
+    """SIGTERM, then SIGKILL after ``timeout`` seconds (at once for 0)."""
     container = (target.runtime or {}).get("container")
     if container:
         # SIGTERM to `docker run` reaches the engine too, but a SIGKILL'd
@@ -453,9 +500,6 @@ def stop(identifier: str, *, timeout: float = 10.0,
         time.sleep(0.25)
     if _alive(target.pid):
         _signal_group(target.pid, signal.SIGKILL)
-    procs = [p for p in reconcile() if p.pid != target.pid]
-    _save(procs)
-    return target
 
 
 # ----------------------------------------------------- planned restarts --

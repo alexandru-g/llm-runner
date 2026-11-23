@@ -2,6 +2,7 @@ import pytest
 
 from llm_runner import backends
 from llm_runner import config as config_mod
+from llm_runner import process as proc
 
 
 @pytest.fixture(autouse=True)
@@ -11,6 +12,17 @@ def _own_config(tmp_path_factory, monkeypatch):
     d = tmp_path_factory.mktemp("config")
     monkeypatch.setattr(config_mod, "CONFIG_DIR", d)
     monkeypatch.setattr(config_mod, "CONFIG_FILE", d / "config.json")
+
+
+@pytest.fixture(autouse=True)
+def _own_state(tmp_path_factory, monkeypatch):
+    """Never touch the real state dir: `proc.stop` writes holds.json there,
+    which the machine's live gateway reads."""
+    d = tmp_path_factory.mktemp("state")
+    monkeypatch.setattr(proc, "STATE_DIR", d)
+    monkeypatch.setattr(proc, "STATE_FILE", d / "running.json")
+    monkeypatch.setattr(proc, "AUTOSTART_FILE", d / "autostart.json")
+    monkeypatch.setattr(proc, "LOG_DIR", d / "logs")
 
 
 @pytest.fixture(autouse=True)
