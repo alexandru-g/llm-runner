@@ -1797,7 +1797,10 @@ def _gateway_get(port: int, path: str) -> dict:
 
 @cli.command()
 @click.argument("identifier", required=False)
-def stop(identifier: str | None) -> None:
+@click.option("--timeout", type=click.FloatRange(min=0), default=10.0, show_default=True,
+              help="Seconds from SIGTERM to SIGKILL; 0 kills at once. Requests "
+                   "through the gateway are ended at the start either way.")
+def stop(identifier: str | None, timeout: float) -> None:
     """Stop a running model by NAME or PID.
 
     With no IDENTIFIER: if exactly one model is running, stop it;
@@ -1809,7 +1812,7 @@ def stop(identifier: str | None) -> None:
             raise click.UsageError("No running models.")
         target = running[0] if len(running) == 1 else _pick_instance_interactively(running)
         identifier = str(target.pid)
-    rec = proc.stop(identifier)
+    rec = proc.stop(identifier, timeout=timeout)
     if rec is None:
         return _forget_down(identifier)
     click.echo(f"Stopped {rec.name}  pid={rec.pid}  port={rec.port}")
@@ -1817,7 +1820,7 @@ def stop(identifier: str | None) -> None:
     # A decision endpoint is useless without its model: take it down too.
     if rec.backend != backends.DECIDE:
         for p in _proxy_attached_to(rec.port):
-            proc.stop(str(p.pid))
+            proc.stop(str(p.pid), timeout=timeout)
             click.echo(f"Stopped {p.name}  pid={p.pid}  port={p.port}")
             stopped.append(p)
     for p in stopped:

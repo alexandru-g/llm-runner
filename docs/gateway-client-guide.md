@@ -137,6 +137,14 @@ generated. Closing the connection cancels the generation on the model server,
 or the request if it's still queued. A half-close (`shutdown(SHUT_WR)`) counts
 too, so keep the connection open for as long as you want the reply.
 
+When a model is stopped (`llmctl stop`) or restarted by `llmctl apply`, the
+gateway ends its requests at once rather than when the engine exits: a stream
+in progress gets one last event, `data: {"error": {"code": "model_unavailable",
+...}}`, and then ends cleanly; a request without a reply yet gets 503
+`model_unavailable`, or goes to another copy of the model if one is running.
+The same event ends a stream whose model stops answering mid-reply. Check for
+an `error` event, not only for `[DONE]`.
+
 ## Endpoints
 
 | Request | Routed by |

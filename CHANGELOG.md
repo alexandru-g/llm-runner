@@ -7,6 +7,13 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`llmctl stop --timeout SECONDS`:** the grace from SIGTERM to SIGKILL (default
+  10 s); `--timeout 0` kills the engine at once. `llmctl apply` keeps the default.
+- **A `requests_cut` event** when the gateway ends requests because their model is
+  being stopped, with how many.
+
 ### Fixed
 
 - **`llmctl chat` sent reference images at full size:** vLLM-Omni generates at the
@@ -14,6 +21,22 @@ All notable changes to llm-runner (`llmctl`). The format follows
   Orin. Chat now shrinks references over about 1 MP before sending them, keeps their
   shape and orientation, and leaves your files alone. A result comes back at the
   shrunk size unless you `/set size`. This adds Pillow as a dependency.
+- **`llmctl stop` left streaming clients waiting up to 10 s
+  ([#1](https://github.com/alexandru-g/llm-runner/issues/1)):** llama-server keeps a
+  stream open and silent after SIGTERM until it is killed, and the gateway went on
+  relaying it. `stop` now marks the engine as stopping before its first signal. The
+  gateway ends that engine's streams with an SSE `error` event (`model_unavailable`)
+  within a quarter of a second, and answers requests without a reply yet, and new
+  ones during the grace, 503 `model_unavailable` (or sends them to another copy).
+  `stop` then waits 0.35 s before SIGTERM, so the gateway has ended the streams with
+  that error first: vLLM, given SIGTERM, ends them itself with `finish_reason:
+  "abort"` and `[DONE]`, which clients read as a normal end. `--timeout 0` skips the
+  wait. `llmctl apply` restarts do the same for the old instance. The mark names the
+  engine's pid, so the new instance is not affected. A model being stopped reads
+  "being stopped", with no `Retry-After`.
+- **The test suite wrote to the real state dir:** tests that stopped or started fake
+  models wrote `events.jsonl` (and could write `holds.json`) under
+  `~/.local/state/llm-runner`. Every test now gets its own state dir.
 
 ## [1.12.0] - 2026-11-04
 
