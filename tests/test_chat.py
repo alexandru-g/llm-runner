@@ -1,5 +1,6 @@
 """`llmctl chat` against a fake gateway that speaks the chat and image APIs."""
 import base64
+import io
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,6 +9,7 @@ from pathlib import Path
 import click
 import pytest
 from click.testing import CliRunner
+from PIL import Image
 
 from llm_runner import chat
 from llm_runner import cli
@@ -474,6 +476,80 @@ def test_reference_makes_an_edit_and_dropping_it_generates(server, tmp_path, cap
     s.command("/image /no/such/file")
     assert "No such file" in capsys.readouterr().err
     assert s.references == []
+
+
+def _uploads(raw):
+    """The images in an edit's multipart form, as ``(filename, content type, Image)``."""
+    found = []
+    for part in raw.split(b"--" + raw[2:raw.index(b"\r\n")])[1:-1]:
+        head, _, body = part.partition(b"\r\n\r\n")
+        if b'name="image"' in head:
+            name = head.split(b'filename="')[1].split(b'"')[0].decode()
+            ctype = head.split(b"Content-Type: ")[1].decode().strip()
+            found.append((name, ctype, Image.open(io.BytesIO(body[:-2]))))
+    return found
+
+
+def test_a_big_reference_is_shrunk_before_sending_and_the_file_kept(server, tmp_path, capsys):
+    fake, port = server
+    ref = tmp_path / "photo.jpg"
+    Image.new("RGB", (4000, 3000), "red").save(ref)
+    before = ref.read_bytes()
+    s = _image(port, tmp_path, params={"size": "2048x1536"}, references=[ref, ref])
+    assert s.send("make it blue")
+    raw = fake.requests[-1][1]
+    uploads = _uploads(raw)
+    assert [(n, c) for n, c, _ in uploads] == [("photo.png", "image/png")] * 2
+    w, h = uploads[0][2].size
+    assert (w, h) == (1168, 880)
+    assert w % 16 == h % 16 == 0 and w * h <= chat.REFERENCE_MAX_AREA
+    assert uploads[0][2].getpixel((0, 0))[0] > 250
+    assert "photo.jpg: sending 4000×3000 as 1168×880" in capsys.readouterr().err
+    assert ref.read_bytes() == before
+    assert b'name="size"\r\n\r\n2048x1536' in raw
+
+
+def test_a_reference_within_the_cap_goes_untouched(server, tmp_path, capsys):
+    fake, port = server
+    ref = tmp_path / "small.jpg"
+    Image.new("RGB", (1024, 1024), "red").save(ref)
+    assert _image(port, tmp_path, references=[ref]).send("a")
+    raw = fake.requests[-1][1]
+    assert b"Content-Type: image/jpeg\r\n\r\n" + ref.read_bytes() in raw
+    assert "sending" not in capsys.readouterr().err
+
+
+def test_a_shrunk_photo_stays_upright(server, tmp_path):
+    fake, port = server
+    ref = tmp_path / "phone.jpg"
+    exif = Image.Exif()
+    exif[0x0112] = 6  # stored sideways: rotate 90° to view
+    Image.new("RGB", (4000, 2000), "red").save(ref, exif=exif)
+    assert _image(port, tmp_path, references=[ref]).send("a")
+    w, h = _uploads(fake.requests[-1][1])[0][2].size
+    assert h > w
+
+
+@pytest.mark.parametrize("mode,fmt,name", [("CMYK", "JPEG", "print.jpg"), ("P", "PNG", "map.png"),
+                                           ("RGBA", "PNG", "cut.png")])
+def test_any_kind_of_big_image_can_be_shrunk(server, tmp_path, mode, fmt, name):
+    fake, port = server
+    ref = tmp_path / name
+    Image.new(mode, (2000, 2000)).save(ref, fmt)
+    assert _image(port, tmp_path, references=[ref]).send("a")
+    upload = _uploads(fake.requests[-1][1])[0][2]
+    assert upload.size == (1024, 1024)
+    assert upload.mode == ("RGBA" if mode == "RGBA" else "RGB")
+
+
+def test_a_reference_too_big_to_read_is_a_message(server, tmp_path, monkeypatch, capsys):
+    fake, port = server
+    ref = tmp_path / "huge.png"
+    Image.new("RGB", (100, 100)).save(ref)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10)
+    assert not _image(port, tmp_path, references=[ref]).send("a")
+    assert "huge.png is too large to read" in capsys.readouterr().err
+    assert fake.requests == []
 
 
 def _spawned(monkeypatch):

@@ -16,6 +16,11 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ### Fixed
 
+- **`llmctl chat` sent reference images at full size:** vLLM-Omni generates at the
+  first reference's size by default, so editing two photos took 14 minutes on an
+  Orin. Chat now shrinks references over about 1 MP before sending them, keeps their
+  shape and orientation, and leaves your files alone. A result comes back at the
+  shrunk size unless you `/set size`. This adds Pillow as a dependency.
 - **`llmctl stop` left streaming clients waiting up to 10 s
   ([#1](https://github.com/alexandru-g/llm-runner/issues/1)):** llama-server keeps a
   stream open and silent after SIGTERM until it is killed, and the gateway went on

@@ -10,7 +10,8 @@ model serves:
             conversation is kept, so each message sends the whole history.
 ``image``   vLLM-Omni pipelines. Each message is a fresh prompt; the images go
             to files, and open in the desktop's viewer when run from a terminal.
-            With reference images it is an edit instead.
+            With reference images it is an edit instead, and photos over about
+            1 MP are shrunk before they are sent (:func:`reference_upload`).
 
 Everything else answers in another shape and is refused (:func:`refusal`):
 decision endpoints and models, embedding servers, CV models.
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import http.client
+import io
 import json
 import mimetypes
 import os
@@ -56,6 +58,13 @@ _IMAGE_ALIASES = {"steps": "num_inference_steps", "negative": "negative_prompt",
                   "guidance": "guidance_scale", "cfg": "true_cfg_scale"}
 _TEXT_ALIASES = {"temp": "temperature"}
 _LOST = (OSError, ValueError, http.client.HTTPException)
+
+# The most a reference image is sent at. Pipelines train around 1 MP, and with
+# size=auto vLLM-Omni generates at the first reference's size: two photos took 14
+# minutes on an Orin, and two at this cap took 29 s at 4 steps. Diffusion sizes step
+# in 16s.
+REFERENCE_MAX_AREA = 1024 * 1024
+_REFERENCE_GRID = 16
 
 
 def refusal(entry: dict) -> str | None:
@@ -435,6 +444,41 @@ class TextSession(Session):
         return True
 
 
+def reference_upload(path: Path) -> tuple[str, str, bytes]:
+    """``(filename, content type, bytes)`` to send for a reference image. Over
+    :data:`REFERENCE_MAX_AREA` it becomes a PNG at that area, upright, with its
+    shape kept and the file on disk untouched. Anything smaller goes as it is, and
+    so does anything Pillow can't read: the server has the last word on those."""
+    from PIL import (  # slow, and only edits need it
+        Image,
+        ImageOps,
+        UnidentifiedImageError,
+    )
+
+    raw = path.read_bytes()
+    as_is = (path.name, mimetypes.guess_type(path.name)[0] or "application/octet-stream", raw)
+    try:
+        with Image.open(io.BytesIO(raw)) as opened:
+            if opened.width * opened.height <= REFERENCE_MAX_AREA:
+                return as_is
+            before = opened.size
+            im = ImageOps.exif_transpose(opened)
+            scale = (REFERENCE_MAX_AREA / (im.width * im.height)) ** 0.5
+            size = tuple(max(_REFERENCE_GRID, int(side * scale) // _REFERENCE_GRID * _REFERENCE_GRID)
+                         for side in im.size)
+            if im.mode not in ("RGB", "RGBA", "L", "LA"):
+                im = im.convert("RGBA" if "transparency" in im.info else "RGB")
+            small = im.resize(size, Image.Resampling.LANCZOS)
+    except UnidentifiedImageError:
+        return as_is
+    except Image.DecompressionBombError as e:
+        raise ValueError(f"{path.name} is too large to read: {e}") from e
+    out = io.BytesIO()
+    small.save(out, "PNG")
+    _note(f"{path.name}: sending {before[0]}×{before[1]} as {size[0]}×{size[1]}")
+    return f"{path.stem}.png", "image/png", out.getvalue()
+
+
 class ImageSession(Session):
     kind = st.IMAGE
     aliases = _IMAGE_ALIASES
@@ -471,10 +515,10 @@ class ImageSession(Session):
             parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n'
                          f"{text}\r\n".encode())
         for path in self.references:
-            ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            filename, ctype, blob = reference_upload(path)
             parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="image"; '
-                         f'filename="{path.name}"\r\nContent-Type: {ctype}\r\n\r\n'.encode()
-                         + path.read_bytes() + b"\r\n")
+                         f'filename="{filename}"\r\nContent-Type: {ctype}\r\n\r\n'.encode()
+                         + blob + b"\r\n")
         parts.append(f"--{boundary}--\r\n".encode())
         req = urllib.request.Request(
             st._url(self.t, "/v1/images/edits"), data=b"".join(parts), method="POST",
