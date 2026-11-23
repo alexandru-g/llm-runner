@@ -446,6 +446,10 @@ def stop(identifier: str, *, timeout: float = 10.0,
     # keeps open and silent for the whole grace.
     own_hold = _mark_stopping(target, timeout)
     try:
+        if timeout > 0 and target.backend != GATEWAY:
+            # The gateway looks every 250 ms; let it end the streams with an
+            # error first. vLLM, sent SIGTERM, ends them itself with [DONE].
+            time.sleep(STOP_NOTICE)
         _terminate(target, timeout)
     finally:
         if own_hold:
@@ -471,6 +475,10 @@ def _mark_stopping(target: RunningProcess, timeout: float) -> bool:
     _write_holds(held)
     return True
 
+
+# From marking an engine stopping to its SIGTERM: one look of the gateway's
+# watcher (gateway.WATCH_EVERY_MS), and a margin.
+STOP_NOTICE = 0.35
 
 # A stop's hold outlives the engine this long: a SIGKILL'd engine's stream
 # ends like a finished one, and the gateway, reading it, must still know why.

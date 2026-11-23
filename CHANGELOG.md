@@ -28,7 +28,10 @@ All notable changes to llm-runner (`llmctl`). The format follows
   gateway ends that engine's streams with an SSE `error` event (`model_unavailable`)
   within a quarter of a second, and answers requests without a reply yet, and new
   ones during the grace, 503 `model_unavailable` (or sends them to another copy).
-  `llmctl apply` restarts do the same for the old instance. The mark names the
+  `stop` then waits 0.35 s before SIGTERM, so the gateway has ended the streams with
+  that error first: vLLM, given SIGTERM, ends them itself with `finish_reason:
+  "abort"` and `[DONE]`, which clients read as a normal end. `--timeout 0` skips the
+  wait. `llmctl apply` restarts do the same for the old instance. The mark names the
   engine's pid, so the new instance is not affected. A model being stopped reads
   "being stopped", with no `Retry-After`.
 - **The test suite wrote to the real state dir:** tests that stopped or started fake

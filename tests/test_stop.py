@@ -255,3 +255,19 @@ def test_a_second_stop_soon_after_has_its_own_hold(tmp_path):
     p2.wait(3)
     h = proc.holds()["m"]
     assert h["pid"] == rec2.pid and h["by"] == "stop"
+
+
+def test_stop_gives_the_gateway_a_look_before_sigterm(tmp_path, monkeypatch):
+    # vLLM ends its streams itself on SIGTERM ([DONE], finish_reason "abort"),
+    # so the gateway has to have ended them, with an error, first.
+    order = []
+    rec = proc.RunningProcess(name="q", pid=999999, port=1, started_at=0, model_path="m",
+                              log_file="l")
+    monkeypatch.setattr(proc, "find", lambda ident: rec)
+    monkeypatch.setattr(proc.time, "sleep", lambda s: order.append(("sleep", s)))
+    monkeypatch.setattr(proc, "_terminate", lambda target, timeout: order.append("term"))
+    proc.stop("q", timeout=5)
+    assert order == [("sleep", proc.STOP_NOTICE), "term"]
+    order.clear()
+    proc.stop("q", timeout=0)                       # --timeout 0: no pause at all
+    assert order == ["term"]
