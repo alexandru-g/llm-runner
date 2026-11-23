@@ -7,6 +7,8 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-11-23
+
 ### Added
 
 - **`llmctl stop --timeout SECONDS`:** the grace from SIGTERM to SIGKILL (default
@@ -498,6 +500,7 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.13.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.13.0
 [1.12.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.12.0
 [1.11.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.11.0
 [1.10.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.10.0
