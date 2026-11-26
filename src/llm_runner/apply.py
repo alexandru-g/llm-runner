@@ -75,6 +75,7 @@ OPTIONS: dict[str, tuple[str, str]] = {
     "reasoning": ("--reasoning", "bool"),
     "embeddings": ("--embeddings/--no-embeddings", "bool"),
     "no_vision": ("--no-vision", "bool"),
+    "no_mmproj_offload": ("--no-mmproj-offload", "bool"),
     "draft": ("--draft", "str"),
     "no_draft": ("--no-draft", "bool"),
     "spec_type": ("--spec-type", "str"),

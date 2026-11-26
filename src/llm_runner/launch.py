@@ -131,6 +131,9 @@ SETTINGS: list[Setting] = [
     Setting("no_vision", "Vision",
             lambda t: [(False, "on"), (True, "off (saves ~1 GB)")],
             lambda t: t.backend == LLAMA and t.spec.mmproj_path is not None),
+    Setting("no_mmproj_offload", "Image encoder",
+            lambda t: [(False, "GPU"), (True, "CPU (saves VRAM, slower images)")],
+            lambda t: t.backend == LLAMA and t.spec.mmproj_path is not None),
     Setting("no_draft", "MTP drafter",
             lambda t: [(False, _draft_title(t)), (True, "off")],
             lambda t: t.backend in (LLAMA, *HF_ENGINES) and t.spec.has_draft),
@@ -326,6 +329,8 @@ class _Menu:
                 and current.get("no_draft") is False and current.get("kv_quant", "f16") != "f16":
             return ("quantized KV drops MTP acceptance to ~0%: "
                     "turn the drafter off, or use f16")
+        if current.get("no_vision") and current.get("no_mmproj_offload"):
+            return "vision is off, so the image encoder setting does nothing"
         return None
 
     def commit(self, current: dict) -> None:

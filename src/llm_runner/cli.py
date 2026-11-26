@@ -57,6 +57,7 @@ def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size:
                      n_parallel: int | None = None,
                      cache_ram: int = 0,
                      kv_unified: bool | None = None,
+                     mmproj_offload: bool = True,
                      host: str = "0.0.0.0",
                      extra: list[str] | None = None) -> list[str]:
     if embeddings:
@@ -125,6 +126,10 @@ def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size:
         cmd.extend(["--reasoning-budget", "0"])
     if mmproj and mmproj.exists():
         cmd.extend(["--mmproj", str(mmproj)])
+        # The vision encoder on the CPU: no VRAM for its weights and compute
+        # buffers (Gemma 26B's image crash on a 24 GB card), slower images.
+        if not mmproj_offload:
+            cmd.append("--no-mmproj-offload")
     # Speculative decoding: pair the base model with a drafter (e.g. a Gemma-4
     # MTP head). llama-server runs the drafter to propose up to spec_n_max
     # tokens per step and the base model verifies them in one pass.
@@ -275,7 +280,8 @@ def _require_backend(backend: str) -> str:
 # dropping it.
 _LLAMA_ONLY_PARAMS = {
     "reasoning": "--reasoning", "n_gpu_layers": "--n-gpu-layers",
-    "no_vision": "--no-vision", "kv_unified": "--kv-unified/--no-kv-unified",
+    "no_vision": "--no-vision", "no_mmproj_offload": "--no-mmproj-offload",
+    "kv_unified": "--kv-unified/--no-kv-unified",
     "cache_ram": "--cache-ram", "ctx_checkpoints": "--ctx-checkpoints",
     "pooling": "--pooling",
     "batch_size": "--batch-size", "ubatch_size": "--ubatch-size",
@@ -1226,6 +1232,9 @@ def profile_rm(name: str) -> None:
 @click.option("--no-vision", is_flag=True, default=False,
               help="Skip the vision projector (mmproj) to free ~1-1.5 GB of VRAM "
                    "on vision models you only use for text.")
+@click.option("--no-mmproj-offload", is_flag=True, default=False,
+              help="Run the vision projector (mmproj) on the CPU instead of the GPU: "
+                   "it frees the projector's VRAM, and images take longer to encode.")
 @click.option("--draft", "draft_spec", default=None,
               help="Speculative/MTP drafter to pair with MODEL for faster "
                    "generation (llama-server --model-draft). Accepts a path to "
@@ -1296,7 +1305,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         reasoning: bool,
         kv_quant: str, gpu_mem: float | None, tool_parser: str | None,
         reasoning_parser: str | None, trust_remote_code: bool,
-        n_gpu_layers: int, no_vision: bool,
+        n_gpu_layers: int, no_vision: bool, no_mmproj_offload: bool,
         embeddings: bool | None, pooling: str, batch_size: int | None,
         ubatch_size: int | None, draft_spec: str | None, no_draft: bool,
         spec_type: str, spec_n_max: int, n_parallel: int | None,
@@ -1535,6 +1544,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                                draft_path=draft_path, spec_type=spec_type,
                                spec_n_max=spec_n_max, n_parallel=n_parallel,
                                cache_ram=cache_ram, kv_unified=kv_unified,
+                               mmproj_offload=not no_mmproj_offload,
                                host=config_mod.get_bind_host(), extra=extra_args)
         # Report the llmctl name as the model id (as --served-model-name
         # does) instead of the GGUF path, so it matches the gateway's /v1/models.

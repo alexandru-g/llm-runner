@@ -533,6 +533,7 @@ to that model, with **Start** on top so Enter launches with what's shown:
  » ▶ Start
      Profile         last  ▸
    * Vision          off (saves ~1 GB)
+     Image encoder   GPU
      Reasoning       off
    * Context         8,192
      KV cache        f16
@@ -866,6 +867,12 @@ llmctl run gemma-4-31b-it-q4_k_m --kv-quant q8_0 -c 16384
 
 # Skip the vision projector on a vision model you're using for text only.
 llmctl run gemma-4-31b-it-q4_k_m --no-vision
+
+# Keep vision, but encode images on the CPU. That frees the projector's VRAM
+# and its compute buffers, so an image no longer needs headroom on the card.
+# Images take longer. Gemma 26B at the default launch on a 24 GB card
+# needs this (or a smaller context, or no drafter) to read images.
+llmctl run gemma-4-26b-a4b-it-ud-q4_k_m --no-mmproj-offload
 
 # Last resort: spill some layers to CPU (it fits, but it's slower).
 llmctl run gemma-4-31b-it-q4_k_m --ngl 48
@@ -1215,7 +1222,7 @@ How the shared `run` flags map:
 | `-X ARGS` / `-E K=V`| appended / env                | appended / env                     | appended / env |
 
 `--gpu-mem`, `--tool-parser`, `--reasoning-parser` and `--trust-remote-code`
-are vllm/sglang-only; `--n-gpu-layers`, `--no-vision`, `--kv-unified`, `--cache-ram`,
+are vllm/sglang-only; `--n-gpu-layers`, `--no-vision`, `--no-mmproj-offload`, `--kv-unified`, `--cache-ram`,
 `--reasoning` and the embedding batch flags are llama-only. Passing one to the
 other side prints a warning and ignores it. SGLang always gets
 `--enable-metrics` (the gateway reads its queue depth from `/metrics`), and
@@ -1711,7 +1718,7 @@ Keys: `model`, `port`, `args`, `env`, and the `run` options `backend`,
 `group` (`null` for none), `runtime`, `image`, `allow_tag`, `dns` (a list), `gpu`, `ctx`,
 `n_parallel`, `gpu_mem`, `kv_cache_mem`, `kv_quant`, `tool_parser`,
 `reasoning_parser`, `trust_remote_code`, `reasoning`, `embeddings`,
-`no_vision`, `draft`, `no_draft`, `spec_type`, `spec_n_max`,
+`no_vision`, `no_mmproj_offload`, `draft`, `no_draft`, `spec_type`, `spec_n_max`,
 `n_gpu_layers`, `kv_unified`, `ctx_checkpoints`, `cache_ram`, `batch_size`,
 `ubatch_size`, `restart`, `restart_max`, `owner`.
 

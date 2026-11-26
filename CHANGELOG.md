@@ -7,6 +7,17 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`llmctl run --no-mmproj-offload`, and an Image encoder row in the launch
+  menu (GPU / CPU):** this runs a vision model's projector on the CPU
+  (llama-server `--no-mmproj-offload`). Vision stays on, the projector's VRAM
+  and compute buffers are freed, and images take longer to encode. It's for
+  launches where text fits but an image runs the card out of memory, such as
+  Gemma 26B at the default launch on a 24 GB card. `apply` takes it as
+  `no_mmproj_offload`. The menu shows the row only for llama models with an
+  mmproj, and warns if vision is also off.
+
 ## [1.14.0] - 2026-11-26
 
 ### Added
