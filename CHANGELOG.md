@@ -7,6 +7,8 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-11-26
+
 ### Added
 
 - **`llmctl run --no-mmproj-offload`, and an Image encoder row in the launch
@@ -527,6 +529,7 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.15.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.15.0
 [1.14.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.14.0
 [1.13.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.13.0
 [1.12.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.12.0
