@@ -7,6 +7,20 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`llmctl run --json`:** one JSON object on stdout when done (the model as
+  `ps --json` shows it, plus `log`, `ready` and `error`), with every message on
+  stderr. It's for programs that start models, such as a GPU queue, so they don't
+  have to parse `Started …` or read llmctl's state files.
+
+### Changed
+
+- **`llmctl ps` lists every model that was started and not stopped,** running or
+  not. One that died and isn't being restarted (the gateway is off, the machine
+  booted without `restore`, a failed start, or the seconds before the supervisor's
+  next look) shows STATE `down`. Before, it was missing, which looked like a stop.
+
 ## [1.13.0] - 2026-11-23
 
 ### Added

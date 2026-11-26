@@ -179,13 +179,14 @@ def _run_option_args(ctx: click.Context) -> list[str]:
     """Rebuild the option part of the `llmctl run` argv from the params the
     user passed on the command line (defaults are omitted so re-detection —
     e.g. embeddings-by-filename — still applies on a re-run). ``--port`` is
-    left out: the manifest pins it separately. So are ``--wait``, ``--menu``
-    and ``--profile``: they're about this invocation, not the launch (a
+    left out: the manifest pins it separately. So are ``--wait``, ``--menu``,
+    ``--profile`` and ``--json``: they're about this invocation, not the launch (a
     profile's values are recorded as the flags they set)."""
     src = click.core.ParameterSource.COMMANDLINE
     args: list[str] = []
     for p in ctx.command.params:
-        if not isinstance(p, click.Option) or p.name in ("port", "wait", "menu", "profile"):
+        if not isinstance(p, click.Option) or p.name in ("port", "wait", "menu", "profile",
+                                                          "as_json"):
             continue
         source = ctx.get_parameter_source(p.name)
         # An owner from $LLMCTL_OWNER is kept too, so a restart from elsewhere
@@ -1146,6 +1147,9 @@ def profile_rm(name: str) -> None:
 @click.option("--wait/--no-wait", "wait", default=False,
               help="Block until the server answers /health (or exits). Handy for "
                    "vllm/sglang, which take a minute or more to load and compile.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Print one JSON object on stdout when done: the model as `ps --json` "
+                   "shows it, plus log and ready. Everything else goes to stderr.")
 @click.option("--menu/--no-menu", "-i", "menu", default=None,
               help="Show the launch-options menu (backend, vision, drafter, reasoning, "
                    "context, KV cache, slots) before starting. On by default when "
@@ -1284,7 +1288,8 @@ def profile_rm(name: str) -> None:
 @click.pass_context
 def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         ctx_size: int | None, ft_path: Path | None, ft_name: str | None,
-        group_name: str | None, owner: str | None, wait: bool, menu: bool | None, profile: str | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
+        group_name: str | None, owner: str | None, wait: bool, as_json: bool,
+        menu: bool | None, profile: str | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
         runtime_kind: str | None, image: str | None, allow_tag: bool, dns: str | None, gpu: str | None,
         restart: str | None, restart_max: int | None,
         kv_cache_mem: str | None,
@@ -1305,6 +1310,20 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     Runtime, or on Triton with --backend triton, and answer Triton's HTTP API
     (/v2/models/NAME/infer). Use --ft <path> to bypass the registry.
     """
+    if as_json and "run_json_out" not in ctx.meta:
+        # Messages (here, in the menu and in helpers) go to stderr; stdout
+        # carries only the JSON object.
+        ctx.meta["run_json_out"] = sys.stdout
+        with contextlib.redirect_stdout(sys.stderr):
+            return ctx.invoke(run.callback, **ctx.params)
+    json_out = ctx.meta.get("run_json_out") if as_json else None
+
+    def report(rec: proc.RunningProcess, ready: bool | None, error: str | None = None) -> None:
+        if json_out is not None:
+            json_out.write(json.dumps({**_model_fields(rec), "log": rec.log_file,
+                                       "ready": ready, "error": error}, indent=2) + "\n")
+            json_out.flush()
+
     spec: ModelSpec | None = None
     if ft_path:
         if profile:
@@ -1575,6 +1594,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     click.echo(f"Command: {shlex.join(cmd)}")
     click.echo(f"Logs:  {rec.log_file}")
     click.echo(f"Tail:  llmctl logs {rec.name}")
+    ready: bool | None = None           # not waited for
     if wait:
         # vllm/sglang load weights, profile memory and capture CUDA graphs
         # before they listen; llama-server is usually up in seconds.
@@ -1584,12 +1604,14 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
             proc.record_event(rec.name, "ready", f"pid {rec.pid} port {rec.port} after "
                               f"{time.time() - t0:.0f} s", pid=rec.pid, port=rec.port, by=by,
                               owner=owner)
+            ready = True
         else:
             why = ("exited before it was ready" if not proc._alive(rec.pid)
                    else f"not ready after {timeout} s")
             proc.record_event(rec.name, "start_failed", f"pid {rec.pid} {why}; log "
                               f"{rec.log_file}", pid=rec.pid, by=by, reason=why,
                               log=rec.log_file, owner=owner)
+            report(rec, False, why)
             raise SystemExit(1)
     elif backend in HF_ENGINES:
         click.echo(f"Note: {backend} takes a minute or more to become ready; use "
@@ -1605,6 +1627,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     if backend in CV_BACKENDS:
         click.echo(f"Infer: POST /v2/models/{name}/infer (Triton's HTTP API; through the "
                    f"gateway too). Config: GET /v2/models/{name}/config.")
+    report(rec, ready)
 
 
 @cli.command("ps")
@@ -1618,25 +1641,27 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
     STATE comes from the gateway's supervisor: starting, ready, restarting
     (down, a restart is due) or crashed (down, given up). RESTARTS counts its
     restarts since the gateway started. `llmctl events -f` follows them.
-    STATE paused is `llmctl pause` (`llmctl resume` starts it again)."""
+    STATE down is a model that should run (it was never stopped) but isn't,
+    and isn't being restarted: the gateway is off, the machine booted without
+    `llmctl restore`, it failed to start, or it died since the supervisor's
+    last look (every 2 s). STATE paused is `llmctl pause` (`llmctl resume`
+    starts it again)."""
     if show_all:
         return _ps_cluster()
     from llm_runner import supervisor
     procs = proc.list_running()
     states = supervisor.read_states()
     live = {p.name for p in procs}
-    rows = [{"name": p.name, "pid": p.pid, "port": p.port, "backend": p.backend,
-             "started_at": p.started_at, **_group_fields(p.group), "owner": p.owner,
-             "model_path": p.model_path, "runtime": p.runtime,
-             **_ps_state(states.get(p.name), alive=True)} for p in procs]
-    specs = {s.name: s for s in proc.autostart_list() if not s.paused}
-    for name, st in states.items():
-        if name not in live and st.get("state") in supervisor.DOWN_STATES and name in specs:
-            sp = specs[name]
-            rows.append({"name": name, "pid": None, "port": sp.port, "backend": sp.backend,
-                         "started_at": None, **_group_fields(sp.group), "owner": sp.owner,
-                         "model_path": sp.model_path, "runtime": sp.runtime,
-                         **_ps_state(st, alive=False)})
+    rows = [{**_model_fields(p), **_ps_state(states.get(p.name), alive=True)} for p in procs]
+    # Every model that was started and never stopped is listed, running or not,
+    # so a missing row means stopped (or never started).
+    for sp in proc.autostart_list():
+        if sp.name in live or sp.paused or sp.backend == GATEWAY:
+            continue
+        rows.append({"name": sp.name, "pid": None, "port": sp.port, "backend": sp.backend,
+                     "started_at": None, **_group_fields(sp.group), "owner": sp.owner,
+                     "model_path": sp.model_path, "runtime": sp.runtime,
+                     **_ps_state(states.get(sp.name), alive=False)})
     for sp in proc.paused_list():
         if sp.name not in live:
             rows.append({"name": sp.name, "pid": None, "port": sp.port, "backend": sp.backend,
@@ -1666,6 +1691,14 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
         click.echo(f"\nAll models: {_gateway_url(gw.port)}  (GET /v1/models lists them)")
 
 
+def _model_fields(p: proc.RunningProcess) -> dict:
+    """A running model as `ps --json` and `run --json` show it (without the
+    supervisor's state)."""
+    return {"name": p.name, "pid": p.pid, "port": p.port, "backend": p.backend,
+            "started_at": p.started_at, **_group_fields(p.group), "owner": p.owner,
+            "model_path": p.model_path, "runtime": p.runtime}
+
+
 def _group_fields(group: str | None) -> dict:
     """``group`` (the first) and, with several, ``groups``: the shape of the
     gateway's /v1/models, so a reader of one group keeps working."""
@@ -1676,10 +1709,13 @@ def _group_fields(group: str | None) -> dict:
 def _ps_state(st: dict | None, alive: bool) -> dict:
     """``ps`` columns from the supervisor's record (None: not supervised yet,
     e.g. the gateway is off or the model is new)."""
+    from llm_runner.supervisor import DOWN_STATES
     st = st or {}
     state = st.get("state")
-    if alive and state in ("restarting", "crashed"):
+    if alive and state in DOWN_STATES:
         state = "starting"          # restarted since the gateway last wrote
+    elif not alive and state not in DOWN_STATES:
+        state = "down"              # not being restarted, or died since the gateway wrote
     return {"state": state, "restarts": st.get("restarts", 0),
             "next_restart_in": st.get("next_restart_in") if not alive else None,
             "last_error": st.get("last_error")}

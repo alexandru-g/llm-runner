@@ -32,12 +32,19 @@ against it.
   `port`, `backend`, `started_at`, `group`, `model_path`, `runtime`,
   `state`, `restarts`, `next_restart_in`, `last_error`, (since 1.5)
   `owner`, and (since 1.6) `groups` for a model with several groups
-  (`group` is then the first).
+  (`group` is then the first). `state` is `starting`, `ready`,
+  `restarting`, `crashed`, `paused`, (since 1.14) `down`, or null for a
+  running model the gateway's supervisor hasn't seen yet. Since 1.14 every
+  model that was started and not stopped has a row, so a missing row means
+  stopped.
+- (since 1.14) `llmctl run --json` prints one object: the `ps --json`
+  keys from `name` to `runtime`, plus `log`, `ready` (`true`, `false`, or
+  null without `--wait`) and `error`. With `ready: false` the exit code is 1.
 
 - `--json` output of `install`, `verify`, `cache export`, `apply`,
-  `images`, `images load`, `images save`, (since 1.2) `ps` and (since 1.9)
-  `import`: the keys documented in the README keep their names, types and
-  meaning. New keys may appear; parse leniently.
+  `images`, `images load`, `images save`, (since 1.2) `ps`, (since 1.9)
+  `import` and (since 1.14) `run`: the keys documented in the README keep
+  their names, types and meaning. New keys may appear; parse leniently.
 
 ### File formats
 

@@ -1811,7 +1811,29 @@ What clients see:
 
 `llmctl ps` shows each model's STATE and RESTARTS (`--json` for scripts),
 including down models the gateway is restarting; `/v1/models` lists down
-models with `status: restarting` or `crashed`.
+models with `status: restarting` or `crashed`. Every model that was started
+and not stopped has a row, running or not: one that isn't being restarted
+(the gateway is off, the machine booted without `restore`, its start failed,
+or it died in the 2 s since the supervisor last looked) shows STATE `down`.
+So a model missing from `ps` was stopped.
+
+Programs that start models read `llmctl run MODEL --json` (with `--wait` to
+block until it answers) instead of its messages. It prints one JSON object
+on stdout, and everything else on stderr:
+
+```json
+{"name": "qwen3-8b", "pid": 41210, "port": 8101, "backend": "vllm",
+ "started_at": 1795467340.5, "group": "qwen3-8b", "owner": "gpuq-12 A3",
+ "model_path": "/models/qwen3-8b", "runtime": null,
+ "log": "~/.local/state/llm-runner/logs/qwen3-8b-8101-1795467340.log",
+ "ready": true, "error": null}
+```
+
+The keys are those of `ps --json` (without the supervisor's), plus `log`
+and `ready`: `true` once it answers, `null` without `--wait`, and `false`
+when the wait failed. Then `error` says why, and the exit code is 1. A
+command-line mistake exits 2 with no JSON. To follow the model after that,
+read `ps --json`, not llmctl's state files.
 
 When several people or agent sessions share a machine, tag who started what:
 `llmctl run MODEL --owner A1` (or `LLMCTL_OWNER=A1` in that session's
