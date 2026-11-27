@@ -7,6 +7,8 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-11-28
+
 ### Added
 
 - **The model's own sampling on llama.** `llmctl download` saves the
@@ -563,6 +565,7 @@ Highlights of the 0.x series: the SGLang backend and uv-installed engines
 API keys, offline mode, telemetry off, `/healthz` and `/readyz`, launch
 profiles, decision endpoints, vLLM and decider support.
 
+[1.16.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.16.0
 [1.15.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.15.0
 [1.14.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.14.0
 [1.13.0]: https://github.com/alexandru-g/llm-runner/releases/tag/v1.13.0
