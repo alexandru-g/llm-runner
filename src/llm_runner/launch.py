@@ -35,7 +35,8 @@ from llm_runner import backends
 from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner.backends import CV_BACKENDS, DECIDER, GATEWAY, HF_ENGINES, LLAMA, OMNI
-from llm_runner.registry import ModelSpec, default_group, looks_like_embedding_model
+from llm_runner.registry import (ModelSpec, default_group, generation_config,
+                                 looks_like_embedding_model, sampling_summary)
 
 CHOICES_FILE = proc.STATE_DIR / "launch.json"
 PROFILES_FILE = proc.STATE_DIR / "profiles.json"
@@ -121,6 +122,16 @@ def _group_values(t: Target) -> list[tuple[Any, str]]:
     return vals
 
 
+def _reasoning_values(t: Target) -> list[tuple[Any, str]]:
+    auto = "model default (off: decision model)" if t.decision else "model default"
+    return [(None, auto), (True, "on"), (False, "off")]
+
+
+def _sampling_values(t: Target) -> list[tuple[Any, str]]:
+    return [("model", f"model's ({sampling_summary(t.spec.model_path)})"),
+            ("server", "llama-server defaults")]
+
+
 def _draft_title(t: Target) -> str:
     return f"on ({t.spec.draft_path.name})" if t.spec.draft_path else "on"
 
@@ -134,12 +145,14 @@ SETTINGS: list[Setting] = [
     Setting("no_mmproj_offload", "Image encoder",
             lambda t: [(False, "GPU"), (True, "CPU (saves VRAM, slower images)")],
             lambda t: t.backend == LLAMA and t.spec.mmproj_path is not None),
-    Setting("no_draft", "MTP drafter",
+    Setting("no_draft", "Drafter",
             lambda t: [(False, _draft_title(t)), (True, "off")],
             lambda t: t.backend in (LLAMA, *HF_ENGINES) and t.spec.has_draft),
-    Setting("reasoning", "Reasoning",
-            lambda t: [(False, "off"), (True, "on")],
+    Setting("reasoning", "Reasoning", _reasoning_values,
             lambda t: t.backend == LLAMA),
+    Setting("sampling", "Sampling", _sampling_values,
+            lambda t: t.backend == LLAMA and not t.decision
+            and bool(generation_config(t.spec.model_path))),
     Setting("ctx_size", "Context", _ctx_values,
             lambda t: t.backend in (LLAMA, *HF_ENGINES)),
     Setting("kv_quant", "KV cache", _kv_values,
@@ -288,7 +301,7 @@ class _Menu:
         if self.remembered is not None:
             # The one profile that also restores the group.
             out.append(Profile("last", "this model's last run", dict(self.remembered)))
-        out.append(Profile("default", "llmctl's defaults", {}))
+        out.append(Profile("default", "as the model ships (its sampling and reasoning)", {}))
         if not self.tunable:
             return out
         out += [p for p in PROFILES if p.applies(self.target)]

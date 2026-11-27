@@ -375,7 +375,24 @@ speculative/MTP drafter (e.g. an `MTP/*-MTP.gguf`) are auto-fetched alongside �
 the drafter is flattened into the model folder so `run` can pair it
 automatically (see [Speculative decoding](#speculative-decoding-mtp-drafters)).
 
-Skip the picker for scripting with `--file`:
+`download` also saves the model's recommended sampling: the
+`generation_config.json` of the repo the GGUF was quantized from (the card's
+`base_model`), next to the GGUF. `run` passes it to llama-server (see
+[Start a model](#start-a-model)).
+
+Some repos keep two layouts of the same quants. Unsloth's Inkling 2 Mini has
+its own layout at the root, which only Unsloth's llama.cpp reads. The layout
+mainline llama.cpp reads sits in `Mainline_Support/`, as `.gguf_file` files.
+When a repo has such mainline copies of quants, drafters or projectors,
+`download` offers only those for that kind and saves them as `.gguf`;
+`Old_Support/` and imatrix files are never offered:
+
+```bash
+llmctl download unsloth/Inkling-2-Mini-GGUF     # → Inkling-2-Mini-UD-Q4_K_XL.gguf, …
+```
+
+Skip the picker for scripting with `--file` (the repo path, or the name it is
+saved as):
 
 ```bash
 llmctl download unsloth/gemma-4-E4B-it-GGUF --file gemma-4-E4B-it-Q4_K_M.gguf
@@ -534,7 +551,7 @@ to that model, with **Start** on top so Enter launches with what's shown:
      Profile         last  ▸
    * Vision          off (saves ~1 GB)
      Image encoder   GPU
-     Reasoning       off
+     Reasoning       model default
    * Context         8,192
      KV cache        f16
      Checkpoints     auto (off: decision model)
@@ -580,7 +597,7 @@ opens the list; pick one and press Enter on Start. The menu opens on `last`.
 | Profile | For | Sets |
 |---|---|---|
 | `last` | any model | what this model ran with last time (including its group and backend) |
-| `default` | any model | llmctl's defaults |
+| `default` | any model | llmctl's defaults, which follow the model: its own sampling (`generation_config.json`) and reasoning |
 | `fast` | chat models with a drafter | MTP on, f16 KV, one slot |
 | `long` | chat models | 128K context, q8_0 KV, drafter off, one slot |
 | `multi` | chat models on llama | 8 GB RAM prompt cache, one slot: several long conversations take turns without reprocessing |
@@ -606,9 +623,20 @@ its name, so editing a profile never changes a running model.
 - Default port: first free port from `8080`.
 - Default context size: `32768`.
 - Override either: `-p 8081 -c 65536`.
-- Reasoning is **disabled by default** on llama (`--reasoning-budget 0`). Pass
-  `--reasoning` to let the model's default reasoning behavior apply. On
-  vllm/sglang use `--reasoning-parser <name>` to get `reasoning_content` split out.
+- Reasoning follows the model on llama: the chat template decides (llama-server
+  `--reasoning auto`). `--reasoning` / `--no-reasoning` turn it on or off
+  (`--reasoning on|off`). Decision models run with it off. On vllm/sglang use
+  `--reasoning-parser <name>` to get `reasoning_content` split out. Before 1.16
+  reasoning was off unless `--reasoning` was given. `restart` and `resume` bring
+  a model started that way back with `--no-reasoning`.
+- Sampling follows the model on llama too: with a `generation_config.json`
+  beside the GGUF (`download` saves it), its temperature, top-p, top-k and min-p
+  become llama-server's defaults for requests that don't set their own. A
+  setting the file leaves out gets the neutral value (top-p 1, top-k off, min-p
+  0), as vLLM reads it. For Inkling 2 Mini that's temperature 1.0 and no
+  truncation, as its card recommends; for Gemma 4, temperature 1.0, top-p 0.95,
+  top-k 64. `--sampling server` keeps llama-server's own defaults, and `-X
+  '--temp 0.6'` overrides one flag. Without the file nothing is passed.
 - Serve an embedding model with `--embeddings` (see [Embedding models](#embedding-models)).
 - Process is detached (own session, survives the CLI exit). Stdout/stderr go
   to a per-instance log file under the state dir. `--wait` polls `/health`
@@ -636,7 +664,7 @@ dense models like Gemma-4-31B). This needs a `llama.cpp` build from **after
 2026-06-07**, when MTP landed.
 
 If a drafter sits next to the model (a sibling GGUF whose name contains `mtp`,
-`-assistant`, `-draft`, or `-eagle` — `llmctl list` shows a `DRAFT` marker), it
+`-assistant`, `-draft`, `-eagle` or `dspark` — `llmctl list` shows a `DRAFT` marker), it
 is wired up automatically:
 
 ```bash
@@ -666,7 +694,9 @@ llmctl run gemma-4-31b-it-q4_k_m --spec-draft-n-max 4
 
 - `--draft <path|key>` — drafter to pair with the model (overrides auto-detect).
 - `--no-draft` — ignore an auto-detected drafter and run the base model alone.
-- `--spec-type <type>` — `llama-server --spec-type` (default `draft-mtp`).
+- `--spec-type <type>` — `llama-server --spec-type`. Default `draft-dspark`
+  for a DSpark block drafter (`dspark-*.gguf`, Inkling 2 Mini's; needs
+  llama.cpp b12760 or later), else `draft-mtp`.
 - `--spec-draft-n-max <n>` — max draft tokens per step (default `3`; try 1–6).
 - `--n-parallel <n>` — server slots (`llama-server --parallel`). **Auto-set to
   `1` when a drafter is attached**, because MTP acceptance and prompt-prefix
@@ -1223,7 +1253,7 @@ How the shared `run` flags map:
 
 `--gpu-mem`, `--tool-parser`, `--reasoning-parser` and `--trust-remote-code`
 are vllm/sglang-only; `--n-gpu-layers`, `--no-vision`, `--no-mmproj-offload`, `--kv-unified`, `--cache-ram`,
-`--reasoning` and the embedding batch flags are llama-only. Passing one to the
+`--reasoning`, `--sampling` and the embedding batch flags are llama-only. Passing one to the
 other side prints a warning and ignores it. SGLang always gets
 `--enable-metrics` (the gateway reads its queue depth from `/metrics`), and
 `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0` so `/health` is an instant check
@@ -1717,7 +1747,8 @@ name and group don't, and the old version's cache is already warm. On the
 Keys: `model`, `port`, `args`, `env`, and the `run` options `backend`,
 `group` (`null` for none), `runtime`, `image`, `allow_tag`, `dns` (a list), `gpu`, `ctx`,
 `n_parallel`, `gpu_mem`, `kv_cache_mem`, `kv_quant`, `tool_parser`,
-`reasoning_parser`, `trust_remote_code`, `reasoning`, `embeddings`,
+`reasoning_parser`, `trust_remote_code`, `reasoning` (`true`/`false`; leave it
+out for the model's default), `sampling`, `embeddings`,
 `no_vision`, `no_mmproj_offload`, `draft`, `no_draft`, `spec_type`, `spec_n_max`,
 `n_gpu_layers`, `kv_unified`, `ctx_checkpoints`, `cache_ram`, `batch_size`,
 `ubatch_size`, `restart`, `restart_max`, `owner`.

@@ -67,6 +67,11 @@ class RunningProcess:
     owner: str | None = None
 
 
+def _reasoning_was_off(cmd: list[str]) -> bool:
+    pairs = list(zip(cmd, cmd[1:]))
+    return ("--reasoning-budget", "0") in pairs or ("--reasoning", "off") in pairs
+
+
 @dataclass
 class LaunchSpec:
     """The minimal recipe needed to relaunch a model after a reboot.
@@ -96,8 +101,17 @@ class LaunchSpec:
     paused: bool = False
 
     def run_cmd(self) -> list[str]:
-        """The ``llmctl run …`` argv that reproduces this launch, port pinned."""
-        return ["run", *self.run_args, "--port", str(self.port)]
+        """The ``llmctl run …`` argv that reproduces this launch, port pinned.
+
+        Before 1.16 ``run`` turned reasoning off unless ``--reasoning`` was
+        given; now it follows the model. A launch recorded with reasoning off
+        and no flag for it gets ``--no-reasoning``, so `restart` and `resume`
+        bring it back as it ran."""
+        args = list(self.run_args)
+        if self.backend == "llama" and _reasoning_was_off(self.cmd) and not any(
+                a in ("--reasoning", "--no-reasoning") for a in args):
+            args.append("--no-reasoning")
+        return ["run", *args, "--port", str(self.port)]
 
 
 def port_in_use(port: int) -> bool:

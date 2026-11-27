@@ -7,6 +7,40 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The model's own sampling on llama.** `llmctl download` saves the
+  `generation_config.json` of the repo a GGUF was quantized from (the card's
+  `base_model`) beside it. `run` passes its temperature, top-p, top-k and min-p
+  to llama-server as the defaults for requests that set none, with neutral
+  values for what it leaves out (top-p 1, top-k off, min-p 0), as vLLM reads it.
+  `--sampling server` keeps llama-server's defaults. The launch menu has a
+  Sampling row when the file is there, and `apply` takes `sampling`. Nothing
+  changes for a model without the file.
+- **DSpark drafters.** A `dspark-*.gguf` beside a model is its drafter
+  (`llmctl list` shows DRAFT, `run` attaches it) and gets `--spec-type
+  draft-dspark`. `--spec-type` now defaults by drafter: `draft-dspark` for
+  those, `draft-mtp` otherwise. This needs llama.cpp b12760 or later.
+- **`download` reads repos that keep a mainline layout apart.** Where a repo
+  has `.gguf_file` copies under a `Mainline_Support/` folder (Unsloth's
+  Inkling 2 Mini), `download` offers those for that kind of file and saves them
+  as `.gguf`. It also never offers imatrix files. `--file` takes the repo path
+  or the saved name. A recheck (`update`) of a file `download` renamed or moved
+  out of a repo folder no longer pulls it again.
+
+### Changed
+
+- **Reasoning follows the model on llama.** `run` no longer turns it off by
+  default: the chat template decides (llama-server `--reasoning auto`), except
+  for decision models, which keep it off. `--reasoning` / `--no-reasoning` turn
+  it on or off, as llama-server `--reasoning on` / `off`. Before, off was
+  `--reasoning-budget 0`. The launch menu's Reasoning row offers model default,
+  on and off. In `apply`, `reasoning: false` now means off; leaving it out means
+  the model's default. `restart` and `resume` of a launch recorded with
+  reasoning off and no flag for it add `--no-reasoning`, so running models come
+  back as they ran.
+- The launch menu's "MTP drafter" row is now "Drafter".
+
 ## [1.15.0] - 2026-11-26
 
 ### Added

@@ -67,13 +67,76 @@ MODELS_DIR = _resolve_models_dir()
 # with a base model rather than serving on its own. Such files are attached to
 # their sibling base model (like an mmproj) instead of listed as standalone
 # models. Canonical Gemma-4 MTP names match (`*-MTP.gguf`, `mtp-*.gguf`); the
-# `-assistant` / `-draft` / `-eagle` variants cover other drafter conventions.
-_DRAFT_NAME_HINTS = ("-mtp", "mtp-", "_mtp", "-assistant", "-draft", "-eagle")
+# `-assistant` / `-draft` / `-eagle` variants cover other drafter conventions,
+# and `dspark-*.gguf` is a DSpark block drafter (Inkling 2's, Unsloth's naming).
+_DRAFT_NAME_HINTS = ("-mtp", "mtp-", "_mtp", "-assistant", "-draft", "-eagle",
+                     "dspark-", "-dspark")
 
 
 def _looks_like_draft(stem: str) -> bool:
     low = stem.lower()
     return any(hint in low for hint in _DRAFT_NAME_HINTS)
+
+
+def draft_spec_type(draft: Path) -> str:
+    """llama-server's ``--spec-type`` for a drafter file: a DSpark block
+    drafter needs ``draft-dspark``; MTP heads and the rest take ``draft-mtp``."""
+    return "draft-dspark" if "dspark" in draft.name.lower() else "draft-mtp"
+
+
+# The model's recommended sampling, as its original (safetensors) repo ships
+# it. `download` saves that repo's generation_config.json beside the GGUF;
+# GGUF repos rarely carry one, and the GGUF header rarely has general.sampling.
+GENERATION_CONFIG = "generation_config.json"
+# llama-server flag per generation_config key, and the neutral value a key the
+# file leaves out gets (as vLLM reads it): only what the model asks for applies.
+_SAMPLING_FLAGS = (("temperature", "--temp", 1.0), ("top_p", "--top-p", 1.0),
+                   ("top_k", "--top-k", 0), ("min_p", "--min-p", 0.0))
+
+
+def generation_config(model_path: Path) -> dict:
+    """The sampling keys of the generation_config.json beside a GGUF (or in a
+    checkpoint dir); {} when there is none or it sets no sampling."""
+    folder = model_path if model_path.is_dir() else model_path.parent
+    try:
+        data = json.loads((folder / GENERATION_CONFIG).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for key, _, _ in _SAMPLING_FLAGS:
+        v = data.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[key] = v
+    return out
+
+
+def sampling_args(model_path: Path, skip: list[str] = ()) -> list[str]:
+    """llama-server default-sampling flags from the model's generation config
+    (none when it has no config). A flag already in ``skip`` (-X) is left to it."""
+    found = generation_config(model_path)
+    if not found:
+        return []
+    args: list[str] = []
+    for key, flag, neutral in _SAMPLING_FLAGS:
+        if flag in skip:
+            continue
+        v = found.get(key, neutral)
+        if key == "top_k":
+            v = max(int(v), 0)          # HF's "off" can be -1 or 0; llama's is 0
+        args += [flag, f"{v:g}" if isinstance(v, float) else str(v)]
+    return args
+
+
+def sampling_summary(model_path: Path) -> str:
+    """``temp 1, top-p 0.95, top-k 64, min-p 0`` for the menu."""
+    a = sampling_args(model_path)
+    names = {"--temp": "temp", "--top-p": "top-p", "--top-k": "top-k", "--min-p": "min-p"}
+    parts = []
+    for flag, value in zip(a[::2], a[1::2]):
+        parts.append(f"{names[flag]} {'off' if flag == '--top-k' and value == '0' else value}")
+    return ", ".join(parts)
 
 
 @dataclass(frozen=True)

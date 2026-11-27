@@ -49,7 +49,7 @@ def _next_free_port(start: int = 8080) -> int:
 
 
 def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size: int,
-                     reasoning: bool, *, kv_quant: str = "f16",
+                     reasoning: bool | None, *, kv_quant: str = "f16",
                      n_gpu_layers: int = 999, embeddings: bool = False,
                      pooling: str = "cls", batch_size: int | None = None,
                      ubatch_size: int | None = None, draft_path: Path | None = None,
@@ -58,6 +58,7 @@ def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size:
                      cache_ram: int = 0,
                      kv_unified: bool | None = None,
                      mmproj_offload: bool = True,
+                     sampling: list[str] | None = None,
                      host: str = "0.0.0.0",
                      extra: list[str] | None = None) -> list[str]:
     if embeddings:
@@ -122,8 +123,11 @@ def _build_llama_cmd(model_path: Path, mmproj: Path | None, port: int, ctx_size:
     # q8_0/q4_0 for the V cache require flash-attn, which is always on above.
     if kv_quant != "f16":
         cmd.extend(["--cache-type-k", kv_quant, "--cache-type-v", kv_quant])
-    if not reasoning:
-        cmd.extend(["--reasoning-budget", "0"])
+    # None: as the chat template has it (llama-server's --reasoning auto).
+    if reasoning is not None:
+        cmd.extend(["--reasoning", "on" if reasoning else "off"])
+    if sampling:
+        cmd.extend(sampling)
     if mmproj and mmproj.exists():
         cmd.extend(["--mmproj", str(mmproj)])
         # The vision encoder on the CPU: no VRAM for its weights and compute
@@ -279,7 +283,8 @@ def _require_backend(backend: str) -> str:
 # a mistake (or a stale `restart` override), so warn instead of silently
 # dropping it.
 _LLAMA_ONLY_PARAMS = {
-    "reasoning": "--reasoning", "n_gpu_layers": "--n-gpu-layers",
+    "reasoning": "--reasoning/--no-reasoning", "sampling": "--sampling",
+    "n_gpu_layers": "--n-gpu-layers",
     "no_vision": "--no-vision", "no_mmproj_offload": "--no-mmproj-offload",
     "kv_unified": "--kv-unified/--no-kv-unified",
     "cache_ram": "--cache-ram", "ctx_checkpoints": "--ctx-checkpoints",
@@ -1091,7 +1096,7 @@ def profile_list() -> None:
     """List the built-in profiles and yours."""
     from llm_runner import launch
     rows = [("last", "any model", "its last run (launch.json)", ""),
-            ("default", "any model", "llmctl's defaults", "")]
+            ("default", "any model", "as the model ships: its sampling and reasoning", "")]
     rows += [(p.name, p.audience, p.blurb,
               _profile_flags(p.values)) for p in launch.PROFILES]
     rows += [(n, f"chat on {r.get('backend', '?')}", "yours", _profile_flags(r["values"]))
@@ -1202,9 +1207,15 @@ def profile_rm(name: str) -> None:
               help="vllm only: fixed KV cache size per GPU (--kv-cache-memory-bytes), "
                    "e.g. 6G, instead of sizing it from free memory. Hybrid models "
                    "(Qwen3.5/3.6) need it for reliable warm restarts.")
-@click.option("--reasoning", is_flag=True, default=False,
-              help="Enable reasoning. Disabled by default (--reasoning-budget 0). "
-                   "llama only; for vllm/sglang see --reasoning-parser.")
+@click.option("--reasoning/--no-reasoning", default=None,
+              help="Turn reasoning on or off (llama-server --reasoning on|off). Default: "
+                   "as the model's chat template has it, except decision models, which "
+                   "run with it off. llama only; for vllm/sglang see --reasoning-parser.")
+@click.option("--sampling", type=click.Choice(["model", "server"]), default="model",
+              help="Default sampling for requests that don't set their own. model (the "
+                   "default): the model's generation_config.json, which `download` saves "
+                   "beside the GGUF; a setting it leaves out is neutral (top-p 1, top-k "
+                   "off, min-p 0). server: llama-server's own defaults. llama only.")
 @click.option("--kv-quant", type=click.Choice(["f16", "q8_0", "q4_0"]),
               default="f16",
               help="Quantize the KV cache to save VRAM. q8_0 ≈ half the f16 size "
@@ -1244,10 +1255,10 @@ def profile_rm(name: str) -> None:
 @click.option("--no-draft", is_flag=True, default=False,
               help="Don't use a speculative drafter even if one is auto-detected "
                    "next to the model.")
-@click.option("--spec-type", "spec_type", default="draft-mtp",
-              help="Speculative decoding type (llama-server --spec-type). "
-                   "Default draft-mtp, for Gemma-4-style MTP drafters. Only "
-                   "used when a drafter is attached.")
+@click.option("--spec-type", "spec_type", default=None,
+              help="Speculative decoding type (llama-server --spec-type). Default: "
+                   "draft-dspark for a DSpark drafter (dspark-*.gguf), else draft-mtp, "
+                   "for Gemma-4-style MTP drafters. Only used when a drafter is attached.")
 @click.option("--spec-draft-n-max", "--spec-n-max", "spec_n_max", type=int,
               default=3,
               help="Max draft tokens proposed per step (llama-server "
@@ -1302,13 +1313,13 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         runtime_kind: str | None, image: str | None, allow_tag: bool, dns: str | None, gpu: str | None,
         restart: str | None, restart_max: int | None,
         kv_cache_mem: str | None,
-        reasoning: bool,
+        reasoning: bool | None, sampling: str,
         kv_quant: str, gpu_mem: float | None, tool_parser: str | None,
         reasoning_parser: str | None, trust_remote_code: bool,
         n_gpu_layers: int, no_vision: bool, no_mmproj_offload: bool,
         embeddings: bool | None, pooling: str, batch_size: int | None,
         ubatch_size: int | None, draft_spec: str | None, no_draft: bool,
-        spec_type: str, spec_n_max: int, n_parallel: int | None,
+        spec_type: str | None, spec_n_max: int, n_parallel: int | None,
         cache_ram: int, kv_unified: bool | None, ctx_checkpoints: int | None) -> None:
     """Start MODEL in the background (also `llmctl start`).
 
@@ -1458,6 +1469,8 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                        "embedding servers.", err=True)
     elif not no_draft and backend != OMNI and backend not in CV_BACKENDS:
         draft_path = _resolve_draft(draft_spec, spec, backend)
+    if spec_type is None:
+        spec_type = registry.draft_spec_type(draft_path) if draft_path else "draft-mtp"
 
     extra_args = [tok for chunk in extra for tok in shlex.split(chunk)]
     env: dict[str, str] = {}
@@ -1537,6 +1550,15 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
             click.echo(f"Non-causal model: --batch-size {batch_size} --ubatch-size "
                        f"{ubatch_size} (each prompt is processed in one batch).")
 
+        if reasoning is None and decision:
+            reasoning = False
+        sampling_args: list[str] = []
+        if sampling == "model" and not embeddings and not decision:
+            sampling_args = registry.sampling_args(model_path, skip=extra_args)
+            if sampling_args:
+                click.echo(f"Sampling: {' '.join(sampling_args)} (the model's "
+                           "generation_config.json; --sampling server for llama-server's "
+                           "defaults).")
         cmd = _build_llama_cmd(model_path, mmproj, chosen_port, ctx_size, reasoning,
                                kv_quant=kv_quant, n_gpu_layers=n_gpu_layers,
                                embeddings=embeddings, pooling=pooling,
@@ -1545,6 +1567,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                                spec_n_max=spec_n_max, n_parallel=n_parallel,
                                cache_ram=cache_ram, kv_unified=kv_unified,
                                mmproj_offload=not no_mmproj_offload,
+                               sampling=sampling_args,
                                host=config_mod.get_bind_host(), extra=extra_args)
         # Report the llmctl name as the model id (as --served-model-name
         # does) instead of the GGUF path, so it matches the gateway's /v1/models.
@@ -3726,6 +3749,47 @@ def _preprocessor_shapes(folder: Path, graph: str) -> dict[str, str] | None:
             "opt": f"{b}x3x{h}x{w}", "max": f"{b}x3x{h}x{w}"}
 
 
+def _gguf_kind(name: str) -> str:
+    if "mmproj" in name.lower():
+        return "mmproj"
+    return "draft" if registry._looks_like_draft(Path(name).stem) else "quant"
+
+
+def _gguf_files(rfilenames: list[str]) -> dict[str, str]:
+    """``{repo path: name it is saved as}`` for the GGUFs llama-server can load.
+
+    Some repos (Unsloth's Inkling 2) put their own layout at the root and the
+    layout mainline llama.cpp reads under a ``Mainline_Support/`` folder, as
+    ``.gguf_file`` so tools don't mix the two up. Where a repo has such mainline
+    copies of a kind (quants, drafters, projectors), only they are offered for
+    it, saved as ``.gguf``. imatrix files are never offered."""
+    plain = {f: Path(f).name for f in rfilenames if f.endswith(".gguf")}
+    mainline = {f: Path(f).name[:-len("_file")] for f in rfilenames
+                if f.endswith(".gguf_file") and "mainline" in f.lower()}
+    kinds = {_gguf_kind(n) for n in mainline.values()}
+    files = {**{f: n for f, n in plain.items() if _gguf_kind(n) not in kinds}, **mainline}
+    return {f: n for f, n in files.items() if "imatrix" not in n.lower()}
+
+
+def _fetch_generation_config(info, repo_id: str, target_dir: Path) -> None:
+    """Save the model's recommended sampling beside the GGUF: the
+    generation_config.json of the repo it was quantized from (the card's
+    ``base_model``), else of this repo. `run` passes it to llama-server."""
+    from huggingface_hub import hf_hub_download
+    card = getattr(info, "card_data", None)
+    base = card.get("base_model") if card is not None else None
+    bases = [base] if isinstance(base, str) else list(base or [])
+    for repo in [*bases[:1], repo_id]:
+        try:
+            got = Path(hf_hub_download(repo_id=repo, filename=registry.GENERATION_CONFIG,
+                                       local_dir=str(target_dir)))
+        except Exception:       # none there, gated, offline: the defaults stand
+            continue
+        if registry.generation_config(got):
+            click.echo(f"  ✓ sampling from {repo}: {registry.sampling_summary(got)}")
+        return
+
+
 def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
                   no_draft: bool, subdir: str | None, *, revalidate: bool = False,
                   target_dir: Path | None = None, hf: bool = False) -> None:
@@ -3751,7 +3815,8 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
     except Exception as e:
         raise click.UsageError(f"Failed to fetch repo info for '{repo_id}': {e}") from e
 
-    siblings = {s.rfilename: s for s in info.siblings if s.rfilename.endswith(".gguf")}
+    local_names = _gguf_files([s.rfilename for s in info.siblings])
+    siblings = {s.rfilename: s for s in info.siblings if s.rfilename in local_names}
     names = [s.rfilename for s in info.siblings]
     if not hf and not siblings and any(n.endswith(".onnx") for n in names) and \
             not any(n.endswith(_HF_WEIGHT_SUFFIXES) for n in names):
@@ -3771,13 +3836,10 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
                      revalidate=revalidate)
         return
 
-    mmproj_names = sorted(f for f in siblings if "mmproj" in f.lower())
+    mmproj_names = sorted(f for f in siblings if _gguf_kind(local_names[f]) == "mmproj")
     # Drafters may live in an MTP/ subdir (rfilename keeps the path), so match
-    # on the basename stem, not the full rfilename.
-    draft_names = sorted(
-        f for f in siblings
-        if f not in set(mmproj_names) and registry._looks_like_draft(Path(f).stem)
-    )
+    # on the local name, not the full rfilename.
+    draft_names = sorted(f for f in siblings if _gguf_kind(local_names[f]) == "draft")
     companions = set(mmproj_names) | set(draft_names)
     quant_names = sorted(f for f in siblings if f not in companions)
     if not quant_names:
@@ -3792,7 +3854,8 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
             ) from e
         choices = [
             questionary.Choice(
-                title=f"{_fmt_size(getattr(siblings[name], 'size', None))}  {name}",
+                title=f"{_fmt_size(getattr(siblings[name], 'size', None))}  "
+                      f"{local_names[name]}",
                 value=name,
             )
             for name in quant_names
@@ -3805,12 +3868,14 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
         if selected is None:
             raise click.Abort()
     else:
-        if filename not in siblings:
+        # The repo path, or the name the file is saved as.
+        by_local = {v: k for k, v in local_names.items()}
+        if filename not in siblings and filename not in by_local:
             raise click.UsageError(
                 f"'{filename}' not found in {repo_id}. Available .gguf files:\n  "
-                + "\n  ".join(sorted(siblings))
+                + "\n  ".join(sorted(local_names.values()))
             )
-        selected = filename
+        selected = filename if filename in siblings else by_local[filename]
 
     # `--file <mmproj> --subdir <folder>` fetches only a vision projector into
     # an existing model folder (e.g. a base model's mmproj for a fine-tune whose
@@ -3829,7 +3894,8 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
                 import questionary
                 mm_choices = [
                     questionary.Choice(
-                        title=f"{_fmt_size(getattr(siblings[name], 'size', None))}  {name}",
+                        title=f"{_fmt_size(getattr(siblings[name], 'size', None))}  "
+                              f"{local_names[name]}",
                         value=name,
                     )
                     for name in mmproj_names
@@ -3851,7 +3917,8 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
                 import questionary
                 d_choices = [
                     questionary.Choice(
-                        title=f"{_fmt_size(getattr(siblings[name], 'size', None))}  {name}",
+                        title=f"{_fmt_size(getattr(siblings[name], 'size', None))}  "
+                              f"{local_names[name]}",
                         value=name,
                     )
                     for name in draft_names
@@ -3874,14 +3941,21 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
     to_download += [chosen_draft] if chosen_draft else []
     for f in to_download:
         # Flatten any repo subdir (e.g. MTP/foo.gguf) so companions land beside
-        # the base model where discovery's sibling-attach logic finds them.
-        dest = target_dir / Path(f).name
+        # the base model where discovery's sibling-attach logic finds them, and
+        # name a mainline `.gguf_file` back to `.gguf`.
+        dest = target_dir / local_names[f]
         before = dest.stat().st_size if dest.exists() else None
         if before and not revalidate:
             click.echo(f"  ✓ already present: {dest.name}")
             continue
         verb = "checking" if revalidate else "downloading"
         click.echo(f"  ↓ {verb} {f} ({_fmt_size(getattr(siblings[f], 'size', None))}) ...")
+        # Put a moved file back where hf_hub_download keeps it, so a recheck
+        # compares it with the remote instead of pulling it again.
+        at = target_dir / f
+        if before and at != dest:
+            at.parent.mkdir(parents=True, exist_ok=True)
+            dest.replace(at)
         local = Path(hf_hub_download(
             repo_id=repo_id,
             filename=f,
@@ -3899,6 +3973,7 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
 
     if not (companion_only and _read_source(target_dir).get("repo_id") not in (None, repo_id)):
         _write_source(target_dir, repo_id, to_download)
+        _fetch_generation_config(info, repo_id, target_dir)
 
     click.echo(f"\nFiles now in {target_dir}:")
     for p in sorted(target_dir.iterdir()):
