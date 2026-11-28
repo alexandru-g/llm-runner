@@ -26,6 +26,7 @@ from llm_runner import backends
 from llm_runner import bundle
 from llm_runner import containers
 from llm_runner import images
+from llm_runner import labels as labels_mod
 from llm_runner import config as config_mod
 from llm_runner import process as proc
 from llm_runner import usage as usage_mod
@@ -1051,9 +1052,12 @@ def config_models_dir(path: Path | None, create: bool) -> None:
               show_default=True,
               help="Order: by key, by last use (most recent first), or by size (largest first).")
 @click.option("-t", "by_time", is_flag=True, help="Same as --sort used.")
+@click.option("--label", "with_labels", multiple=True, metavar="LABEL",
+              help="Only models with this label (repeat: with all of them). "
+                   "`llmctl label` lists the labels.")
 @click.option("--json", "as_json", is_flag=True,
               help="Machine-readable JSON: models_dir and the models, in the chosen order.")
-def list_cmd(sort_by: str, by_time: bool, as_json: bool) -> None:
+def list_cmd(sort_by: str, by_time: bool, with_labels: tuple[str, ...], as_json: bool) -> None:
     """List models discovered on disk under MODELS_DIR (also `llmctl ls`).
 
     GGUF files are served by llama-server; Hugging Face checkpoint
@@ -1064,8 +1068,16 @@ def list_cmd(sort_by: str, by_time: bool, as_json: bool) -> None:
     LAST USED is the model's last request through this machine's gateway, or
     its last start by `llmctl run`, whichever is later. A request straight to
     a model's port (such as `speedtest`) doesn't count.
+
+    LABELS says what each model is or can do (chat, vision, reasoning, tools,
+    embed, image, decide, ...): detected from its files, with your changes
+    (`llmctl label`).
     """
     specs = discover_models()
+    tags = {key: labels_mod.of_spec(spec) for key, spec in specs.items()}
+    if with_labels:
+        want = {labels_mod.check_name(x) for x in with_labels}
+        specs = {k: v for k, v in specs.items() if want <= set(tags[k])}
     used = _last_used(specs)
     if by_time or sort_by == "used":
         specs = dict(sorted(specs.items(), key=lambda kv: (-(used.get(kv[0]) or 0), kv[0])))
@@ -1075,26 +1087,25 @@ def list_cmd(sort_by: str, by_time: bool, as_json: bool) -> None:
         click.echo(json.dumps({"models_dir": str(MODELS_DIR), "models": [
             {"key": key, "backend": spec.backend, "size": spec.size,
              "last_used": used.get(key), "vision": spec.has_vision, "draft": spec.has_draft,
-             "decision": spec.decision, "path": str(spec.model_path)}
+             "decision": spec.decision, "labels": tags[key], "path": str(spec.model_path)}
             for key, spec in specs.items()]}, indent=2))
         return
     click.echo(f"Models dir: {MODELS_DIR}")
     if not specs:
-        click.echo("\n(no models found — use `llmctl download <repo>` to fetch one)")
+        click.echo(f"\n(no models labelled {', '.join(with_labels)})" if with_labels else
+                   "\n(no models found — use `llmctl download <repo>` to fetch one)")
         return
     key_w = max(20, max(len(k) for k in specs))
+    tag_w = max(6, max(len(",".join(tags[k])) for k in specs))
     sources = {key: _read_source(s.model_path if s.model_path.is_dir() else s.model_path.parent)
                for key, s in specs.items()}
     click.echo("")
     click.echo(f"{'KEY':<{key_w}}  {'BACKEND':<7}  {'SIZE':>8}  {'LAST USED':<10}  "
-               f"{'VISION':<6}  {'DRAFT':<6}  "
-               f"{'DECISION':<8}  {'REVISION':<12}  {'LICENSE':<12}  PATH")
-    click.echo("-" * (key_w + 107))
+               f"{'LABELS':<{tag_w}}  {'DRAFT':<6}  {'REVISION':<12}  {'LICENSE':<12}  PATH")
+    click.echo("-" * (key_w + tag_w + 91))
     for key, spec in specs.items():
         size = _fmt_size(spec.size).strip()
-        vision = "yes" if spec.has_vision else ""
         draft = "yes" if spec.has_draft else ""
-        decision = "yes" if spec.decision else ""
         src = sources[key]
         meta = _cv_meta(spec) if not (src.get("license") and src.get("revision")) else {}
         rev = str(src.get("revision") or meta.get("revision") or meta.get("version") or "")[:12]
@@ -1102,8 +1113,7 @@ def list_cmd(sort_by: str, by_time: bool, as_json: bool) -> None:
         rel = spec.model_path.relative_to(MODELS_DIR) if spec.model_path.is_relative_to(MODELS_DIR) else spec.model_path
         last = usage_mod.ago(used.get(key))
         click.echo(f"{key:<{key_w}}  {spec.backend:<7}  {size:>8}  {last:<10}  "
-                   f"{vision:<6}  {draft:<6}  "
-                   f"{decision:<8}  {rev:<12}  {lic:<12}  {rel}")
+                   f"{','.join(tags[key]):<{tag_w}}  {draft:<6}  {rev:<12}  {lic:<12}  {rel}")
 
 
 def _last_used(specs: dict) -> dict[str, float | None]:
@@ -1190,6 +1200,220 @@ def profile_rm(name: str) -> None:
         raise click.UsageError(f"No profile '{name}'. Yours: "
                                + (", ".join(launch.user_profiles()) or "(none)"))
     click.echo(f"Deleted profile '{name}'.")
+
+
+# ------------------------------------------------------------- labels --
+
+@cli.group("label", invoke_without_command=True)
+@click.pass_context
+def label_group(ctx: click.Context) -> None:
+    """Labels: what each model is or can do (chat, vision, image, ...).
+
+    llmctl detects chat, vision, reasoning, tools, ocr, embed, rerank, image,
+    decide and cv from a model's files; add your own (code, ...) or take a
+    detected one away. Changes are kept in the model's folder
+    (.llmctl-labels.json), shared by every quant in it.
+
+    A label routes: a request for "chat" goes to a running model labelled
+    chat when no model or group has that name (`label prefer` says which
+    first). `llmctl run chat` picks among the chat models, `llmctl list
+    --label chat` lists them.
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(label_list)
+
+
+def _interactive() -> bool:
+    """Someone at a terminal to ask."""
+    return sys.stdin.isatty()
+
+
+def _label_target(model: str | None, prompt: str) -> tuple[str, ModelSpec, dict]:
+    specs = discover_models()
+    if not specs:
+        raise click.UsageError("No models found on disk.")
+    if model is None:
+        model = _pick_model_interactively(specs, prompt)
+    key = _model_key(model, specs)
+    if key is None:
+        raise click.BadArgumentUsage(f"Unknown model '{model}'. `llmctl list` shows them.")
+    return key, specs[key], specs
+
+
+def _sharing(spec: ModelSpec, specs: dict) -> list[str]:
+    """The models whose labels are kept in the same file as ``spec``'s."""
+    at = labels_mod.sidecar(spec.model_path)
+    return [k for k, s in specs.items() if labels_mod.sidecar(s.model_path) == at]
+
+
+def _ask_labels(title: str, current: list[str], detected: list[str],
+                in_use: list[str] = ()) -> list[str] | None:
+    """Tick a model's labels (space toggles, Enter keeps); None if cancelled."""
+    try:
+        import questionary
+    except ImportError as e:
+        raise click.UsageError("questionary not installed. Use `llmctl label add/rm`.") from e
+    names = labels_mod.known([*current, *in_use])
+    w = max(len(n) for n in names)
+    choices = [questionary.Choice(
+        title=f"{n:<{w}}  {'(detected) ' if n in detected else ''}{labels_mod.about(n)}".rstrip(),
+        value=n, checked=n in current) for n in names]
+    return questionary.checkbox(
+        title, choices=choices,
+        instruction="(space toggles, Enter keeps; `llmctl label create` adds one to this list)",
+    ).ask()
+
+
+def _in_use(specs: dict) -> list[str]:
+    return sorted({x for s in specs.values() for x in (labels_mod.edits(s.model_path) or {})
+                   .get("add", [])})
+
+
+@label_group.command("list")
+def label_list() -> None:
+    """Every label: how many models here have it, and what it means."""
+    specs = discover_models()
+    tags = {k: labels_mod.of_spec(s) for k, s in specs.items()}
+    count: dict[str, int] = {}
+    for found in tags.values():
+        for x in found:
+            count[x] = count.get(x, 0) + 1
+    names = labels_mod.known(list(count))
+    mine = labels_mod.created()
+    w = max(5, max(len(n) for n in names))
+    click.echo(f"{'LABEL':<{w}}  {'MODELS':>6}  {'FROM':<8}  ABOUT")
+    for n in names:
+        src = "detected" if n in labels_mod.BUILTIN else "yours" if n in mine else "used"
+        click.echo(f"{n:<{w}}  {count.get(n, 0):>6}  {src:<8}  {labels_mod.about(n)}".rstrip())
+    prefs = labels_mod.preferences()
+    if prefs:
+        click.echo("\nPreferred (a request for the label tries these first):")
+        for n, order_ in prefs.items():
+            click.echo(f"  {n}: {', '.join(order_)}")
+    click.echo("\n`llmctl list --label NAME` lists a label's models; `llmctl label show MODEL` "
+               "one model's.")
+
+
+@label_group.command("show")
+@click.argument("model", required=False)
+def label_show(model: str | None) -> None:
+    """A model's labels: detected, added and removed."""
+    key, spec, specs = _label_target(model, "Select a model:")
+    detected = labels_mod.detect_spec(spec)
+    changed = labels_mod.edits(spec.model_path) or {}
+    click.echo(f"{key}: {', '.join(labels_mod.of_spec(spec)) or '(none)'}")
+    click.echo(f"  detected: {', '.join(detected) or '-'}")
+    click.echo(f"  added:    {', '.join(changed.get('add') or []) or '-'}")
+    click.echo(f"  removed:  {', '.join(changed.get('remove') or []) or '-'}")
+    others = [k for k in _sharing(spec, specs) if k != key]
+    if changed or others:
+        click.echo(f"  kept in {labels_mod.sidecar(spec.model_path)}"
+                   + (f", shared with {', '.join(others)}" if others else ""))
+
+
+def _change_labels(model: str, add: list[str], remove: list[str]) -> None:
+    key, spec, specs = _label_target(model, "")
+    current = labels_mod.of_spec(spec)
+    wanted = [x for x in current if x not in remove] + [x for x in add if x not in current]
+    path = labels_mod.set_labels(spec, wanted)
+    click.echo(f"{key}: {', '.join(labels_mod.of_spec(spec)) or '(none)'}")
+    others = [k for k in _sharing(spec, specs) if k != key]
+    if others:
+        click.echo(f"  (kept in {path}, so also for {', '.join(others)})")
+    unknown = [x for x in add if x not in labels_mod.known(_in_use(specs))]
+    if unknown:
+        click.echo(f"  new label: {', '.join(unknown)} (`llmctl label create NAME --about TEXT` "
+                   "describes it)")
+
+
+@label_group.command("add")
+@click.argument("model")
+@click.argument("names", nargs=-1, required=True, metavar="LABEL...")
+def label_add(model: str, names: tuple[str, ...]) -> None:
+    """Give MODEL these labels (a new name makes a new label)."""
+    _change_labels(model, [labels_mod.check_name(x) for x in names], [])
+
+
+@label_group.command("rm")
+@click.argument("model")
+@click.argument("names", nargs=-1, required=True, metavar="LABEL...")
+def label_rm(model: str, names: tuple[str, ...]) -> None:
+    """Take these labels from MODEL (a detected one stays off)."""
+    _change_labels(model, [], [labels_mod.check_name(x) for x in names])
+
+
+@label_group.command("edit")
+@click.argument("model", required=False)
+def label_edit(model: str | None) -> None:
+    """Tick MODEL's labels in a checklist."""
+    key, spec, specs = _label_target(model, "Select a model to label:")
+    picked = _ask_labels(f"Labels for {key}:", labels_mod.of_spec(spec),
+                         labels_mod.detect_spec(spec), _in_use(specs))
+    if picked is None:
+        raise click.Abort()
+    labels_mod.set_labels(spec, picked)
+    click.echo(f"{key}: {', '.join(labels_mod.of_spec(spec)) or '(none)'}")
+
+
+@label_group.command("reset")
+@click.argument("model")
+def label_reset(model: str) -> None:
+    """Forget MODEL's label changes: back to what's detected."""
+    key, spec, _ = _label_target(model, "")
+    with contextlib.suppress(FileNotFoundError):
+        labels_mod.sidecar(spec.model_path).unlink()
+    click.echo(f"{key}: {', '.join(labels_mod.of_spec(spec)) or '(none)'}")
+
+
+@label_group.command("create")
+@click.argument("name")
+@click.option("--about", default="", help="What the label means (shown in the lists).")
+def label_create(name: str, about: str) -> None:
+    """Make a label of your own, so the download checklist offers it."""
+    name = labels_mod.check_name(name)
+    if name in labels_mod.BUILTIN:
+        raise click.UsageError(f"'{name}' is detected by llmctl; it needs no creating.")
+    labels_mod.create(name, about)
+    click.echo(f"Label '{name}' created. `llmctl label add MODEL {name}` gives it to a model.")
+
+
+@label_group.command("delete")
+@click.argument("name")
+def label_delete(name: str) -> None:
+    """Delete a label you created (models keep it until `label rm`)."""
+    name = labels_mod.check_name(name)
+    if name in labels_mod.BUILTIN:
+        raise click.UsageError(f"'{name}' is detected by llmctl; `llmctl label rm MODEL "
+                               f"{name}` takes it from one model.")
+    if not labels_mod.delete(name):
+        raise click.UsageError(f"No label '{name}' of yours. Yours: "
+                               + (", ".join(labels_mod.created()) or "(none)"))
+    click.echo(f"Deleted label '{name}'.")
+
+
+@label_group.command("prefer")
+@click.argument("label")
+@click.argument("names", nargs=-1, metavar="[MODEL|GROUP]...")
+@click.option("--clear", is_flag=True, help="Forget the order.")
+def label_prefer(label: str, names: tuple[str, ...], clear: bool) -> None:
+    """Which models a request for LABEL goes to first, in order.
+
+    Without names, prints the order. Names are model or group names as the
+    gateway knows them, on any node; the models not named come after, ready
+    and local first. Kept on this machine: each gateway uses its own.
+
+      llmctl label prefer chat gemma-4-31b-it inkling-2-mini
+    """
+    label = labels_mod.check_name(label)
+    if clear:
+        labels_mod.set_preference(label, [])
+        click.echo(f"{label}: no preferred order.")
+        return
+    if names:
+        labels_mod.set_preference(label, list(dict.fromkeys(names)))
+    order_ = labels_mod.preferences().get(label)
+    click.echo(f"{label}: {', '.join(order_)}" if order_ else
+               f"{label}: no preferred order (ready, then node priority, then local).")
 
 
 @cli.command()
@@ -1402,6 +1626,9 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     vLLM-Omni and answer /v1/images/generations; CV models (ONNX) run on ONNX
     Runtime, or on Triton with --backend triton, and answer Triton's HTTP API
     (/v2/models/NAME/infer). Use --ft <path> to bypass the registry.
+
+    MODEL can also be a label (`llmctl run image`): you pick one of the models
+    labelled so, or it starts the only one. `llmctl label` lists the labels.
     """
     if as_json and "run_json_out" not in ctx.meta:
         # Messages (here, in the menu and in helpers) go to stderr; stdout
@@ -1435,6 +1662,17 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         picked = not model
         if picked:
             model = _pick_model_interactively(specs)
+        elif model not in specs and labels_mod.NAME.fullmatch(model):
+            # A label: pick one of its models (the only one, without asking).
+            labelled = {k: v for k, v in specs.items() if model in labels_mod.of_spec(v)}
+            if len(labelled) > 1 and not _interactive():
+                raise click.BadArgumentUsage(
+                    f"Several models are labelled {model}; name one:\n  "
+                    + "\n  ".join(labelled))
+            if labelled:
+                picked = True
+                model = (next(iter(labelled)) if len(labelled) == 1 else
+                         _pick_model_interactively(labelled, f"Select a {model} model to run:"))
         if model not in specs:
             available = "\n  ".join(specs)
             raise click.BadArgumentUsage(
@@ -1778,6 +2016,11 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
                          "started_at": None, **_group_fields(sp.group), "owner": sp.owner,
                          "model_path": sp.model_path, "runtime": sp.runtime,
                          **_ps_state(None, alive=False), "state": "paused"})
+    cmds = {sp.name: sp.cmd for sp in [*proc.autostart_list(), *proc.paused_list()]}
+    cmds.update({p.name: p.cmd for p in procs})
+    for r in rows:
+        r["labels"] = labels_mod.of_launch(r["name"], r["backend"], r.get("model_path"),
+                                           cmds.get(r["name"]) or [])
     if as_json:
         from llm_runner import gpu
         live_pids = [r["pid"] for r in rows if r["pid"]]
@@ -1792,9 +2035,15 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
     if not rows:
         click.echo("(no models running)")
         return
+    # GROUPS and LABELS come last, after the columns scripts read.
+    rt_w = max(7, max(len(_runtime_label(r["runtime"])) for r in rows))
+    grp = {r["name"]: ",".join(r.get("groups") or ([r["group"]] if r.get("group") else []))
+           for r in rows}
+    grp_w = max(6, max(len(g) for g in grp.values()))
     click.echo(f"{'PID':<8} {'PORT':<6} {'BACKEND':<8} {'STARTED':<20} {'NAME':<28} "
-               f"{'STATE':<11} {'RESTARTS':<8} {'OWNER':<10} RUNTIME")
-    click.echo("-" * 120)
+               f"{'STATE':<11} {'RESTARTS':<8} {'OWNER':<10} {'RUNTIME':<{rt_w}} "
+               f"{'GROUPS':<{grp_w}} LABELS")
+    click.echo("-" * (120 + rt_w + grp_w))
     for r in rows:
         started = (dt.datetime.fromtimestamp(r["started_at"]).strftime("%Y-%m-%d %H:%M:%S")
                    if r["started_at"] else "-")
@@ -1803,7 +2052,8 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
             state += f" ({r['next_restart_in']:.0f}s)"
         click.echo(f"{r['pid'] or '-':<8} {r['port']:<6} {r['backend']:<8} {started:<20} "
                    f"{r['name']:<28} {state:<11} {r['restarts']:<8} {r['owner'] or '-':<10} "
-                   f"{_runtime_label(r['runtime'])}")
+                   f"{_runtime_label(r['runtime']):<{rt_w}} {grp[r['name']] or '-':<{grp_w}} "
+                   f"{','.join(r['labels']) or '-'}".rstrip())
     gw = _gateway_record()
     if gw:
         click.echo(f"\nAll models: {_gateway_url(gw.port)}  (GET /v1/models lists them)")
@@ -1939,8 +2189,8 @@ def _ps_cluster() -> None:
 
         gw_ = max([len(groups(m)) for m in models] + [5])
         click.echo(f"  {'MODEL':<{w}}  {'GROUP':<{gw_}}  {'NODE':<12} {'PRIO':<5} "
-                   f"{'STATUS':<8} {'PORT':<6} CTX")
-        click.echo("-" * (w + gw_ + 50))
+                   f"{'STATUS':<8} {'PORT':<6} {'CTX':<7} LABELS")
+        click.echo("-" * (w + gw_ + 66))
         for m in sorted(models, key=lambda m: (m["llmctl"].get("group") or m["id"], m["id"])):
             group = groups(m)
             for n, inst in enumerate(m["llmctl"]["nodes"]):
@@ -1949,9 +2199,12 @@ def _ps_cluster() -> None:
                 click.echo(f"{'→' if first else ' '} {m['id'] if first else '':<{w}}  "
                            f"{group if first else '':<{gw_}}  {node:<12} "
                            f"{inst['priority']:<5} {inst['status']:<8} {inst['port'] or '':<6} "
-                           f"{inst['context'] or ''}")
+                           f"{inst['context'] or '':<7} "
+                           f"{','.join(m['llmctl'].get('labels') or []) if first else ''}"
+                           .rstrip())
         click.echo("\n→ = where calls go (ready first, then lowest priority, then this machine)."
-                   "\nA GROUP name reaches its best member on any node.")
+                   "\nA GROUP name reaches its best member on any node; so does a label "
+                   "when no model or group has its name.")
     _echo_cluster_line(status)
 
 
@@ -3851,7 +4104,7 @@ def _snapshot_hf(repo_id: str, info, target_dir: Path, *, revalidate: bool) -> N
 
     click.echo(f"\nFiles now in {target_dir}:")
     for p in sorted(target_dir.iterdir()):
-        if p.is_file() and p.name != _SOURCE_FILE:
+        if p.is_file() and p.name not in (_SOURCE_FILE, labels_mod.FILE):
             click.echo(f"  {p.name}  ({_fmt_size(p.stat().st_size)})")
         elif diffusers and p.is_dir() and not p.name.startswith("."):
             # A pipeline's components: one folder each.
@@ -4174,7 +4427,7 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
 
     click.echo(f"\nFiles now in {target_dir}:")
     for p in sorted(target_dir.iterdir()):
-        if p.is_file() and p.name != _SOURCE_FILE:
+        if p.is_file() and p.name not in (_SOURCE_FILE, labels_mod.FILE):
             click.echo(f"  {p.name}  ({_fmt_size(p.stat().st_size)})")
 
 
@@ -4193,8 +4446,11 @@ def _run_download(repo_id: str, filename: str | None, no_mmproj: bool,
               help="Fetch the repo as a Hugging Face checkpoint for vllm "
                    "(safetensors + config) even if it also has GGUFs. "
                    "Repos without GGUFs are snapshotted this way automatically.")
+@click.option("--label", "with_labels", multiple=True, metavar="LABEL",
+              help="Give the model this label besides the detected ones, without the "
+                   "checklist (repeatable).")
 def download(repo_id: str, filename: str | None, no_mmproj: bool, no_draft: bool,
-             subdir: str | None, hf: bool) -> None:
+             subdir: str | None, hf: bool, with_labels: tuple[str, ...]) -> None:
     """Download a model from a Hugging Face REPO_ID into MODELS_DIR.
 
     GGUF repos: pick a quant (served by llama-server).
@@ -4211,10 +4467,39 @@ def download(repo_id: str, filename: str | None, no_mmproj: bool, no_draft: bool
       # a base model's vision projector into a fine-tune's folder
       llmctl download unsloth/Qwen3.5-4B-GGUF --file mmproj-F16.gguf --subdir h2o-lightning-4b
 
-    Records the source repo so `llmctl update` can re-check it later.
+    Records the source repo so `llmctl update` can re-check it later. A new
+    model's labels (chat, vision, ...; `llmctl label`) are then ticked in a
+    checklist, the detected ones already ticked; --label, or no terminal,
+    skips it.
     """
     _require_online("download")
+    extra = [labels_mod.check_name(x) for x in with_labels]
     _run_download(repo_id, filename, no_mmproj, no_draft, subdir, hf=hf)
+    _label_download(MODELS_DIR / (subdir or _derive_subdir(repo_id)), extra)
+
+
+def _label_download(folder: Path, extra: list[str]) -> None:
+    """Labels for what a download brought: the checklist once per folder
+    (skipped when its labels were already set), or ``extra`` on top of the
+    detected ones."""
+    specs = discover_models()
+    here = {k: s for k, s in specs.items()
+            if s.model_path == folder or s.model_path.parent == folder}
+    if not here:
+        return
+    key, spec = next(iter(here.items()))
+    if extra:
+        for s in {labels_mod.sidecar(s.model_path): s for s in here.values()}.values():
+            labels_mod.set_labels(s, [*labels_mod.of_spec(s), *extra])
+    elif labels_mod.edits(spec.model_path) is None and _interactive():
+        picked = _ask_labels(f"Labels for {', '.join(here)}:", labels_mod.of_spec(spec),
+                             labels_mod.detect_spec(spec), _in_use(specs))
+        if picked is None:
+            click.echo("Labels left as detected.")
+        else:
+            labels_mod.set_labels(spec, picked)
+    for k, s in here.items():
+        click.echo(f"Labels of {k}: {', '.join(labels_mod.of_spec(s)) or '(none)'}")
 
 
 def _resolve_update_target(target: str | None) -> tuple[str, Path, str | None]:

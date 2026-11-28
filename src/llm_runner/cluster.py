@@ -86,6 +86,11 @@ class Instance:
         only one llmctl before 1.6 sends)."""
         return self.info.get("groups") or ([self.group] if self.group else [])
 
+    @property
+    def labels(self) -> list[str]:
+        """What it is or can do (chat, vision, ...; llmctl 1.19+)."""
+        return self.info.get("labels") or []
+
     def answers_to(self, name: str) -> bool:
         return name == self.id or name in self.groups
 
@@ -101,13 +106,25 @@ def split_pin(requested: str) -> tuple[str, str | None]:
     return (name, node) if at and name and node else (requested, None)
 
 
+def _preferred(i: Instance, names: list[str]) -> int:
+    """Where ``i`` stands in a label's preferred order (models or groups)."""
+    for n, name in enumerate(names):
+        if i.answers_to(name):
+            return n
+    return len(names)
+
+
 def pick(instances: list[Instance], requested: object, api: str,
-         needs_vision: bool = False) -> list[Instance]:
+         needs_vision: bool = False,
+         prefer: dict[str, list[str]] | None = None) -> list[Instance]:
     """The instances a request may go to, best first. Raises :class:`Unroutable`.
 
     ``requested`` is a model id, a group (any of its members will do), a
-    unique prefix of either, or empty when only one model serves ``api``;
-    ``name@node`` keeps it to one node."""
+    unique prefix of either, a label (any model labelled so will do; only
+    when no model or group has the name, and never by prefix), or empty when
+    only one model serves ``api``; ``name@node`` keeps it to one node.
+    ``prefer`` orders a label's models: ``{label: [model or group, ...]}``,
+    the ones named first in that order, then the rest as a group's are."""
     pool = [i for i in instances if i.api == api]
     kind = {SYSTEMONE: "decision endpoint", IMAGES: "image model",
             KSERVE: "CV model"}.get(api, "model")
@@ -117,6 +134,12 @@ def pick(instances: list[Instance], requested: object, api: str,
         for g in i.groups:
             if g in groups:
                 groups[g].append(i.id)
+    labels: dict[str, list[str]] = {}
+    for i in pool:
+        for lb in i.labels:
+            if lb not in ids and lb not in groups:
+                labels.setdefault(lb, []).append(i.id)
+    by_label = False
     listing = ", ".join(ids) or "(none running)"
     if requested is not None and not isinstance(requested, str):
         raise Unroutable(400, "invalid_model", "\"model\" must be a string.")
@@ -132,6 +155,8 @@ def pick(instances: list[Instance], requested: object, api: str,
                              f"Several {kind}s are running; set \"model\" to one of: {listing}")
     elif name in ids or name in groups:
         chosen = name
+    elif name in labels:
+        chosen, by_label = name, True
     else:
         prefixed = [i for i in ids if i.startswith(name)]
         owners = {i.group for i in pool if i.id in prefixed}
@@ -150,7 +175,7 @@ def pick(instances: list[Instance], requested: object, api: str,
             raise Unroutable(404, "model_not_found",
                              f"No running {kind} named \"{name}\". Running: {listing}")
 
-    cands = [i for i in pool if i.answers_to(chosen)]
+    cands = [i for i in pool if (chosen in i.labels if by_label else i.answers_to(chosen))]
     if node is not None:
         where = ", ".join(sorted({i.node for i in cands}))
         cands = [i for i in cands if i.node == node]
@@ -165,6 +190,10 @@ def pick(instances: list[Instance], requested: object, api: str,
                              f"(running on: {', '.join(sorted({i.node for i in cands}))}; "
                              "start one with its mmproj).")
         cands = seeing
+    names = (prefer or {}).get(chosen) if by_label else None
+    if names:
+        return sorted(order(cands), key=lambda i: (_STATUS_RANK.get(i.status, 2),
+                                                   _preferred(i, names)))
     return order(cands)
 
 

@@ -146,11 +146,16 @@ def choices(entries: list[dict]) -> list[Model]:
 
 
 def resolve(entries: list[dict], identifier: str) -> Model:
-    """``identifier`` (a model, a group, or either as ``name@node``) as a Model."""
+    """``identifier`` (a model, a group, a label, or any as ``name@node``) as
+    a Model. A label picks what the gateway would: its preferred order
+    (``llmctl label prefer``), else ready and local first."""
     name, node = split_pin(identifier)
     entry = next((e for e in entries if e.get("id") == name), None) or next(
         (e for e in entries if name in ((e.get("llmctl") or {}).get("groups")
                                         or [(e.get("llmctl") or {}).get("group")])), None)
+    if entry is None and (entry := _by_label(entries, name, node)) is not None:
+        # One conversation stays with one model.
+        identifier = entry["id"] + (f"@{node}" if node else "")
     if entry is None:
         raise click.UsageError(f"No running model matches '{name}'. Running: "
                                + (", ".join(sorted(e["id"] for e in entries)) or "(none)") + ".")
@@ -163,6 +168,24 @@ def resolve(entries: list[dict], identifier: str) -> Model:
         raise click.UsageError(f"{entry['id']} isn't running on node '{node}'. It is on: "
                                + ", ".join(str(c.get("node")) for c in copies) + ".")
     return _model(entry, copy, identifier)
+
+
+def _by_label(entries: list[dict], label: str, node: str | None) -> dict | None:
+    from llm_runner import labels as labels_mod
+    hits = [e for e in entries if not (e.get("llmctl") or {}).get("members")
+            and label in ((e.get("llmctl") or {}).get("labels") or [])
+            and (node is None or any(c.get("node") == node for c in _copies(e)))
+            and not refusal(e)]
+    if not hits:
+        return None
+    names = labels_mod.preferences().get(label) or []
+
+    def rank(e: dict) -> tuple:
+        info = e.get("llmctl") or {}
+        answers = [e.get("id"), *(info.get("groups") or [info.get("group")])]
+        first = next((n for n, x in enumerate(names) if x in answers), len(names))
+        return (info.get("status") != "ready", first, not info.get("local"), e.get("id"))
+    return sorted(hits, key=rank)[0]
 
 
 def parse_value(text: str) -> Any:

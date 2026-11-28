@@ -512,16 +512,19 @@ llmctl list -t            # most recently used first (same as --sort used)
 llmctl list --sort size   # largest first
 ```
 
-Shows discovered models with key, size, when each was last used,
-vision/draft markers, and path:
+Shows discovered models with key, size, when each was last used, labels,
+draft marker, and path:
 
 ```
-KEY                     SIZE  LAST USED   VISION  DRAFT  DECISION  PATH
-gemma-4-31b-it-q4_k_m   17G   8m ago              yes              gemma-4-31b-it/gemma-4-31B-it-Q4_K_M.gguf
-gemma-4-e4b-it-q4_k_m   2.4G  2d ago      yes                      gemma-4-e4b-it/gemma-4-E4B-it-Q4_K_M.gguf
-qwen3-8b-q5_k_m         5.4G  2026-09-14                           qwen3-8b/Qwen3-8B-Q5_K_M.gguf
-gemma-4-e4b-it-q8_0     5.0G  never       yes                      gemma-4-e4b-it/gemma-4-E4B-it-Q8_0.gguf
+KEY                     SIZE  LAST USED   LABELS                       DRAFT  PATH
+gemma-4-31b-it-q4_k_m   17G   8m ago      chat,reasoning,tools         yes    gemma-4-31b-it/gemma-4-31B-it-Q4_K_M.gguf
+gemma-4-e4b-it-q4_k_m   2.4G  2d ago      chat,vision,reasoning,tools         gemma-4-e4b-it/gemma-4-E4B-it-Q4_K_M.gguf
+bge-m3-q8_0             605M  2026-09-14  embed                               bge-m3/bge-m3-Q8_0.gguf
+flux.1-dev              31G   never       image                               flux.1-dev
 ```
+
+`llmctl list --label vision` lists only the models with that label (repeat
+`--label` to need several). See [Labels](#labels).
 
 **LAST USED** is the later of a model's last request through this machine's
 gateway and its last start by `llmctl run`. A request that another node's
@@ -537,7 +540,7 @@ disambiguated by prefixing with the parent dir name. A `DRAFT` marker means a
 speculative/MTP drafter sits alongside and is auto-attached on `run` (see
 [Speculative decoding](#speculative-decoding-mtp-drafters)).
 
-A `DECISION` marker flags a calibrated decision model (e.g. Quyet): an
+A `decide` label flags a calibrated decision model (e.g. Quyet): an
 ordinary checkpoint whose answer is the next-token probability of option
 letters under a vendor-specific prompt, rescaled with fitted temperatures. It
 is detected from a `quyet_config.json` beside the weights or a
@@ -929,14 +932,62 @@ llmctl run gemma-4-31b-it-q4_k_m --ngl 48
 For a 17 GB Q4 weight file on a 24 GB card, `--kv-quant q8_0 -c 16384`
 (optionally `--no-vision`) is usually enough to fit comfortably.
 
+### Labels
+
+A label says what a model is or can do. llmctl detects these from the files,
+each time it looks (a projector added later makes a model `vision`):
+
+| Label | When |
+|---|---|
+| `chat` | It generates text: a llama, vllm or sglang model that isn't one of the others below |
+| `vision` | It reads images: a projector (mmproj) beside the GGUF, or a vision tower in the checkpoint |
+| `reasoning` | Its chat template can think (`enable_thinking`, `reasoning_content`, `reasoning_effort`) |
+| `tools` | Its chat template takes `tools` |
+| `ocr` | `ocr` in its name |
+| `embed` | An embedding model (the same check that turns on `--embeddings`) |
+| `rerank` | `rerank` in its name |
+| `image` | A diffusers pipeline (image generation) |
+| `decide` | A decision model, or a decider checkpoint |
+| `cv` | A computer-vision model (ONNX) |
+
+```bash
+llmctl label                                  # every label, how many models have it
+llmctl label show glm-ocr-q8_0                # detected, added, removed
+llmctl label add qwen3.6-27b-ud-q4_k_xl code  # a new name makes a new label
+llmctl label rm glm-ocr-q8_0 chat             # a detected one stays off
+llmctl label edit gemma-4-31b-it-ud-q4_k_xl   # tick them in a checklist
+llmctl label reset glm-ocr-q8_0               # back to what's detected
+llmctl label create code --about "good at code"   # offer it in the checklists
+```
+
+Your changes are kept in the model's folder, in `.llmctl-labels.json`, so
+every quant in the folder shares them and they travel with a copy of it (a
+GGUF right in MODELS_DIR gets its own `.<file>.llmctl-labels.json`).
+`llmctl download` asks for a new model's labels in the same checklist, the
+detected ones ticked; `--label NAME` adds one without asking, and without a
+terminal the detected ones stay.
+
+A label also works where a model name does:
+
+- **Requests:** `"model": "chat"` reaches a running model labelled chat, on
+  any node, when no model or group has that name. Unlike a group's, its
+  models needn't be interchangeable, so say which come first: `llmctl label
+  prefer chat gemma-4-31b-it inkling-2-mini` (model or group names; the rest
+  follow, ready first, then node priority). Each gateway keeps its own order.
+  A label is never matched by prefix, and `/v1/models` doesn't list labels as
+  models; each model shows its own in `llmctl.labels`.
+- **`llmctl run image`** starts the only model labelled image, or lets you pick
+  one; **`llmctl chat chat`** talks to one (and stays with it).
+
 ### List running models
 
 ```bash
 llmctl ps
 ```
 
-Prints PID, port, start time, name and runtime (`host`, or `docker` with the
-image's short digest). Dead entries are pruned automatically.
+Prints PID, port, start time, name, state, owner, runtime (`host`, or `docker`
+with the image's short digest), and last its groups and labels. Dead entries
+are pruned automatically.
 When the gateway is up, its all-models URL is printed underneath.
 
 `llmctl ps --json` adds, for each model, the GPU memory its engine uses

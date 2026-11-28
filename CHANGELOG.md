@@ -7,6 +7,30 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Model labels:** what each model is or can do. llmctl detects `chat`,
+  `vision`, `reasoning` and `tools` (from the chat template), `ocr`, `embed`,
+  `rerank`, `image`, `decide` and `cv`; you add your own (`code`, ...) or take
+  a detected one away with `llmctl label add|rm|edit|reset MODEL`, and describe
+  new ones with `llmctl label create`. Changes live in the model's folder
+  (`.llmctl-labels.json`), shared by its quants. `llmctl label` lists them.
+- **A label routes like a group:** a request for `"chat"` goes to a running
+  model labelled chat when no model or group has that name (never by prefix);
+  `llmctl label prefer chat MODEL...` sets which go first. `llmctl run chat`
+  starts the only chat model or lets you pick one, and `llmctl chat chat`
+  talks to one.
+- **`llmctl download` asks for the labels** of a new model in a checklist, the
+  detected ones ticked (`--label` or no terminal skips it).
+- **`llmctl list --label NAME`** filters; `labels` in `list --json`, `ps --json`
+  and the gateway's `/v1/models` (`llmctl.labels`).
+- **`llmctl ps` shows GROUPS and LABELS** as its last columns, and `ps -a` LABELS.
+
+### Changed
+
+- `llmctl list` shows a LABELS column in place of VISION and DECISION (the
+  `vision` and `decide` labels; `--json` keeps those keys).
+
 ## [1.18.0] - 2026-11-28
 
 ### Added

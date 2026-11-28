@@ -40,10 +40,17 @@ against it.
   engine and its child processes, in MiB; null when not running, in a
   container, or on a Jetson), and the object has `gpus`: a list of `{index,
   name, total_mib, free_mib, unified}`. On a Jetson the one entry is the
-  system's memory (`unified: true`, `free_mib` from MemAvailable).
+  system's memory (`unified: true`, `free_mib` from MemAvailable). Since
+  1.19 each row also has `labels` (a list of names, see below).
 - (since 1.18) `llmctl list --json` prints `{"models_dir", "models": [...]}`,
   each with `key`, `backend`, `size` (bytes), `last_used` (epoch seconds or
   null), `vision`, `draft`, `decision` and `path`, in the order `--sort` asks.
+  Since 1.19 also `labels`.
+- (since 1.19) Labels: the names llmctl detects (`chat`, `vision`,
+  `reasoning`, `tools`, `ocr`, `embed`, `rerank`, `image`, `decide`, `cv`)
+  keep their meaning; how they're detected may improve. A request's `model`
+  that names no running model or group but a label goes to a model with that
+  label (see the gateway below).
 - (since 1.14) `llmctl run --json` prints one object: the `ps --json`
   keys from `name` to `runtime`, plus `log`, `ready` (`true`, `false`, or
   null without `--wait`) and `error`. With `ready: false` the exit code is 1.
@@ -121,6 +128,9 @@ against it.
   `local`, `status`, `port`, `context`, `vision`, `runtime`, `image`,
   `image_digest`), and since 1.1 `image_id` (in both). Since 1.6 a model in
   several groups also has `groups` (all of them; `group` stays the first).
+  Since 1.19 `labels`, and a `model` that is a label (no model or group by
+  that name) routes to a running model with it, in the order `llmctl label
+  prefer` sets on the gateway asked, else as a group's members.
 - API keys: `Authorization: Bearer <key>` as configured with `llmctl
   gateway auth`.
 - Since 1.17: remote control, `POST /control/v1/exec` and `GET
@@ -148,7 +158,7 @@ that bumps the protocol version and is a major release.
   `msg`, and for `event: "request"` the keys listed in the README. They
   never contain prompt or reply text.
 - State files under the state directory (`running.json`, `autostart.json`,
-  `usage.json` (1.17),
+  `usage.json` (1.17), `label-cache.json` (1.19),
   `profiles.json`, `images.json`, `supervisor.json`, `events.jsonl`,
   `holds.json`, `cache/`) and `config.json`. Use `llmctl ps --json` and `llmctl events
   --json`. Use the commands that manage

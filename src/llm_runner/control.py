@@ -61,7 +61,10 @@ KEY_ENV = "LLMCTL_CONTROL_KEY"
 ALLOWED = {
     ("apply",), ("autostart", "list"), ("autostart", "status"), ("chat",),
     ("decide", "profiles"), ("decide", "spec"), ("decide", "start"),
-    ("download",), ("events",), ("list",), ("logs",), ("pause",), ("profile",),
+    ("download",), ("events",), ("label",), ("label", "add"), ("label", "create"),
+    ("label", "delete"), ("label", "edit"), ("label", "list"), ("label", "prefer"),
+    ("label", "reset"), ("label", "rm"), ("label", "show"),
+    ("list",), ("logs",), ("pause",), ("profile",),
     ("profile", "list"), ("profile", "rm"), ("ps",), ("registry", "status"),
     ("restart",), ("restore",), ("resume",), ("rm",), ("run",), ("show",),
     ("speedtest",), ("stop",), ("update",), ("verify",), ("version",),

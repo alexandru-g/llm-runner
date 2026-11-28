@@ -53,6 +53,7 @@ from urllib.parse import quote, unquote, urlsplit
 from llm_runner import __version__
 from llm_runner import auth
 from llm_runner import config as config_mod
+from llm_runner import labels as labels_mod
 from llm_runner import logs
 from llm_runner import metrics as metrics_mod
 from llm_runner import usage as usage_mod
@@ -487,6 +488,9 @@ class LocalModels:
             par = _flag(m.cmd, "--parallel", "-np", "--max-num-seqs",
                         "--max-running-requests")
             info["parallel"] = int(par) if par and par.isdigit() else None
+        info["labels"] = labels_mod.of_instance(
+            m.name, m.backend, m.model_path, vision=bool(info.get("vision")),
+            decision=bool(info.get("decision")), embeddings=info.get("embeddings"))
         return {"id": m.name, "object": "model", "created": int(m.started_at),
                 "owned_by": "llmctl", "llmctl": info}
 
@@ -1210,7 +1214,8 @@ def make_handler(gw: Gateway):
             try:
                 # An image pipeline takes its input images itself (edits).
                 cands = pick(gw.instances(local_only=hop), requested, api,
-                             needs_vision=api != IMAGES and has_images(payload))
+                             needs_vision=api != IMAGES and has_images(payload),
+                             prefer=labels_mod.preferences())
             except Unroutable as e:
                 name, pin = split_pin(requested) if isinstance(requested, str) else (None, None)
                 if e.code == "model_not_found" and pin is None and \
@@ -1244,7 +1249,8 @@ def make_handler(gw: Gateway):
             name, _, rest = path[len("/v2/models/"):].partition("/")
             name = unquote(name)
             try:
-                cands = pick(gw.instances(local_only=hop), name, KSERVE)
+                cands = pick(gw.instances(local_only=hop), name, KSERVE,
+                             prefer=labels_mod.preferences())
             except Unroutable as e:
                 bare, pin = split_pin(name)
                 if e.code == "model_not_found" and pin is None and \

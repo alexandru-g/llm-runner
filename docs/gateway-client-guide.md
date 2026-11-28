@@ -79,6 +79,7 @@ This is the standard OpenAI list, plus an `llmctl` block on each entry:
 | `llmctl.context`, `vision`, `embeddings`, `decision`, `parallel` | What the best copy can do. Per-machine values are in `nodes`. |
 | `llmctl.nodes` | Every copy, best first: ready copies, then lower priority number, then the machine you asked. |
 | `llmctl.members` | Present only on a group entry; lists its model ids. |
+| `llmctl.labels` | What it is or can do (llmctl 1.19+): `chat`, `vision`, `reasoning`, `tools`, `embed`, `image`, `decide`, ... and any the operator added. |
 
 A group gets its own entry in the list once two or more different models
 belong to it. Every model entry carries its `group` either way.
@@ -94,7 +95,8 @@ The `"model"` field accepts these forms:
 | `"gemma-4-26b-a4b-it-ud-q4_k_m"` | Exactly this model, on whichever machine is best. |
 | `"gemma-4-26b-a4b-it"` | The group: any of its members, typically every quant of one model. The best member answers. |
 | `"gemma-4-26b"` | A prefix. Unique prefixes work. A prefix matching several quants of one group means the group. |
-| `"quyet@orin"` | Pins a machine. Works with ids, groups and prefixes. |
+| `"chat"` | A label (llmctl 1.19+): any running model labelled so (`chat`, `vision`, `embed`, `image`, ...), when no model or group has that name. Never matched by prefix. The node's `llmctl label prefer` order goes first. |
+| `"quyet@orin"` | Pins a machine. Works with ids, groups, labels and prefixes. |
 | no `model` | Allowed only when exactly one model serves that kind of request. |
 
 Recommendations:

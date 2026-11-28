@@ -106,6 +106,7 @@ def test_list_json(gguf):
     first = out["models"][0]
     assert first == {"key": "big-q4", "backend": "llama", "size": 4 * 1024 ** 3,
                      "last_used": 1.8e9, "vision": True, "draft": True, "decision": False,
+                     "labels": ["chat", "vision"],
                      "path": str(registry.MODELS_DIR / "big" / "big-Q4.gguf")}
     assert {m["key"] for m in out["models"]} >= {"big-q4", "qwen3-v1", "qwen3-v2"}
 
