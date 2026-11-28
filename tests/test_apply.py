@@ -118,18 +118,24 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_ensure_gateway", lambda: None)
     monkeypatch.setattr(cli, "_port_in_use", lambda port: False)
     started = []
+    sleepers: list[subprocess.Popen] = []
     real = subprocess.Popen
 
     def popen(argv, **kw):
         started.append(argv)
-        return real(["sleep", "60"], start_new_session=True)
+        sleepers.append(real(["sleep", "60"], start_new_session=True))
+        return sleepers[-1]
     monkeypatch.setattr(proc.subprocess, "Popen", popen)
     yield started
-    for p in proc._load():
+    # Only what this fixture started: never pids read from a state file,
+    # which could be the machine's real one (2026-11-28 a test that undid
+    # the monkeypatches killed the live gateway and a served model).
+    for s in sleepers:
         try:
-            os.killpg(p.pid, 9)
+            os.killpg(s.pid, 9)
         except ProcessLookupError:
             pass
+        s.wait()
 
 
 def _apply(*args):
