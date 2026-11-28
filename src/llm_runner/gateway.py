@@ -55,6 +55,7 @@ from llm_runner import auth
 from llm_runner import config as config_mod
 from llm_runner import logs
 from llm_runner import metrics as metrics_mod
+from llm_runner import usage as usage_mod
 from llm_runner import process as proc
 from llm_runner import supervisor as sup_mod
 from llm_runner import tracing
@@ -227,6 +228,15 @@ class LocalModels:
         self._holds_lock = threading.Lock()
         self._cut: dict[tuple[str, int], int] = {}
         self._relaying: dict[tuple[str, int], int] = {}     # requests per local engine
+        # When each model last served a request (`llmctl list --sort used`).
+        self.usage = usage_mod.Tracker(state_file.parent)
+
+    def note_used(self, name: str) -> None:
+        """A request reached ``name`` on this machine (directly, or forwarded
+        by another node's gateway)."""
+        with self._lock:
+            path = next((m.model_path for m in self._records if m.name == name), "")
+        self.usage.note(path, name)
 
     def stopping(self, name: str, pid: int | None) -> bool:
         """`llmctl stop` (or `apply`) is taking down ``name``'s engine ``pid``:
@@ -1003,9 +1013,15 @@ def make_handler(gw: Gateway):
             o = self._obs
             self._log_request()
             self._export_span()
+            c = o["inst"]
+            # Recorded where the model runs, so a hop counts too (not metrics:
+            # the gateway that took the call counts those). Only what the
+            # engine answered: the gateway's own errors carry a code.
+            if c is not None and c.local and o["status"] is not None and \
+                    o["code"] in (None, "client_left"):
+                gw.local.note_used(c.id)
             if not o["count"]:
                 return
-            c = o["inst"]
             lbl = {"model": c.id if c else "", "node": c.node if c else "",
                    "backend": (c.info.get("backend") or "") if c else ""}
             m = gw.metrics
@@ -1123,6 +1139,8 @@ def make_handler(gw: Gateway):
 
             if path.startswith("/registry/v1/"):
                 return self._registry(path, body)
+            if path.startswith("/control/v1/"):
+                return self._control(path, body)
             # A request from another gateway: authenticated, and never sent on.
             hop = HOP_HEADER in self.headers
             if hop and not self._authorized():
@@ -1283,6 +1301,63 @@ def make_handler(gw: Gateway):
                 gw.sync_from_table()
                 return self._json(200, {"ok": True})
             return self._error(404, "not_found", f"No registry endpoint {self.command} {path}.")
+
+        # ------------------------------------------------------------ control --
+        def _control(self, path: str, body: bytes) -> None:
+            """`llmctl … --node THIS`: run an llmctl command here and relay its
+            terminal (see llm_runner.control)."""
+            from llm_runner import control
+            work = None
+            try:
+                who = control.authorize(self.headers, self.client_address[0], token=gw.token,
+                                        policy=gw.access(), nodes=gw.view.nodes(),
+                                        node=gw.node)
+                if path == control.STATUS_PATH and self.command == "GET":
+                    s = control.settings()
+                    return self._json(200, {"node": gw.node, "version": __version__,
+                                            "control": s["on"], "nodes": s["nodes"],
+                                            "you": who})
+                if path != control.EXEC_PATH or self.command != "POST":
+                    return self._error(404, "not_found",
+                                       f"No route {self.command} {path}.")
+                try:
+                    req = json.loads(body or b"{}")
+                except ValueError:
+                    return self._error(400, "invalid_json", "Body is not valid JSON.")
+                argv = req.get("argv") if isinstance(req, dict) else None
+                command = control.check_argv(argv)
+                files = req.get("files") or {}
+                if files:
+                    work = control.workdir()
+                argv = control.stage_files(command, list(argv), files, work)
+            except control.Refused as e:
+                return self._error(e.status, e.code, e.message)
+            if (self.headers.get("Upgrade") or "").lower() != control.UPGRADE:
+                return self._error(400, "upgrade_needed",
+                                   f"Send Upgrade: {control.UPGRADE} (llmctl --node does).")
+            size = req.get("size")
+            size = tuple(size) if isinstance(size, list) and len(size) == 2 and all(
+                isinstance(n, int) and 0 < n < 10000 for n in size) else None
+            logs.emit(f"control: {who} runs llmctl {' '.join(argv)}", event="control",
+                      who=who, argv=argv)
+            self.send_response(101)
+            self.send_header("Upgrade", control.UPGRADE)
+            self.send_header("Connection", "Upgrade")
+            self.end_headers()
+            self.wfile.flush()
+            self._replied, self._obs["status"] = True, 101
+            self.close_connection = True
+            try:
+                code = control.run_exec(self.connection, argv, who=who,
+                                        use_tty=bool(req.get("tty")), size=size,
+                                        term=req.get("term") if isinstance(req.get("term"), str)
+                                        else None)
+                logs.emit(f"control: {who}: llmctl {argv[0]} exited {code}", event="control",
+                          who=who, exit_code=code)
+            finally:
+                if work is not None:
+                    import shutil
+                    shutil.rmtree(work, ignore_errors=True)
 
         # --------------------------------------------------------- forwarding --
         def _forward(self, cands: list[Instance], path_for, body_for) -> None:
@@ -1721,6 +1796,7 @@ def serve(port: int = DEFAULT_PORT, host: str = "0.0.0.0") -> None:
             time.sleep(0.05)
         stop.set()
         gw.local.flush_cuts()
+        gw.local.usage.flush()
         gw.goodbye()
         if gw.exporter is not None:
             gw.exporter.close()

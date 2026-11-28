@@ -28,6 +28,7 @@ from llm_runner import containers
 from llm_runner import images
 from llm_runner import config as config_mod
 from llm_runner import process as proc
+from llm_runner import usage as usage_mod
 from llm_runner import registry
 from llm_runner import cv
 from llm_runner import engines as engines_mod
@@ -463,6 +464,20 @@ class _AliasGroup(click.Group):
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
         return super().get_command(ctx, self.ALIASES.get(cmd_name, cmd_name))
+
+    def main(self, args=None, *a, **kw):
+        # `--node NAME` anywhere: run the command on that node, in this terminal.
+        from llm_runner import control
+        argv = list(sys.argv[1:] if args is None else args)
+        node, rest = control.split_node(argv)
+        if node is not None:
+            if not control.is_self(node):
+                code = control.exec_remote(node, rest)
+                if kw.get("standalone_mode", True):
+                    sys.exit(code)
+                return code
+            argv = rest
+        return super().main(argv, *a, **kw)
 
 
 @click.group(cls=_AliasGroup)
@@ -1018,26 +1033,40 @@ def config_models_dir(path: Path | None, create: bool) -> None:
 
 
 @cli.command("list")
-def list_cmd() -> None:
+@click.option("--sort", "sort_by", type=click.Choice(["key", "used", "size"]), default="key",
+              show_default=True,
+              help="Order: by key, by last use (most recent first), or by size (largest first).")
+@click.option("-t", "by_time", is_flag=True, help="Same as --sort used.")
+def list_cmd(sort_by: str, by_time: bool) -> None:
     """List models discovered on disk under MODELS_DIR (also `llmctl ls`).
 
     GGUF files are served by llama-server; Hugging Face checkpoint
     directories (config.json + safetensors) by vllm, or by decider.serve when
     they carry a decider_config.json; diffusers pipelines (model_index.json,
     e.g. FLUX.1) by vLLM-Omni (backend omni) for image generation.
+
+    LAST USED is the model's last request through this machine's gateway, or
+    its last start by `llmctl run`, whichever is later. A request straight to
+    a model's port (such as `speedtest`) doesn't count.
     """
     click.echo(f"Models dir: {MODELS_DIR}")
     specs = discover_models()
     if not specs:
         click.echo("\n(no models found — use `llmctl download <repo>` to fetch one)")
         return
+    used = _last_used(specs)
+    if by_time or sort_by == "used":
+        specs = dict(sorted(specs.items(), key=lambda kv: (-(used.get(kv[0]) or 0), kv[0])))
+    elif sort_by == "size":
+        specs = dict(sorted(specs.items(), key=lambda kv: (-(kv[1].size or 0), kv[0])))
     key_w = max(20, max(len(k) for k in specs))
     sources = {key: _read_source(s.model_path if s.model_path.is_dir() else s.model_path.parent)
                for key, s in specs.items()}
     click.echo("")
-    click.echo(f"{'KEY':<{key_w}}  {'BACKEND':<7}  {'SIZE':>8}  {'VISION':<6}  {'DRAFT':<6}  "
+    click.echo(f"{'KEY':<{key_w}}  {'BACKEND':<7}  {'SIZE':>8}  {'LAST USED':<10}  "
+               f"{'VISION':<6}  {'DRAFT':<6}  "
                f"{'DECISION':<8}  {'REVISION':<12}  {'LICENSE':<12}  PATH")
-    click.echo("-" * (key_w + 95))
+    click.echo("-" * (key_w + 107))
     for key, spec in specs.items():
         size = _fmt_size(spec.size).strip()
         vision = "yes" if spec.has_vision else ""
@@ -1048,8 +1077,26 @@ def list_cmd() -> None:
         rev = str(src.get("revision") or meta.get("revision") or meta.get("version") or "")[:12]
         lic = str(src.get("license") or meta.get("license") or "")[:12]
         rel = spec.model_path.relative_to(MODELS_DIR) if spec.model_path.is_relative_to(MODELS_DIR) else spec.model_path
-        click.echo(f"{key:<{key_w}}  {spec.backend:<7}  {size:>8}  {vision:<6}  {draft:<6}  "
+        last = usage_mod.ago(used.get(key))
+        click.echo(f"{key:<{key_w}}  {spec.backend:<7}  {size:>8}  {last:<10}  "
+                   f"{vision:<6}  {draft:<6}  "
                    f"{decision:<8}  {rev:<12}  {lic:<12}  {rel}")
+
+
+def _last_used(specs: dict) -> dict[str, float | None]:
+    """``{key: last use}``: usage.json by model path; for a model without an
+    entry, its latest start in events.jsonl (under its key)."""
+    recorded = usage_mod.load()
+    starts: dict[str, float] | None = None
+    out: dict[str, float | None] = {}
+    for key, spec in specs.items():
+        t = usage_mod.last_used(recorded.get(str(spec.model_path)))
+        if t is None:
+            if starts is None:
+                starts = usage_mod.starts_from_events()
+            t = starts.get(key)
+        out[key] = t
+    return out
 
 
 def _cv_meta(spec: ModelSpec) -> dict:
@@ -1602,6 +1649,7 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
                      model_path=str(model_path), run_args=run_args,
                      backend=backend, env=env, group=group, runtime=runtime,
                      restart=restart, restart_max=restart_max, owner=owner)
+    usage_mod.note_start(str(model_path), rec.name)
     by, why = (ctx.obj or {}).get("by", "run"), (ctx.obj or {}).get("reason")
     proc.record_event(rec.name, "started", f"by {by}" + (f", {why}" if why else "")
                       + f"; pid {rec.pid} port {rec.port}", pid=rec.pid, port=rec.port,
@@ -3030,15 +3078,21 @@ def gateway_auth(state: str | None, local: tuple[str, ...], local_default: bool,
 def gateway_key(ctx: click.Context) -> None:
     """API keys for callers from outside (see `llmctl gateway auth`)."""
     if ctx.invoked_subcommand is None:
+        from llm_runner import control
         keys = config_mod.load().get("gateway_keys") or {}
-        click.echo("\n".join(sorted(keys)) or "No keys (`llmctl gateway key add NAME`).")
+        ctl = set(control.settings()["keys"])
+        click.echo("\n".join(k + ("  (control)" if k in ctl else "") for k in sorted(keys))
+                   or "No keys (`llmctl gateway key add NAME`).")
         if config_mod.get_upstream_key():
             click.echo("This gateway's own key for the registry: set (`key set --clear`).")
 
 
 @gateway_key.command("add")
 @click.argument("name")
-def gateway_key_add(name: str) -> None:
+@click.option("--control", "control_scope", is_flag=True,
+              help="Also let it run llmctl commands here remotely (`llmctl --node`), "
+                   "once `llmctl gateway control on`.")
+def gateway_key_add(name: str, control_scope: bool) -> None:
     """Make a key called NAME and print it. Only its hash is kept, so copy it now."""
     from llm_runner import auth
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
@@ -3050,8 +3104,15 @@ def gateway_key_add(name: str) -> None:
     key = auth.new_key()
     keys[name] = auth.hash_key(key)
     config_mod.update(gateway_keys=keys)
+    if control_scope:
+        from llm_runner import control
+        config_mod.update(gateway_control_keys=sorted({*control.settings()["keys"], name}))
     click.echo(key)
-    click.echo(f"Key {name} added; it is not shown again.", err=True)
+    click.echo(f"Key {name} added{' (control)' if control_scope else ''}; it is not "
+               "shown again.", err=True)
+    if control_scope and not config_mod.load().get("remote_control"):
+        click.echo("note: remote control is off, so the key can't use it yet "
+                   "(`llmctl gateway control on`).", err=True)
     if config_mod.load().get("gateway_auth") != auth.ON:
         click.echo("note: auth is off, so no one needs it yet (`llmctl gateway auth on`).",
                    err=True)
@@ -3089,11 +3150,81 @@ def gateway_key_set(key: str | None, clear: bool) -> None:
 @click.argument("name")
 def gateway_key_rm(name: str) -> None:
     """Revoke the key called NAME (at once, no restart)."""
+    from llm_runner import control
     keys = dict(config_mod.load().get("gateway_keys") or {})
     if keys.pop(name, None) is None:
         raise click.UsageError(f"No key called {name}.")
-    config_mod.update(gateway_keys=keys or None)
+    ctl = [k for k in control.settings()["keys"] if k != name]
+    config_mod.update(gateway_keys=keys or None, gateway_control_keys=ctl or None)
     click.echo(f"Key {name} revoked.")
+
+
+@gateway.group("control", invoke_without_command=True)
+@click.pass_context
+def gateway_control(ctx: click.Context) -> None:
+    """Let other nodes (and control keys) run llmctl commands here.
+
+    \b
+      llmctl gateway control on            # accept remote control
+      llmctl gateway control allow rtx     # from rtx's gateway and CLI
+      llmctl gateway key add ops --control # or from a client with this key
+
+    Then, on rtx: `llmctl run --node orin`, `llmctl ps --node orin`, … Every
+    command that manages models works, menus and pickers included; set-up
+    commands (config, gateway, registry, setup, import) and the run options
+    -X, -E, --ft and --image don't. A node must call from the address the
+    registry has for it. Changes apply at once, no restart. With no
+    subcommand, print the settings.
+    """
+    if ctx.invoked_subcommand is None:
+        _show_control()
+
+
+def _show_control() -> None:
+    from llm_runner import control
+    s = control.settings()
+    click.echo(f"Remote control: {'on' if s['on'] else 'off'}")
+    click.echo("Nodes allowed:  " + (", ".join(s["nodes"]) or "(none)"))
+    click.echo("Control keys:   " + (", ".join(s["keys"]) or "(none)"))
+    if s["on"] and not s["nodes"] and not s["keys"]:
+        click.echo("note: no node or key may use it yet (`llmctl gateway control allow "
+                   "NODE`, or `llmctl gateway key add NAME --control`).", err=True)
+
+
+@gateway_control.command("on")
+def gateway_control_on() -> None:
+    """Accept remote control from the allowed nodes and control keys."""
+    config_mod.update(remote_control=True)
+    _show_control()
+
+
+@gateway_control.command("off")
+def gateway_control_off() -> None:
+    """Refuse all remote control (the allow list and keys are kept)."""
+    config_mod.update(remote_control=None)
+    _show_control()
+
+
+@gateway_control.command("allow")
+@click.argument("nodes", nargs=-1, required=True)
+def gateway_control_allow(nodes: tuple[str, ...]) -> None:
+    """Let NODES (by their cluster name) control this machine."""
+    from llm_runner import control
+    for n in nodes:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", n):
+            raise click.UsageError(f"{n!r} isn't a node name.")
+    config_mod.update(remote_control_from=sorted({*control.settings()["nodes"], *nodes}))
+    _show_control()
+
+
+@gateway_control.command("deny")
+@click.argument("nodes", nargs=-1, required=True)
+def gateway_control_deny(nodes: tuple[str, ...]) -> None:
+    """Take NODES off the allow list."""
+    from llm_runner import control
+    left = [n for n in control.settings()["nodes"] if n not in nodes]
+    config_mod.update(remote_control_from=left or None)
+    _show_control()
 
 
 @gateway.command("metrics-token")

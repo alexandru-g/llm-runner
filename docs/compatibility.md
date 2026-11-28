@@ -116,6 +116,15 @@ against it.
   several groups also has `groups` (all of them; `group` stays the first).
 - API keys: `Authorization: Bearer <key>` as configured with `llmctl
   gateway auth`.
+- Since 1.17: remote control, `POST /control/v1/exec` and `GET
+  /control/v1/status`. Covered: who may (off until `gateway control on`; this
+  machine, allowed nodes with the cluster token from their registered address,
+  keys made with `--control`), that `--node NAME` runs the command on that node
+  with stdout, stderr and the exit code as they are there, and which commands
+  and options are refused. The frame format on the upgraded connection is
+  llmctl's own and may change in a minor release, with a client and node of the
+  same minor version always speaking the same one. More commands may become
+  allowed in a minor release.
 
 ### Cluster protocol
 
@@ -132,6 +141,7 @@ that bumps the protocol version and is a major release.
   `msg`, and for `event: "request"` the keys listed in the README. They
   never contain prompt or reply text.
 - State files under the state directory (`running.json`, `autostart.json`,
+  `usage.json` (1.17),
   `profiles.json`, `images.json`, `supervisor.json`, `events.jsonl`,
   `holds.json`, `cache/`) and `config.json`. Use `llmctl ps --json` and `llmctl events
   --json`. Use the commands that manage

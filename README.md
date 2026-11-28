@@ -507,18 +507,30 @@ export LLM_RUNNER_MODELS_DIR=/fast/ml/models
 ### List on-disk models
 
 ```bash
-llmctl list
+llmctl list               # by key
+llmctl list -t            # most recently used first (same as --sort used)
+llmctl list --sort size   # largest first
 ```
 
-Shows discovered models with key, size, vision/draft markers, and path:
+Shows discovered models with key, size, when each was last used,
+vision/draft markers, and path:
 
 ```
-KEY                     SIZE  VISION  DRAFT  DECISION  PATH
-gemma-4-e4b-it-q4_k_m   2.4G  yes                      gemma-4-e4b-it/gemma-4-E4B-it-Q4_K_M.gguf
-gemma-4-e4b-it-q8_0     5.0G  yes                      gemma-4-e4b-it/gemma-4-E4B-it-Q8_0.gguf
-gemma-4-31b-it-q4_k_m   17G           yes              gemma-4-31b-it/gemma-4-31B-it-Q4_K_M.gguf
-qwen3-8b-q5_k_m         5.4G                           qwen3-8b/Qwen3-8B-Q5_K_M.gguf
+KEY                     SIZE  LAST USED   VISION  DRAFT  DECISION  PATH
+gemma-4-31b-it-q4_k_m   17G   8m ago              yes              gemma-4-31b-it/gemma-4-31B-it-Q4_K_M.gguf
+gemma-4-e4b-it-q4_k_m   2.4G  2d ago      yes                      gemma-4-e4b-it/gemma-4-E4B-it-Q4_K_M.gguf
+qwen3-8b-q5_k_m         5.4G  2026-09-14                           qwen3-8b/Qwen3-8B-Q5_K_M.gguf
+gemma-4-e4b-it-q8_0     5.0G  never       yes                      gemma-4-e4b-it/gemma-4-E4B-it-Q8_0.gguf
 ```
+
+**LAST USED** is the later of a model's last request through this machine's
+gateway and its last start by `llmctl run`. A request that another node's
+gateway forwards here counts here, where the model ran. A request straight to
+a model's port doesn't count; `speedtest` goes there, so benchmarks don't
+either. The gateway keeps the times in `usage.json` in the state dir, writing
+them at most every 30 s and when it exits. For a model used before llmctl 1.17,
+the latest start in `events.jsonl` stands in. After 60 days the column shows a
+date.
 
 The key is the filename stem lowercased; collisions across folders are
 disambiguated by prefixing with the parent dir name. A `DRAFT` marker means a
@@ -1475,6 +1487,63 @@ any$  llmctl ps --all                           # every model, and where calls g
   `http://localhost:9000/v1` works at home and away.
 - Each gateway port (9000) must be reachable from the other machines, e.g.
   `sudo ufw allow from 192.168.8.0/24 to any port 9000 proto tcp`.
+
+### Control another machine: `--node`
+
+Any command that manages models runs on another node when you add `--node
+NAME`, here in your terminal: its pickers, launch menu and prompts work as
+they do on that machine, with its models, engines and remembered choices.
+
+```bash
+llmctl run --node orin                     # orin's picker and launch menu
+llmctl run inkling-2-mini-ud-q4_k_xl --node orin --no-draft
+llmctl ps --node orin
+llmctl list -t --node orin                 # orin's models, most recently used first
+llmctl stop --node orin                    # orin's picker of running models
+llmctl apply serving.yaml --node orin      # the file is sent along
+llmctl speedtest --node orin
+```
+
+`--node` can go anywhere before `--`, and the node's own name (or `local`) runs
+here. Output keeps stdout and stderr apart when you pipe it, so `llmctl ps --json
+--node orin | jq` works, and the exit code is the remote command's. Ctrl-C reaches
+the command on the node.
+
+**Nothing is allowed until the node says so.** On the machine to be controlled:
+
+```bash
+llmctl gateway control on             # accept remote control
+llmctl gateway control allow rtx      # from rtx (its gateway and its CLI)
+llmctl gateway control                # show the settings
+```
+
+A node proves itself with the cluster token and must call from the address
+the registry has for it, so another machine with the token can't pass for
+rtx. A client that isn't a node (a laptop, a script) uses a control key instead:
+
+```bash
+llmctl gateway key add laptop --control    # on the node; prints the key once
+LLMCTL_CONTROL_KEY=<key> llmctl ps --node http://192.168.8.115:9000
+```
+
+A key made without `--control` can't control anything, and the gateway's LAN
+exemption (no key needed from the local network) never applies to control.
+Calls from the machine itself (loopback) are always let in once control is on.
+
+What runs remotely: `run` (`start`), `stop`, `ps`, `list`, `chat`,
+`speedtest`, `download`, `update`, `rm`, `restart`, `pause`, `resume`,
+`restore`, `logs`, `events`, `apply`, `decide`, `show`, `verify`, `profile`,
+`autostart list|status`, `registry status` and `version`. What doesn't: set-up
+of the machine (`config`, `gateway`, `registry set|serve|token|clear`, `node`,
+`setup`, `import`, `install`, `images`, `cache`, `autostart install|sync`),
+and the options that would run any program or write anywhere there (`-X`,
+`-E`/`--env`, `--ft`, `--image`, `--allow-tag`, `chat --out`). A serving file
+sent with `apply --node` may not have `args`, `env` or `image` in an entry.
+
+The node runs the command as its own `llmctl` and logs each one (`control:
+node rtx runs llmctl run …`). Events it writes carry `remote` (`node rtx`,
+`key laptop`, `local`) in `llmctl events --json`. A node on llmctl older than
+1.17 answers that it has no remote control.
 
 ## Production: containers, bundles and serving files
 

@@ -7,6 +7,26 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Remote control: `--node NAME` runs a command on another machine.** Every
+  command that manages models works, interactive ones included: `llmctl run
+  --node orin` shows orin's picker and launch menu in your terminal, and `ps`,
+  `list`, `stop`, `chat`, `speedtest`, `apply` (the file is sent along) and the
+  rest work as on that machine, with stdout, stderr and the exit code kept.
+  It's off until `llmctl gateway control on` on the node, then open to the
+  nodes in `llmctl gateway control allow` (cluster token, from their registered
+  address) and to keys made with `llmctl gateway key add NAME --control`. Set-up
+  commands and the options that would run any program there (`-X`, `--env`,
+  `--ft`, `--image`) are refused. Events from remote commands carry `remote`.
+- **`llmctl list` shows when each model was last used,** and `--sort used` (or
+  `-t`) orders it most recent first; `--sort size` orders by size. A model's last
+  use is the later of its last request through this machine's gateway (including
+  requests another node forwarded here) and its last start by `llmctl run`. The
+  gateway keeps the times in `usage.json` in the state dir. Models used before
+  this release fall back to their latest start in `events.jsonl`. Requests
+  straight to a model's port, such as `speedtest`'s, don't count.
+
 ## [1.16.0] - 2026-11-28
 
 ### Added

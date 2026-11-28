@@ -579,6 +579,8 @@ def record_event(name: str, event: str, detail: str = "", *,
     pid = fields.get("pid")
     if pid is not None and _last_event(path, name) == (event, pid):
         return False
+    # `llmctl … --node` from elsewhere: who asked (see llm_runner.control).
+    fields.setdefault("remote", os.environ.get("LLMCTL_REMOTE"))
     line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": name, "event": event,
             "detail": detail, **{k: v for k, v in fields.items() if v is not None}}
     try:
