@@ -7,6 +7,25 @@ All notable changes to llm-runner (`llmctl`). The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`llmctl list --json`:** `{"models_dir", "models": [...]}` with each model's
+  key, backend, size in bytes, last use (epoch seconds or null), vision, drafter,
+  decision and path, in `--sort` order.
+- **GPU memory in `llmctl ps --json`:** `vram_mib` per model (nvidia-smi,
+  counting child processes; null in a container or on a Jetson), and `gpus` with
+  each GPU's total and free memory. A Jetson reports its shared system memory
+  (`unified: true`).
+- **A fit check in `llmctl run`** (llama): it refuses to start a model whose
+  weights, projector and drafter don't fit in the free GPU memory, saying what
+  to change, and warns on a tight fit. `--force` starts it anyway.
+- **`--node` shows in `--help`** of the commands that can run remotely.
+
+### Changed
+
+- `--profile last` for a model with no remembered run uses the defaults, with
+  a note, instead of failing.
+
 ## [1.17.0] - 2026-11-28
 
 ### Added

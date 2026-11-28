@@ -634,6 +634,12 @@ its name, so editing a profile never changes a running model.
   [vLLM and SGLang specifics](#vllm-and-sglang-specifics)).
 - Default port: first free port from `8080`.
 - Default context size: `32768`.
+- Before a llama start, `run` checks the weights it will load onto the GPU
+  (model, projector unless `--no-mmproj-offload`, drafter) against the free
+  GPU memory (on a Jetson, the free system memory). It refuses when they
+  can't fit and warns when less than 1 GiB would be left for the KV cache.
+  `--force` starts anyway; `--n-gpu-layers` below all skips the check.
+  Restarts by the gateway's supervisor don't check.
 - Override either: `-p 8081 -c 65536`.
 - Reasoning follows the model on llama: the chat template decides (llama-server
   `--reasoning auto`). `--reasoning` / `--no-reasoning` turn it on or off
@@ -932,6 +938,13 @@ llmctl ps
 Prints PID, port, start time, name and runtime (`host`, or `docker` with the
 image's short digest). Dead entries are pruned automatically.
 When the gateway is up, its all-models URL is printed underneath.
+
+`llmctl ps --json` adds, for each model, the GPU memory its engine uses
+(`vram_mib`, from nvidia-smi, counting child processes such as vLLM's
+workers), and the machine's GPUs with their total and free memory (`gpus`). A
+Jetson reports its shared system memory instead (`unified: true`), and no
+use per model. `llmctl list --json` gives the on-disk models (key, backend,
+size in bytes, last use, vision, drafter, decision, path) in `--sort` order.
 
 ### Stop a running model
 

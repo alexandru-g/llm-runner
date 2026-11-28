@@ -30,3 +30,12 @@ def _no_toolchain_probe(monkeypatch):
     """Launches never probe this machine's nvcc and GCC (the probe runs
     subprocesses, which tests that fake Popen would intercept)."""
     monkeypatch.setattr(backends, "toolchain_env", dict)
+
+
+@pytest.fixture(autouse=True)
+def _no_gpu_probe(monkeypatch):
+    """No nvidia-smi: the fit check and `ps --json` see no GPU unless a test
+    says what it has (results don't depend on this machine's free VRAM)."""
+    from llm_runner import gpu
+    monkeypatch.setattr(gpu, "gpus", lambda: [])
+    monkeypatch.setattr(gpu, "process_mib", lambda: None)

@@ -314,6 +314,11 @@ class _Menu:
 
     def find(self, name: str) -> Profile:
         found = {p.name: p for p in self.profiles()}
+        if name == "last" and name not in found:
+            # Never launched from the menu or a profile: what `default` gives.
+            click.echo(f"note: no last run remembered for {self.target.spec.key}; "
+                       "using the defaults.", err=True)
+            return found["default"]
         if name not in found:
             raise click.BadParameter(
                 f"no profile '{name}' for {self.target.spec.key} on {self.target.backend}; "

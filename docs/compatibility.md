@@ -36,14 +36,21 @@ against it.
   `restarting`, `crashed`, `paused`, (since 1.14) `down`, or null for a
   running model the gateway's supervisor hasn't seen yet. Since 1.14 every
   model that was started and not stopped has a row, so a missing row means
-  stopped.
+  stopped. Since 1.18 each row also has `vram_mib` (GPU memory of the
+  engine and its child processes, in MiB; null when not running, in a
+  container, or on a Jetson), and the object has `gpus`: a list of `{index,
+  name, total_mib, free_mib, unified}`. On a Jetson the one entry is the
+  system's memory (`unified: true`, `free_mib` from MemAvailable).
+- (since 1.18) `llmctl list --json` prints `{"models_dir", "models": [...]}`,
+  each with `key`, `backend`, `size` (bytes), `last_used` (epoch seconds or
+  null), `vision`, `draft`, `decision` and `path`, in the order `--sort` asks.
 - (since 1.14) `llmctl run --json` prints one object: the `ps --json`
   keys from `name` to `runtime`, plus `log`, `ready` (`true`, `false`, or
   null without `--wait`) and `error`. With `ready: false` the exit code is 1.
 
 - `--json` output of `install`, `verify`, `cache export`, `apply`,
   `images`, `images load`, `images save`, (since 1.2) `ps`, (since 1.9)
-  `import` and (since 1.14) `run`: the keys documented in the README keep
+  `import`, (since 1.14) `run` and (since 1.18) `list`: the keys documented in the README keep
   their names, types and meaning. New keys may appear; parse leniently.
 
 ### File formats

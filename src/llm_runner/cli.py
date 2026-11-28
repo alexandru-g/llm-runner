@@ -196,7 +196,7 @@ def _run_option_args(ctx: click.Context) -> list[str]:
     args: list[str] = []
     for p in ctx.command.params:
         if not isinstance(p, click.Option) or p.name in ("port", "wait", "menu", "profile",
-                                                          "as_json"):
+                                                          "as_json", "force"):
             continue
         source = ctx.get_parameter_source(p.name)
         # An owner from $LLMCTL_OWNER is kept too, so a restart from elsewhere
@@ -480,11 +480,25 @@ class _AliasGroup(click.Group):
         return super().main(argv, *a, **kw)
 
 
+def _node_option(f):
+    """``--node`` in a command's --help. `_AliasGroup.main` takes it off the
+    command line before click sees it, so it never reaches the command."""
+    return click.option(
+        "--node", "node", metavar="NAME", expose_value=False,
+        help="Run this on another node of the cluster, here in your terminal "
+             "(menus and pickers included). The node allows it with `llmctl gateway "
+             "control`; NAME can also be a gateway URL, with $LLMCTL_CONTROL_KEY.")(f)
+
+
 @click.group(cls=_AliasGroup)
 @click.version_option(__version__, "--version", "-V", prog_name="llmctl")
+@_node_option
 def cli() -> None:
     """Manage local model servers (llama-server for GGUF, vllm for HF
-    checkpoints)."""
+    checkpoints).
+
+    Add --node NAME to a command that manages models to run it on another
+    node: `llmctl run --node orin`, `llmctl ps --json --node orin`."""
 
 
 @cli.command()
@@ -1037,7 +1051,9 @@ def config_models_dir(path: Path | None, create: bool) -> None:
               show_default=True,
               help="Order: by key, by last use (most recent first), or by size (largest first).")
 @click.option("-t", "by_time", is_flag=True, help="Same as --sort used.")
-def list_cmd(sort_by: str, by_time: bool) -> None:
+@click.option("--json", "as_json", is_flag=True,
+              help="Machine-readable JSON: models_dir and the models, in the chosen order.")
+def list_cmd(sort_by: str, by_time: bool, as_json: bool) -> None:
     """List models discovered on disk under MODELS_DIR (also `llmctl ls`).
 
     GGUF files are served by llama-server; Hugging Face checkpoint
@@ -1049,16 +1065,23 @@ def list_cmd(sort_by: str, by_time: bool) -> None:
     its last start by `llmctl run`, whichever is later. A request straight to
     a model's port (such as `speedtest`) doesn't count.
     """
-    click.echo(f"Models dir: {MODELS_DIR}")
     specs = discover_models()
-    if not specs:
-        click.echo("\n(no models found — use `llmctl download <repo>` to fetch one)")
-        return
     used = _last_used(specs)
     if by_time or sort_by == "used":
         specs = dict(sorted(specs.items(), key=lambda kv: (-(used.get(kv[0]) or 0), kv[0])))
     elif sort_by == "size":
         specs = dict(sorted(specs.items(), key=lambda kv: (-(kv[1].size or 0), kv[0])))
+    if as_json:
+        click.echo(json.dumps({"models_dir": str(MODELS_DIR), "models": [
+            {"key": key, "backend": spec.backend, "size": spec.size,
+             "last_used": used.get(key), "vision": spec.has_vision, "draft": spec.has_draft,
+             "decision": spec.decision, "path": str(spec.model_path)}
+            for key, spec in specs.items()]}, indent=2))
+        return
+    click.echo(f"Models dir: {MODELS_DIR}")
+    if not specs:
+        click.echo("\n(no models found — use `llmctl download <repo>` to fetch one)")
+        return
     key_w = max(20, max(len(k) for k in specs))
     sources = {key: _read_source(s.model_path if s.model_path.is_dir() else s.model_path.parent)
                for key, s in specs.items()}
@@ -1202,6 +1225,9 @@ def profile_rm(name: str) -> None:
               help="Who is starting it, e.g. a session's name (A1). Shown in `llmctl ps` "
                    "and `llmctl events`, and kept across restarts. Default: "
                    "$LLMCTL_OWNER, else none.")
+@click.option("--force", is_flag=True, default=False,
+              help="Start even when the model's weights look too big for the free GPU "
+                   "memory (llama; checked before starting, not remembered for restarts).")
 @click.option("--wait/--no-wait", "wait", default=False,
               help="Block until the server answers /health (or exits). Handy for "
                    "vllm/sglang, which take a minute or more to load and compile.")
@@ -1355,7 +1381,7 @@ def profile_rm(name: str) -> None:
 @click.pass_context
 def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
         ctx_size: int | None, ft_path: Path | None, ft_name: str | None,
-        group_name: str | None, owner: str | None, wait: bool, as_json: bool,
+        group_name: str | None, owner: str | None, force: bool, wait: bool, as_json: bool,
         menu: bool | None, profile: str | None, extra: tuple[str, ...], env_pairs: tuple[str, ...],
         runtime_kind: str | None, image: str | None, allow_tag: bool, dns: str | None, gpu: str | None,
         restart: str | None, restart_max: int | None,
@@ -1645,6 +1671,9 @@ def run(ctx: click.Context, model: str | None, backend: str, port: int | None,
     else:
         group = "" if group_name.lower() == "none" else group_name
     group = ",".join(dict.fromkeys(g for g in registry.split_groups(group) if g != name))
+    if backend == LLAMA and not force:
+        _fit_check(model_path, mmproj if not no_mmproj_offload else None, draft_path,
+                   n_gpu_layers, runtime)
     rec = proc.start(name=name, cmd=cmd, port=chosen_port,
                      model_path=str(model_path), run_args=run_args,
                      backend=backend, env=env, group=group, runtime=runtime,
@@ -1750,7 +1779,15 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
                          "model_path": sp.model_path, "runtime": sp.runtime,
                          **_ps_state(None, alive=False), "state": "paused"})
     if as_json:
-        click.echo(json.dumps({"models": rows}, indent=2))
+        from llm_runner import gpu
+        live_pids = [r["pid"] for r in rows if r["pid"]]
+        vram = gpu.tree_mib(live_pids, gpu.process_mib())
+        for r in rows:
+            # A container's engine isn't a child of the `docker run` llmctl knows.
+            docker = (r.get("runtime") or {}).get("kind") == containers.DOCKER
+            r["vram_mib"] = None if not r["pid"] or docker else vram.get(r["pid"])
+        click.echo(json.dumps({"models": rows, "gpus": [g.as_dict() for g in gpu.gpus()]},
+                              indent=2))
         return
     if not rows:
         click.echo("(no models running)")
@@ -1770,6 +1807,35 @@ def ps_cmd(show_all: bool, as_json: bool) -> None:
     gw = _gateway_record()
     if gw:
         click.echo(f"\nAll models: {_gateway_url(gw.port)}  (GET /v1/models lists them)")
+
+
+def _fit_check(model_path: Path, mmproj: Path | None, draft: Path | None,
+               n_gpu_layers: int, runtime: dict | None) -> None:
+    """Refuse a llama start whose weights alone exceed the free GPU memory
+    (warn when less than 1 GiB would be left for KV cache and buffers). Best
+    effort: no GPU information, or layers kept on the CPU, skips it."""
+    from llm_runner import gpu
+    if n_gpu_layers < 999:
+        return
+    seen = gpu.visible(gpu.gpus(), (runtime or {}).get("gpus"))
+    free = [g.free_mib for g in seen if g.free_mib is not None]
+    if not free:
+        return
+    parts = [("weights", model_path), ("projector", mmproj), ("drafter", draft)]
+    sizes = [(what, p.stat().st_size >> 20) for what, p in parts if p is not None and p.exists()]
+    need, have = sum(mib for _, mib in sizes), sum(free)
+    where = (" (shared with the system)" if seen[0].unified else "") + \
+        (f" on GPU {','.join(str(g.index) for g in seen)}" if len(seen) > 1 else "")
+    detail = " + ".join(f"{what} {mib / 1024:.1f}" for what, mib in sizes)
+    if need > have:
+        raise click.ClickException(
+            f"won't fit: {need / 1024:.1f} GiB to load ({detail}), {have / 1024:.1f} GiB free"
+            f"{where}. Free some memory, or use --no-vision, --no-mmproj-offload, --no-draft, "
+            "--n-gpu-layers N or a smaller quant; --force starts it anyway.")
+    if need + 1024 > have:
+        click.echo(f"warning: tight fit: {need / 1024:.1f} GiB to load ({detail}), "
+                   f"{have / 1024:.1f} GiB free{where}; the KV cache and buffers need more.",
+                   err=True)
 
 
 def _model_fields(p: proc.RunningProcess) -> dict:
@@ -5037,6 +5103,20 @@ def rm(model: str | None, yes: bool) -> None:
             proc.autostart_remove(s.name)
             click.echo(f"Removed {s.name} from the autostart manifest.")
     click.echo(f"Deleted {model}.")
+
+
+def _document_node_option() -> None:
+    """Every command that may run remotely shows --node in its --help."""
+    from llm_runner import control
+    for path in control.ALLOWED:
+        cmd: click.Command | None = cli
+        for name in path:
+            cmd = cmd.commands.get(name) if isinstance(cmd, click.Group) else None
+        if cmd is not None and not any(p.name == "node" for p in cmd.params):
+            _node_option(cmd)
+
+
+_document_node_option()
 
 
 if __name__ == "__main__":
